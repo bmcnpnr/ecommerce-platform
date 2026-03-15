@@ -453,3 +453,29 @@ services:
       timeout: 10s
       retries: 10
       start_period: 45s
+
+  # ─── Frontend ────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ../ecommerce-frontend
+      dockerfile: Dockerfile
+      args:
+        # Relative base URL so nginx proxies /api → api-gateway within the stack.
+        # Override at build time if deploying behind a public domain:
+        #   docker compose build --build-arg VITE_API_BASE_URL=https://api.example.com
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/}
+    container_name: frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
