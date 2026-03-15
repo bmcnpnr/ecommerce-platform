@@ -14,6 +14,12 @@ volumes:
   reviewdb-data:
   kafka-data:
   zookeeper-data:
+  # ─── Monitoring volumes ──────────────────────────────────────────────
+  prometheus-data:
+  grafana-data:
+  loki-data:
+  tempo-data:
+  alertmanager-data:
 
 services:
 
@@ -227,7 +233,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://userdb:5432/userdb
       DB_USERNAME: useruser
       DB_PASSWORD: userpass
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      ENVIRONMENT: development
       JWT_SECRET: ${JWT_SECRET:-myVerySecretJwtKeyThatIsAtLeast32CharactersLongForHS256}
     depends_on:
       userdb:
@@ -254,7 +261,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://productdb:5432/productdb
       DB_USERNAME: productuser
       DB_PASSWORD: productpass
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      ENVIRONMENT: development
     depends_on:
       productdb:
         condition: service_healthy
@@ -280,7 +288,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://catalogdb:5432/catalogdb
       DB_USERNAME: cataloguser
       DB_PASSWORD: catalogpass
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      ENVIRONMENT: development
     depends_on:
       catalogdb:
         condition: service_healthy
@@ -307,7 +316,8 @@ services:
       DB_USERNAME: orderuser
       DB_PASSWORD: orderpass
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      ENVIRONMENT: development
     depends_on:
       orderdb:
         condition: service_healthy
@@ -336,7 +346,8 @@ services:
       DB_USERNAME: paymentuser
       DB_PASSWORD: paymentpass
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      ENVIRONMENT: development
     depends_on:
       paymentdb:
         condition: service_healthy
@@ -365,7 +376,8 @@ services:
       DB_USERNAME: shippinguser
       DB_PASSWORD: shippingpass
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      ENVIRONMENT: development
     depends_on:
       shippingdb:
         condition: service_healthy
@@ -393,7 +405,8 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://reviewdb:5432/reviewdb
       DB_USERNAME: reviewuser
       DB_PASSWORD: reviewpass
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      ENVIRONMENT: development
     depends_on:
       reviewdb:
         condition: service_healthy
@@ -417,7 +430,8 @@ services:
       - "8088:8088"
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      ENVIRONMENT: development
     depends_on:
       kafka:
         condition: service_healthy
@@ -442,6 +456,8 @@ services:
     environment:
       EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
       JWT_SECRET: ${JWT_SECRET:-myVerySecretJwtKeyThatIsAtLeast32CharactersLongForHS256}
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+      ENVIRONMENT: development
     depends_on:
       service-discovery:
         condition: service_healthy
@@ -453,6 +469,354 @@ services:
       timeout: 10s
       retries: 10
       start_period: 45s
+
+  # ─── Frontend ────────────────────────────────────────────────────────
+
+  frontend:
+    build:
+      context: ../ecommerce-frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /
+    container_name: frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ─── Monitoring Stack ────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.console.libraries=/usr/share/prometheus/console_libraries
+      - --web.console.templates=/usr/share/prometheus/consoles
+      - --web.enable-lifecycle
+      - --web.enable-remote-write-receiver
+    ports:
+      - "9090:9090"
+    volumes:
+      - ../ecommerce-monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../ecommerce-monitoring/prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    networks:
+      - ecommerce-network
+    depends_on:
+      - cadvisor
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:11.1.0
+    container_name: grafana
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_SERVER_ROOT_URL: http://localhost:3001
+      GF_FEATURE_TOGGLES_ENABLE: traceqlEditor traceQLStreaming metricsSummary
+    volumes:
+      - ../ecommerce-monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../ecommerce-monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    networks:
+      - ecommerce-network
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  loki:
+    image: grafana/loki:3.1.0
+    container_name: loki
+    command: -config.file=/etc/loki/loki-config.yml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ../ecommerce-monitoring/loki/loki-config.yml:/etc/loki/loki-config.yml:ro
+      - loki-data:/loki
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3100/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  promtail:
+    image: grafana/promtail:3.1.0
+    container_name: promtail
+    command: -config.file=/etc/promtail/promtail-config.yml
+    volumes:
+      - ../ecommerce-monitoring/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - ecommerce-network
+    depends_on:
+      - loki
+
+  tempo:
+    image: grafana/tempo:2.5.0
+    container_name: tempo
+    command: -config.file=/etc/tempo/tempo-config.yml
+    ports:
+      - "3200:3200"
+      - "4317:4317"
+      - "4318:4318"
+    volumes:
+      - ../ecommerce-monitoring/tempo/tempo-config.yml:/etc/tempo/tempo-config.yml:ro
+      - tempo-data:/var/tempo
+    networks:
+      - ecommerce-network
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3200/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ../ecommerce-monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    networks:
+      - ecommerce-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9093/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ─── Infrastructure Exporters ────────────────────────────────────────
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.1
+    container_name: node-exporter
+    command:
+      - --path.rootfs=/host
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+    pid: host
+    ports:
+      - "9100:9100"
+    volumes:
+      - /:/host:ro,rslave
+    networks:
+      - ecommerce-network
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.49.1
+    container_name: cadvisor
+    privileged: true
+    ports:
+      - "9095:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    devices:
+      - /dev/kmsg
+    networks:
+      - ecommerce-network
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    container_name: kafka-exporter
+    command:
+      - --kafka.server=kafka:29092
+      - --web.listen-address=:9308
+    ports:
+      - "9308:9308"
+    networks:
+      - ecommerce-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  blackbox-exporter:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: blackbox-exporter
+    command: --config.file=/etc/blackbox/blackbox-config.yml
+    ports:
+      - "9115:9115"
+    volumes:
+      - ../ecommerce-monitoring/blackbox-exporter/blackbox-config.yml:/etc/blackbox/blackbox-config.yml:ro
+    networks:
+      - ecommerce-network
+
+  nginx-exporter:
+    image: nginx/nginx-prometheus-exporter:1.1.0
+    container_name: nginx-exporter
+    command:
+      - --nginx.scrape-uri=http://frontend:80/stub_status
+    ports:
+      - "9113:9113"
+    networks:
+      - ecommerce-network
+    depends_on:
+      - frontend
+
+  # ─── PostgreSQL Exporters (one per database) ─────────────────────────
+
+  postgres-exporter-userdb:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres-exporter-userdb
+    environment:
+      DATA_SOURCE_NAME: postgresql://useruser:userpass@userdb:5432/userdb?sslmode=disable
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    ports:
+      - "9187:9187"
+    volumes:
+      - ../ecommerce-monitoring/postgres-exporter/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    networks:
+      - ecommerce-network
+    depends_on:
+      userdb:
+        condition: service_healthy
+    labels:
+      database: userdb
+
+  postgres-exporter-productdb:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres-exporter-productdb
+    environment:
+      DATA_SOURCE_NAME: postgresql://productuser:productpass@productdb:5432/productdb?sslmode=disable
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    ports:
+      - "9188:9187"
+    volumes:
+      - ../ecommerce-monitoring/postgres-exporter/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    networks:
+      - ecommerce-network
+    depends_on:
+      productdb:
+        condition: service_healthy
+    labels:
+      database: productdb
+
+  postgres-exporter-catalogdb:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres-exporter-catalogdb
+    environment:
+      DATA_SOURCE_NAME: postgresql://cataloguser:catalogpass@catalogdb:5432/catalogdb?sslmode=disable
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    ports:
+      - "9189:9187"
+    volumes:
+      - ../ecommerce-monitoring/postgres-exporter/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    networks:
+      - ecommerce-network
+    depends_on:
+      catalogdb:
+        condition: service_healthy
+    labels:
+      database: catalogdb
+
+  postgres-exporter-orderdb:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres-exporter-orderdb
+    environment:
+      DATA_SOURCE_NAME: postgresql://orderuser:orderpass@orderdb:5432/orderdb?sslmode=disable
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    ports:
+      - "9190:9187"
+    volumes:
+      - ../ecommerce-monitoring/postgres-exporter/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    networks:
+      - ecommerce-network
+    depends_on:
+      orderdb:
+        condition: service_healthy
+    labels:
+      database: orderdb
+
+  postgres-exporter-paymentdb:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres-exporter-paymentdb
+    environment:
+      DATA_SOURCE_NAME: postgresql://paymentuser:paymentpass@paymentdb:5432/paymentdb?sslmode=disable
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    ports:
+      - "9191:9187"
+    volumes:
+      - ../ecommerce-monitoring/postgres-exporter/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    networks:
+      - ecommerce-network
+    depends_on:
+      paymentdb:
+        condition: service_healthy
+    labels:
+      database: paymentdb
+
+  postgres-exporter-shippingdb:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres-exporter-shippingdb
+    environment:
+      DATA_SOURCE_NAME: postgresql://shippinguser:shippingpass@shippingdb:5432/shippingdb?sslmode=disable
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    ports:
+      - "9192:9187"
+    volumes:
+      - ../ecommerce-monitoring/postgres-exporter/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    networks:
+      - ecommerce-network
+    depends_on:
+      shippingdb:
+        condition: service_healthy
+    labels:
+      database: shippingdb
+
+  postgres-exporter-reviewdb:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres-exporter-reviewdb
+    environment:
+      DATA_SOURCE_NAME: postgresql://reviewuser:reviewpass@reviewdb:5432/reviewdb?sslmode=disable
+      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
+    ports:
+      - "9193:9187"
+    volumes:
+      - ../ecommerce-monitoring/postgres-exporter/queries.yml:/etc/postgres-exporter/queries.yml:ro
+    networks:
+      - ecommerce-network
+    depends_on:
+      reviewdb:
+        condition: service_healthy
+    labels:
+      database: reviewdb
 
   # ─── Frontend ────────────────────────────────────────────────────────
   frontend:
