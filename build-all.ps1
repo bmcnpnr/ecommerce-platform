@@ -1,5 +1,7 @@
 param(
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [switch]$NoDocker,  # Maven only; skip Docker image rebuild
+    [switch]$NoCache    # Pass --no-cache to docker compose build
 )
 
 $JAVA_HOME = 'C:\Program Files\Java\jdk-25.0.2'
@@ -24,7 +26,10 @@ $services = @(
     'ecommerce-notification-service'
 )
 
-$ROOT = Split-Path -Parent $PSScriptRoot
+# Script lives in ecommerce-platform/; sibling repos are one level up.
+$scriptDir = $PSScriptRoot
+$ROOT = Split-Path -Parent $scriptDir
+
 $results = [ordered]@{}
 $startTime = Get-Date
 
@@ -35,9 +40,11 @@ Write-Host "============================================" -ForegroundColor Cyan
 Write-Host "Java  : $JAVA_HOME"
 Write-Host "Maven : $MAVEN_HOME"
 Write-Host "Tests : $(if ($SkipTests) { 'Skipped' } else { 'Enabled' })"
+Write-Host "Docker: $(if ($NoDocker) { 'Skipped (-NoDocker)' } else { 'Rebuild images after Maven' })"
 Write-Host "============================================" -ForegroundColor Cyan
 Write-Host ""
 
+# ─── Maven builds ────────────────────────────────────────────────────────────
 foreach ($svc in $services) {
     $path = Join-Path $ROOT $svc
     Write-Host "---------- $svc ----------" -ForegroundColor Yellow
@@ -73,5 +80,29 @@ foreach ($svc in $services) {
 Write-Host "--------------------------------------------" -ForegroundColor Cyan
 Write-Host "$successCount passed, $failCount failed" -ForegroundColor $(if ($failCount -eq 0) { 'Green' } else { 'Red' })
 Write-Host "============================================" -ForegroundColor Cyan
+
+# ─── Docker image rebuild ────────────────────────────────────────────────────
+# This step copies the freshly built JARs into Docker images so that
+# 'docker compose up' actually runs the new code. Without this step,
+# Docker reuses cached images that contain the old JARs.
+if (-not $NoDocker) {
+    if ($failCount -gt 0) {
+        Write-Host ""
+        Write-Host "Skipping Docker build: $failCount Maven build(s) failed." -ForegroundColor Yellow
+    } else {
+        Write-Host ""
+        Write-Host "============================================" -ForegroundColor Cyan
+        Write-Host "   Rebuilding Docker images               " -ForegroundColor Cyan
+        Write-Host "============================================" -ForegroundColor Cyan
+        $dockerArgs = @('compose', 'build')
+        if ($NoCache) { $dockerArgs += '--no-cache' }
+        Push-Location $scriptDir
+        & docker @dockerArgs
+        Pop-Location
+        Write-Host ""
+        Write-Host "Docker images rebuilt successfully." -ForegroundColor Green
+        Write-Host "Run 'docker compose up -d' to start the stack." -ForegroundColor Green
+    }
+}
 
 exit $failCount
