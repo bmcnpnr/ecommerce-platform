@@ -1,4 +1,8 @@
-version: '3.8'
+# Ecommerce microservices platform.
+#
+# Prerequisite: the service jars must exist in each repo's target/ directory.
+# Run ./build-all.ps1 (Windows) or ./build-all.sh (Linux/macOS) first — the
+# Dockerfiles copy a pre-built jar rather than compiling inside the image.
 
 networks:
   ecommerce-network:
@@ -20,6 +24,37 @@ volumes:
   tempo-data:
   alertmanager-data:
 
+# ─── Shared fragments ──────────────────────────────────────────────────
+#
+# MaxRAMPercentage is required: with a mem_limit set, the JVM default of 25%
+# would leave far too little heap, and without a mem_limit the JVM sizes its
+# heap against the whole 16GB VM (~4GB max heap *per service*, which the host
+# cannot honour ten times over).
+# ActiveProcessorCount caps GC/ForkJoin/Netty pool sizing — the VM reports 32
+# CPUs, so ten JVMs would otherwise each spin up ~23 GC threads.
+x-java-env: &java-env
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+  ENVIRONMENT: development
+  JAVA_OPTS: >-
+    -XX:MaxRAMPercentage=55
+    -XX:ActiveProcessorCount=2
+    -XX:+ExitOnOutOfMemoryError
+
+# Spring Boot cold start under contention (10 JVMs booting at once) can exceed
+# a minute, so the grace period is generous. Failures during start_period do
+# not count against retries.
+x-actuator-healthcheck: &actuator-healthcheck
+  interval: 10s
+  timeout: 5s
+  retries: 20
+  start_period: 90s
+
+x-db-healthcheck: &db-healthcheck
+  interval: 10s
+  timeout: 5s
+  retries: 5
+
 services:
 
   # ─── Infrastructure ─────────────────────────────────────────────────
@@ -27,6 +62,8 @@ services:
   kafka:
     image: confluentinc/cp-kafka:7.6.0
     container_name: kafka
+    restart: unless-stopped
+    mem_limit: 1200m
     ports:
       - "9092:9092"
     environment:
@@ -43,7 +80,10 @@ services:
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_HEAP_OPTS: -Xmx640m -Xms320m
+      # An already-formatted kafka-data volume keeps its own cluster id; this
+      # value only applies on a first, empty format.
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
     volumes:
       - kafka-data:/var/lib/kafka/data
     networks:
@@ -52,7 +92,7 @@ services:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:29092"]
       interval: 10s
       timeout: 10s
-      retries: 10
+      retries: 15
       start_period: 60s
 
   # ─── Databases ──────────────────────────────────────────────────────
@@ -60,6 +100,8 @@ services:
   userdb:
     image: postgres:16-alpine
     container_name: userdb
+    restart: unless-stopped
+    mem_limit: 256m
     environment:
       POSTGRES_DB: userdb
       POSTGRES_USER: useruser
@@ -71,14 +113,14 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *db-healthcheck
       test: ["CMD-SHELL", "pg_isready -U useruser -d userdb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   productdb:
     image: postgres:16-alpine
     container_name: productdb
+    restart: unless-stopped
+    mem_limit: 256m
     environment:
       POSTGRES_DB: productdb
       POSTGRES_USER: productuser
@@ -90,14 +132,14 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *db-healthcheck
       test: ["CMD-SHELL", "pg_isready -U productuser -d productdb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   catalogdb:
     image: postgres:16-alpine
     container_name: catalogdb
+    restart: unless-stopped
+    mem_limit: 256m
     environment:
       POSTGRES_DB: catalogdb
       POSTGRES_USER: cataloguser
@@ -109,14 +151,14 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *db-healthcheck
       test: ["CMD-SHELL", "pg_isready -U cataloguser -d catalogdb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   orderdb:
     image: postgres:16-alpine
     container_name: orderdb
+    restart: unless-stopped
+    mem_limit: 256m
     environment:
       POSTGRES_DB: orderdb
       POSTGRES_USER: orderuser
@@ -128,14 +170,14 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *db-healthcheck
       test: ["CMD-SHELL", "pg_isready -U orderuser -d orderdb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   paymentdb:
     image: postgres:16-alpine
     container_name: paymentdb
+    restart: unless-stopped
+    mem_limit: 256m
     environment:
       POSTGRES_DB: paymentdb
       POSTGRES_USER: paymentuser
@@ -147,14 +189,14 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *db-healthcheck
       test: ["CMD-SHELL", "pg_isready -U paymentuser -d paymentdb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   shippingdb:
     image: postgres:16-alpine
     container_name: shippingdb
+    restart: unless-stopped
+    mem_limit: 256m
     environment:
       POSTGRES_DB: shippingdb
       POSTGRES_USER: shippinguser
@@ -166,14 +208,14 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *db-healthcheck
       test: ["CMD-SHELL", "pg_isready -U shippinguser -d shippingdb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   reviewdb:
     image: postgres:16-alpine
     container_name: reviewdb
+    restart: unless-stopped
+    mem_limit: 256m
     environment:
       POSTGRES_DB: reviewdb
       POSTGRES_USER: reviewuser
@@ -185,10 +227,8 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *db-healthcheck
       test: ["CMD-SHELL", "pg_isready -U reviewuser -d reviewdb"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
 
   # ─── Application Services ───────────────────────────────────────────
 
@@ -197,31 +237,33 @@ services:
       context: ../ecommerce-service-discovery
       dockerfile: docker/Dockerfile
     container_name: service-discovery
+    restart: unless-stopped
+    mem_limit: 640m
     ports:
       - "8761:8761"
+    environment:
+      <<: *java-env
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *actuator-healthcheck
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8761/actuator/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
+      start_period: 60s
 
   user-service:
     build:
       context: ../ecommerce-user-service
       dockerfile: docker/Dockerfile
     container_name: user-service
+    restart: unless-stopped
+    mem_limit: 768m
     ports:
       - "8081:8081"
     environment:
+      <<: *java-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://userdb:5432/userdb
       DB_USERNAME: useruser
       DB_PASSWORD: userpass
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      ENVIRONMENT: development
       JWT_SECRET: ${JWT_SECRET:-myVerySecretJwtKeyThatIsAtLeast32CharactersLongForHS256}
     depends_on:
       userdb:
@@ -231,26 +273,23 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *actuator-healthcheck
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8081/actuator/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 45s
 
   product-service:
     build:
       context: ../ecommerce-product-service
       dockerfile: docker/Dockerfile
     container_name: product-service
+    restart: unless-stopped
+    mem_limit: 768m
     ports:
       - "8082:8082"
     environment:
+      <<: *java-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://productdb:5432/productdb
       DB_USERNAME: productuser
       DB_PASSWORD: productpass
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      ENVIRONMENT: development
     depends_on:
       productdb:
         condition: service_healthy
@@ -259,26 +298,23 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *actuator-healthcheck
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8082/actuator/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 45s
 
   catalog-service:
     build:
       context: ../ecommerce-catalog-service
       dockerfile: docker/Dockerfile
     container_name: catalog-service
+    restart: unless-stopped
+    mem_limit: 768m
     ports:
       - "8083:8083"
     environment:
+      <<: *java-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://catalogdb:5432/catalogdb
       DB_USERNAME: cataloguser
       DB_PASSWORD: catalogpass
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      ENVIRONMENT: development
     depends_on:
       catalogdb:
         condition: service_healthy
@@ -287,27 +323,24 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *actuator-healthcheck
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8083/actuator/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 45s
 
   order-service:
     build:
       context: ../ecommerce-order-service
       dockerfile: docker/Dockerfile
     container_name: order-service
+    restart: unless-stopped
+    mem_limit: 768m
     ports:
       - "8084:8084"
     environment:
+      <<: *java-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://orderdb:5432/orderdb
       DB_USERNAME: orderuser
       DB_PASSWORD: orderpass
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      ENVIRONMENT: development
     depends_on:
       orderdb:
         condition: service_healthy
@@ -318,27 +351,24 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *actuator-healthcheck
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8084/actuator/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
 
   payment-service:
     build:
       context: ../ecommerce-payment-service
       dockerfile: docker/Dockerfile
     container_name: payment-service
+    restart: unless-stopped
+    mem_limit: 768m
     ports:
       - "8085:8085"
     environment:
+      <<: *java-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://paymentdb:5432/paymentdb
       DB_USERNAME: paymentuser
       DB_PASSWORD: paymentpass
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      ENVIRONMENT: development
     depends_on:
       paymentdb:
         condition: service_healthy
@@ -349,27 +379,24 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *actuator-healthcheck
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8085/actuator/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
 
   shipping-service:
     build:
       context: ../ecommerce-shipping-service
       dockerfile: docker/Dockerfile
     container_name: shipping-service
+    restart: unless-stopped
+    mem_limit: 768m
     ports:
       - "8086:8086"
     environment:
+      <<: *java-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://shippingdb:5432/shippingdb
       DB_USERNAME: shippinguser
       DB_PASSWORD: shippingpass
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      ENVIRONMENT: development
     depends_on:
       shippingdb:
         condition: service_healthy
@@ -380,26 +407,23 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *actuator-healthcheck
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8086/actuator/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
 
   review-service:
     build:
       context: ../ecommerce-review-service
       dockerfile: docker/Dockerfile
     container_name: review-service
+    restart: unless-stopped
+    mem_limit: 768m
     ports:
       - "8087:8087"
     environment:
+      <<: *java-env
       SPRING_DATASOURCE_URL: jdbc:postgresql://reviewdb:5432/reviewdb
       DB_USERNAME: reviewuser
       DB_PASSWORD: reviewpass
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      ENVIRONMENT: development
     depends_on:
       reviewdb:
         condition: service_healthy
@@ -408,24 +432,21 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *actuator-healthcheck
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8087/actuator/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
 
   notification-service:
     build:
       context: ../ecommerce-notification-service
       dockerfile: docker/Dockerfile
     container_name: notification-service
+    restart: unless-stopped
+    mem_limit: 640m
     ports:
       - "8088:8088"
     environment:
+      <<: *java-env
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      ENVIRONMENT: development
     depends_on:
       kafka:
         condition: service_healthy
@@ -434,41 +455,37 @@ services:
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *actuator-healthcheck
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8088/actuator/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 45s
 
   api-gateway:
     build:
       context: ../ecommerce-api-gateway
       dockerfile: docker/Dockerfile
     container_name: api-gateway
+    restart: unless-stopped
+    mem_limit: 768m
     ports:
       - "8080:8080"
     environment:
-      EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+      <<: *java-env
       JWT_SECRET: ${JWT_SECRET:-myVerySecretJwtKeyThatIsAtLeast32CharactersLongForHS256}
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
-      ENVIRONMENT: development
     depends_on:
       service-discovery:
         condition: service_healthy
     networks:
       - ecommerce-network
     healthcheck:
+      <<: *actuator-healthcheck
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/actuator/health"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 45s
 
   # ─── Monitoring Stack ────────────────────────────────────────────────
 
   prometheus:
     image: prom/prometheus:v2.52.0
     container_name: prometheus
+    restart: unless-stopped
+    mem_limit: 640m
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -496,6 +513,8 @@ services:
   grafana:
     image: grafana/grafana:11.1.0
     container_name: grafana
+    restart: unless-stopped
+    mem_limit: 384m
     ports:
       - "3001:3000"
     environment:
@@ -523,6 +542,8 @@ services:
   loki:
     image: grafana/loki:3.1.0
     container_name: loki
+    restart: unless-stopped
+    mem_limit: 512m
     command: -config.file=/etc/loki/loki-config.yml
     ports:
       - "3100:3100"
@@ -535,11 +556,14 @@ services:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3100/ready"]
       interval: 15s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
   promtail:
     image: grafana/promtail:3.1.0
     container_name: promtail
+    restart: unless-stopped
+    mem_limit: 256m
     command: -config.file=/etc/promtail/promtail-config.yml
     volumes:
       - ../ecommerce-monitoring/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
@@ -552,6 +576,8 @@ services:
   tempo:
     image: grafana/tempo:2.5.0
     container_name: tempo
+    restart: unless-stopped
+    mem_limit: 512m
     command: -config.file=/etc/tempo/tempo-config.yml
     ports:
       - "3200:3200"
@@ -568,11 +594,14 @@ services:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3200/ready"]
       interval: 15s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
   alertmanager:
     image: prom/alertmanager:v0.27.0
     container_name: alertmanager
+    restart: unless-stopped
+    mem_limit: 128m
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
       - --storage.path=/alertmanager
@@ -594,6 +623,8 @@ services:
   node-exporter:
     image: prom/node-exporter:v1.8.1
     container_name: node-exporter
+    restart: unless-stopped
+    mem_limit: 128m
     command:
       - --path.rootfs=/host
       - --path.procfs=/host/proc
@@ -610,7 +641,15 @@ services:
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: cadvisor
+    restart: unless-stopped
+    mem_limit: 320m
     privileged: true
+    # --docker_only drops the raw cgroup hierarchy, which on the Docker Desktop
+    # VM is noise; housekeeping_interval trims cAdvisor's own CPU cost.
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=15s
+      - --store_container_labels=false
     ports:
       - "9095:8080"
     volumes:
@@ -627,6 +666,8 @@ services:
   kafka-exporter:
     image: danielqsj/kafka-exporter:v1.7.0
     container_name: kafka-exporter
+    restart: unless-stopped
+    mem_limit: 128m
     command:
       - --kafka.server=kafka:29092
       - --web.listen-address=:9308
@@ -638,9 +679,31 @@ services:
       kafka:
         condition: service_healthy
 
+  # Topic / consumer-group browser. The monitoring README documented this at
+  # :8090 but the service was never defined here.
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    restart: unless-stopped
+    mem_limit: 512m
+    ports:
+      - "8090:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: ecommerce
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      DYNAMIC_CONFIG_ENABLED: "true"
+      JAVA_OPTS: -XX:MaxRAMPercentage=60 -XX:ActiveProcessorCount=2
+    networks:
+      - ecommerce-network
+    depends_on:
+      kafka:
+        condition: service_healthy
+
   blackbox-exporter:
     image: prom/blackbox-exporter:v0.25.0
     container_name: blackbox-exporter
+    restart: unless-stopped
+    mem_limit: 128m
     command: --config.file=/etc/blackbox/blackbox-config.yml
     ports:
       - "9115:9115"
@@ -652,6 +715,8 @@ services:
   nginx-exporter:
     image: nginx/nginx-prometheus-exporter:1.1.0
     container_name: nginx-exporter
+    restart: unless-stopped
+    mem_limit: 64m
     command:
       - --nginx.scrape-uri=http://frontend:80/stub_status
     ports:
@@ -666,6 +731,8 @@ services:
   postgres-exporter-userdb:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-userdb
+    restart: unless-stopped
+    mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://useruser:userpass@userdb:5432/userdb?sslmode=disable
       PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
@@ -684,6 +751,8 @@ services:
   postgres-exporter-productdb:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-productdb
+    restart: unless-stopped
+    mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://productuser:productpass@productdb:5432/productdb?sslmode=disable
       PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
@@ -702,6 +771,8 @@ services:
   postgres-exporter-catalogdb:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-catalogdb
+    restart: unless-stopped
+    mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://cataloguser:catalogpass@catalogdb:5432/catalogdb?sslmode=disable
       PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
@@ -720,6 +791,8 @@ services:
   postgres-exporter-orderdb:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-orderdb
+    restart: unless-stopped
+    mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://orderuser:orderpass@orderdb:5432/orderdb?sslmode=disable
       PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
@@ -738,6 +811,8 @@ services:
   postgres-exporter-paymentdb:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-paymentdb
+    restart: unless-stopped
+    mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://paymentuser:paymentpass@paymentdb:5432/paymentdb?sslmode=disable
       PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
@@ -756,6 +831,8 @@ services:
   postgres-exporter-shippingdb:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-shippingdb
+    restart: unless-stopped
+    mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://shippinguser:shippingpass@shippingdb:5432/shippingdb?sslmode=disable
       PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
@@ -774,6 +851,8 @@ services:
   postgres-exporter-reviewdb:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-reviewdb
+    restart: unless-stopped
+    mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://reviewuser:reviewpass@reviewdb:5432/reviewdb?sslmode=disable
       PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
@@ -800,6 +879,8 @@ services:
         #   docker compose build --build-arg VITE_API_BASE_URL=https://api.example.com
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/}
     container_name: frontend
+    restart: unless-stopped
+    mem_limit: 128m
     ports:
       - "3000:80"
     depends_on:
@@ -807,9 +888,10 @@ services:
         condition: service_healthy
     networks:
       - ecommerce-network
-    restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:80"]
+      # 127.0.0.1, not localhost: busybox wget resolves localhost to ::1 first,
+      # and nginx' 'listen 80' binds IPv4 only, so the probe was refused.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:80"]
       interval: 15s
       timeout: 5s
       retries: 5

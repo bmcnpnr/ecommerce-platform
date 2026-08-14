@@ -1,0 +1,40 @@
+version: 2.1
+
+jobs:
+  validate-and-package:
+    docker:
+      - image: cimg/base:2026.08
+    resource_class: medium
+    environment:
+      GIT_REVISION: << pipeline.git.revision >>
+    steps:
+      - checkout
+      - run:
+          name: Validate local-build Compose model
+          command: docker compose -f docker-compose.yml config --quiet
+      - run:
+          name: Validate registry-deployment Compose model
+          command: docker compose -f docker-compose.yml -f docker-compose.registry.yml config --quiet
+      - setup_remote_docker
+      - run:
+          name: Lint Bash automation
+          command: docker build --target shell-validation --file .circleci/validate.Dockerfile .
+      - run:
+          name: Parse PowerShell automation
+          command: docker build --target powershell-validation --file .circleci/validate.Dockerfile .
+      - run:
+          name: Package deployment manifests
+          command: |
+            mkdir -p artifacts
+            tar -czf "artifacts/platform-deployment-${GIT_REVISION:0:12}.tar.gz" \
+              docker-compose.yml docker-compose.registry.yml \
+              build-all.sh rebuild.sh build-all.ps1 rebuild.ps1 CICD.md
+      - store_artifacts:
+          path: artifacts
+          destination: platform
+
+workflows:
+  ci:
+    jobs:
+      - validate-and-package:
+          filters: pipeline.git.branch or pipeline.git.tag

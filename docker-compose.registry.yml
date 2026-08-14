@@ -1,0 +1,44 @@
+services:
+  service-discovery:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-service-discovery:${IMAGE_TAG:-develop}
+    pull_policy: always
+
+  api-gateway:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-api-gateway:${IMAGE_TAG:-develop}
+    pull_policy: always
+
+  user-service:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-user-service:${IMAGE_TAG:-develop}
+    pull_policy: always
+
+  product-service:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-product-service:${IMAGE_TAG:-develop}
+    pull_policy: always
+
+  catalog-service:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-catalog-service:${IMAGE_TAG:-develop}
+    pull_policy: always
+
+  order-service:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-order-service:${IMAGE_TAG:-develop}
+    pull_policy: always
+
+  payment-service:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-payment-service:${IMAGE_TAG:-develop}
+    pull_policy: always
+
+  shipping-service:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-shipping-service:${IMAGE_TAG:-develop}
+    pull_policy: always
+
+  review-service:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-review-service:${IMAGE_TAG:-develop}
+    pull_policy: always
+
+  notification-service:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-notification-service:${IMAGE_TAG:-develop}
+    pull_policy: always
+
+  frontend:
+    image: ${DOCKERHUB_USERNAME:-bmcnpnr}/ecommerce-frontend:${IMAGE_TAG:-develop}
+    pull_policy: always
