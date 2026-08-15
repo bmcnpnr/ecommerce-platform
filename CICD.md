@@ -50,6 +50,23 @@ is restricted to trusted delivery refs:
 The Docker Hub context is attached only to publish jobs. Feature branches and
 pull-request jobs never receive registry credentials.
 
+### Unset pipeline values render as `<nil>`
+
+CircleCI substitutes an unset pipeline value with the literal four-character
+string `<nil>`, not with an empty string. A branch build therefore reaches the
+publish job with `GIT_TAG=<nil>`, which passes a `[[ -n ... ]]` test and yields
+an unusable image reference:
+
+```
+Error parsing reference: "<user>/ecommerce-catalog-service:<nil>"
+is not a valid repository/tag: invalid reference format
+```
+
+Every publish job normalises `GIT_TAG` and `GIT_BRANCH` to empty before reading
+them. Keep that normalisation when editing these jobs, and use explicit `if`
+blocks rather than `[[ ... ]] && VAR=""` — under `set -e` a false one-liner is
+the last command in the list and aborts the step.
+
 ## Docker validation and build contexts
 
 Every deployable repository builds its runtime image on every branch and tag
