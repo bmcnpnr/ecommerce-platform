@@ -1,0 +1,96 @@
+# Eureka. Every other Spring pod blocks on this in an init container, so it is
+# the one workload with no dependencies of its own.
+#
+# Note the deliberate double discovery: Kubernetes Services resolve pod DNS,
+# while the gateway routes with lb://<service> through Eureka. Eureka is kept
+# because it is what the application code is written against — see the
+# EUREKA_INSTANCE_PREFER_IP_ADDRESS note in 02-config.yaml.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-discovery
+  namespace: ecommerce
+  labels:
+    app: service-discovery
+    group: application
+spec:
+  selector:
+    app: service-discovery
+  ports:
+    - name: http
+      port: 8761
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-discovery-lb
+  namespace: ecommerce
+  labels:
+    app: service-discovery
+spec:
+  type: LoadBalancer
+  selector:
+    app: service-discovery
+  ports:
+    - name: http
+      port: 8761
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: service-discovery
+  namespace: ecommerce
+  labels:
+    app: service-discovery
+    group: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: service-discovery
+  template:
+    metadata:
+      labels:
+        app: service-discovery
+        group: application
+    spec:
+      containers:
+        - name: service-discovery
+          image: ecommerce/service-discovery:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8761
+          envFrom:
+            - configMapRef:
+                name: java-env
+          resources:
+            requests:
+              cpu: 100m
+              memory: 320Mi
+            limits:
+              memory: 640Mi
+          # failureThreshold x periodSeconds = 5 minutes of cold start before
+          # Kubernetes gives up. This replaces compose's start_period, and like
+          # start_period it keeps early failures from counting as crashes.
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5

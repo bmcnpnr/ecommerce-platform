@@ -1,0 +1,171 @@
+# React SPA served by nginx, with /api proxied to the gateway.
+#
+# The image is reused unchanged from compose, but its baked-in nginx.conf is
+# overridden by the ConfigMap below. Two things in the compose version do not
+# survive the move:
+#
+#   resolver 127.0.0.11   — Docker's embedded DNS. That address does not exist
+#                           in a pod; nginx would fail every proxied request.
+#   proxy_pass via a variable — a workaround for container IPs changing on
+#                           restart. A Service's ClusterIP is stable for the
+#                           life of the Service, so resolving once at startup
+#                           is correct again and the variable indirection (and
+#                           the $request_uri it forces) can go.
+#
+# Two Services: `frontend` on :80 is what nginx-exporter and blackbox scrape
+# (both address it by that name and port), `frontend-lb` publishes it on host
+# port 3000 to match docker-compose.yml.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: frontend-nginx
+  namespace: ecommerce
+data:
+  default.conf: |
+    server {
+        listen 80;
+        listen [::]:80;
+        server_name _;
+
+        root /usr/share/nginx/html;
+        index index.html;
+
+        gzip on;
+        gzip_types text/plain text/css application/json application/javascript
+                   text/xml application/xml application/xml+rss text/javascript;
+
+        # nginx metrics for nginx-prometheus-exporter. Without this the
+        # exporter's scrape falls through to the SPA fallback below, receives
+        # HTML, and every nginx_* metric goes missing.
+        location = /stub_status {
+            stub_status;
+            access_log off;
+            allow 10.0.0.0/8;
+            allow 172.16.0.0/12;
+            allow 192.168.0.0/16;
+            allow 127.0.0.1;
+            deny all;
+        }
+
+        # '^~' so this wins over the static-asset regex below: without it a
+        # request such as /api/v1/products/logo.png would match the regex
+        # location and 404 instead of being proxied.
+        location ^~ /api/ {
+            proxy_pass         http://api-gateway:8080;
+            proxy_http_version 1.1;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $scheme;
+            proxy_read_timeout 60s;
+        }
+
+        location ^~ /actuator/ {
+            proxy_pass         http://api-gateway:8080;
+            proxy_http_version 1.1;
+            proxy_set_header   Host      $host;
+            proxy_set_header   X-Real-IP $remote_addr;
+        }
+
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?|ttf|eot)$ {
+            expires 1y;
+            add_header Cache-Control "public, immutable";
+            try_files $uri =404;
+        }
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+    }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: ecommerce
+  labels:
+    app: frontend
+    group: frontend
+spec:
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend-lb
+  namespace: ecommerce
+  labels:
+    app: frontend
+spec:
+  type: LoadBalancer
+  selector:
+    app: frontend
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: ecommerce
+  labels:
+    app: frontend
+    group: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+        group: frontend
+      annotations:
+        # Roll the pods when the proxy config changes; without this a ConfigMap
+        # edit only reaches nginx on the next unrelated restart.
+        checksum/nginx-config: "v1"
+    spec:
+      containers:
+        - name: nginx
+          image: ecommerce/frontend:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 5
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: frontend-nginx

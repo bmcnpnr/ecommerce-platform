@@ -1,0 +1,911 @@
+# The nine Spring Boot workloads. Uniform by design: same probe shape, same
+# envFrom, same init-container gating, so the only per-service differences are
+# the port, the database it owns, and whether it talks to Kafka.
+#
+# Kubernetes has no equivalent of compose's `depends_on: condition:
+# service_healthy`. Without something in its place every service would boot
+# before postgres and Eureka, fail fast, and back off — CrashLoopBackOff
+# stretches to 5 minutes between attempts, so a cold start that should take 90
+# seconds can take 10 minutes. The busybox init containers below reproduce the
+# compose ordering at a fraction of that cost.
+#
+# Probes use the split liveness/readiness groups enabled in 02-config.yaml.
+# Liveness must never depend on a downstream: pointing it at the aggregate
+# /actuator/health would let a 30-second database blip kill every JVM at once.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: ecommerce
+  labels:
+    app: user-service
+    group: application
+spec:
+  selector:
+    app: user-service
+  ports:
+    - name: http
+      port: 8081
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: ecommerce
+  labels:
+    app: user-service
+    group: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+        group: application
+    spec:
+      initContainers:
+        - name: wait-for-service-discovery
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z service-discovery 8761; do echo 'waiting for service-discovery'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-userdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z userdb 5432; do echo 'waiting for userdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: user-service
+          image: ecommerce/user-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8081
+          envFrom:
+            - configMapRef:
+                name: java-env
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://userdb:5432/userdb
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: userdb-credentials
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: userdb-credentials
+                  key: POSTGRES_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: JWT_SECRET
+          resources:
+            requests:
+              cpu: 100m
+              memory: 320Mi
+            limits:
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: product-service
+  namespace: ecommerce
+  labels:
+    app: product-service
+    group: application
+spec:
+  selector:
+    app: product-service
+  ports:
+    - name: http
+      port: 8082
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: product-service
+  namespace: ecommerce
+  labels:
+    app: product-service
+    group: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: product-service
+  template:
+    metadata:
+      labels:
+        app: product-service
+        group: application
+    spec:
+      initContainers:
+        - name: wait-for-service-discovery
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z service-discovery 8761; do echo 'waiting for service-discovery'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-productdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z productdb 5432; do echo 'waiting for productdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: product-service
+          image: ecommerce/product-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8082
+          envFrom:
+            - configMapRef:
+                name: java-env
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://productdb:5432/productdb
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: productdb-credentials
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: productdb-credentials
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 320Mi
+            limits:
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog-service
+  namespace: ecommerce
+  labels:
+    app: catalog-service
+    group: application
+spec:
+  selector:
+    app: catalog-service
+  ports:
+    - name: http
+      port: 8083
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog-service
+  namespace: ecommerce
+  labels:
+    app: catalog-service
+    group: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: catalog-service
+  template:
+    metadata:
+      labels:
+        app: catalog-service
+        group: application
+    spec:
+      initContainers:
+        - name: wait-for-service-discovery
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z service-discovery 8761; do echo 'waiting for service-discovery'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-catalogdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z catalogdb 5432; do echo 'waiting for catalogdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: catalog-service
+          image: ecommerce/catalog-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8083
+          envFrom:
+            - configMapRef:
+                name: java-env
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://catalogdb:5432/catalogdb
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: catalogdb-credentials
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: catalogdb-credentials
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 320Mi
+            limits:
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order-service
+  namespace: ecommerce
+  labels:
+    app: order-service
+    group: application
+spec:
+  selector:
+    app: order-service
+  ports:
+    - name: http
+      port: 8084
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-service
+  namespace: ecommerce
+  labels:
+    app: order-service
+    group: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order-service
+  template:
+    metadata:
+      labels:
+        app: order-service
+        group: application
+    spec:
+      initContainers:
+        - name: wait-for-service-discovery
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z service-discovery 8761; do echo 'waiting for service-discovery'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-orderdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z orderdb 5432; do echo 'waiting for orderdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z kafka 29092; do echo 'waiting for kafka'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: order-service
+          image: ecommerce/order-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8084
+          envFrom:
+            - configMapRef:
+                name: java-env
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://orderdb:5432/orderdb
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: orderdb-credentials
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: orderdb-credentials
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 320Mi
+            limits:
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payment-service
+  namespace: ecommerce
+  labels:
+    app: payment-service
+    group: application
+spec:
+  selector:
+    app: payment-service
+  ports:
+    - name: http
+      port: 8085
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payment-service
+  namespace: ecommerce
+  labels:
+    app: payment-service
+    group: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: payment-service
+  template:
+    metadata:
+      labels:
+        app: payment-service
+        group: application
+    spec:
+      initContainers:
+        - name: wait-for-service-discovery
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z service-discovery 8761; do echo 'waiting for service-discovery'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-paymentdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z paymentdb 5432; do echo 'waiting for paymentdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z kafka 29092; do echo 'waiting for kafka'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: payment-service
+          image: ecommerce/payment-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8085
+          envFrom:
+            - configMapRef:
+                name: java-env
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://paymentdb:5432/paymentdb
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: paymentdb-credentials
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: paymentdb-credentials
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 320Mi
+            limits:
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shipping-service
+  namespace: ecommerce
+  labels:
+    app: shipping-service
+    group: application
+spec:
+  selector:
+    app: shipping-service
+  ports:
+    - name: http
+      port: 8086
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: shipping-service
+  namespace: ecommerce
+  labels:
+    app: shipping-service
+    group: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shipping-service
+  template:
+    metadata:
+      labels:
+        app: shipping-service
+        group: application
+    spec:
+      initContainers:
+        - name: wait-for-service-discovery
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z service-discovery 8761; do echo 'waiting for service-discovery'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-shippingdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z shippingdb 5432; do echo 'waiting for shippingdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z kafka 29092; do echo 'waiting for kafka'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: shipping-service
+          image: ecommerce/shipping-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8086
+          envFrom:
+            - configMapRef:
+                name: java-env
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://shippingdb:5432/shippingdb
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: shippingdb-credentials
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: shippingdb-credentials
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 320Mi
+            limits:
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: review-service
+  namespace: ecommerce
+  labels:
+    app: review-service
+    group: application
+spec:
+  selector:
+    app: review-service
+  ports:
+    - name: http
+      port: 8087
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: review-service
+  namespace: ecommerce
+  labels:
+    app: review-service
+    group: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: review-service
+  template:
+    metadata:
+      labels:
+        app: review-service
+        group: application
+    spec:
+      initContainers:
+        - name: wait-for-service-discovery
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z service-discovery 8761; do echo 'waiting for service-discovery'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-reviewdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z reviewdb 5432; do echo 'waiting for reviewdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: review-service
+          image: ecommerce/review-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8087
+          envFrom:
+            - configMapRef:
+                name: java-env
+          env:
+            - name: SPRING_DATASOURCE_URL
+              value: jdbc:postgresql://reviewdb:5432/reviewdb
+            - name: DB_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: reviewdb-credentials
+                  key: POSTGRES_USER
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: reviewdb-credentials
+                  key: POSTGRES_PASSWORD
+          resources:
+            requests:
+              cpu: 100m
+              memory: 320Mi
+            limits:
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification-service
+  namespace: ecommerce
+  labels:
+    app: notification-service
+    group: application
+spec:
+  selector:
+    app: notification-service
+  ports:
+    - name: http
+      port: 8088
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification-service
+  namespace: ecommerce
+  labels:
+    app: notification-service
+    group: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification-service
+  template:
+    metadata:
+      labels:
+        app: notification-service
+        group: application
+    spec:
+      initContainers:
+        - name: wait-for-service-discovery
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z service-discovery 8761; do echo 'waiting for service-discovery'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+        - name: wait-for-kafka
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z kafka 29092; do echo 'waiting for kafka'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: notification-service
+          image: ecommerce/notification-service:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8088
+          envFrom:
+            - configMapRef:
+                name: java-env
+          resources:
+            requests:
+              cpu: 100m
+              memory: 320Mi
+            limits:
+              memory: 640Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: ecommerce
+  labels:
+    app: api-gateway
+    group: application
+spec:
+  selector:
+    app: api-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway-lb
+  namespace: ecommerce
+  labels:
+    app: api-gateway
+spec:
+  type: LoadBalancer
+  selector:
+    app: api-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: ecommerce
+  labels:
+    app: api-gateway
+    group: application
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+        group: application
+    spec:
+      initContainers:
+        - name: wait-for-service-discovery
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z service-discovery 8761; do echo 'waiting for service-discovery'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: api-gateway
+          image: ecommerce/api-gateway:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - configMapRef:
+                name: java-env
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: JWT_SECRET
+          resources:
+            requests:
+              cpu: 100m
+              memory: 320Mi
+            limits:
+              memory: 768Mi
+          startupProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /actuator/health/readiness
+              port: http
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /actuator/health/liveness
+              port: http
+            periodSeconds: 20
+            failureThreshold: 5

@@ -1,0 +1,707 @@
+# One PostgreSQL instance per service, mirroring docker-compose.yml.
+#
+# StatefulSet rather than Deployment: the identity (userdb-0) and its PVC stay
+# bound together across restarts, and the default rolling update never runs two
+# postgres processes against the same volume — a Deployment would, briefly, and
+# postgres refuses to start on a directory another postmaster still holds.
+#
+# PGDATA points at a *subdirectory* of the mount. The volume root belongs to the
+# provisioner and postgres' initdb insists on an empty directory it owns.
+#
+# The <name>-lb Services publish each database on the same host port as
+# docker-compose.yml, so existing psql/DataGrip connections keep working. They
+# are separate objects from the in-cluster Service so that the internal name
+# and port (userdb:5432) stay untouched.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: userdb
+  namespace: ecommerce
+  labels:
+    app: userdb
+    group: database
+spec:
+  selector:
+    app: userdb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: userdb-lb
+  namespace: ecommerce
+  labels:
+    app: userdb
+    group: database
+spec:
+  type: LoadBalancer
+  selector:
+    app: userdb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: userdb
+  namespace: ecommerce
+  labels:
+    app: userdb
+    group: database
+spec:
+  serviceName: userdb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: userdb
+  template:
+    metadata:
+      labels:
+        app: userdb
+        group: database
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: userdb-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: productdb
+  namespace: ecommerce
+  labels:
+    app: productdb
+    group: database
+spec:
+  selector:
+    app: productdb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: productdb-lb
+  namespace: ecommerce
+  labels:
+    app: productdb
+    group: database
+spec:
+  type: LoadBalancer
+  selector:
+    app: productdb
+  ports:
+    - name: postgres
+      port: 5433
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: productdb
+  namespace: ecommerce
+  labels:
+    app: productdb
+    group: database
+spec:
+  serviceName: productdb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: productdb
+  template:
+    metadata:
+      labels:
+        app: productdb
+        group: database
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: productdb-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalogdb
+  namespace: ecommerce
+  labels:
+    app: catalogdb
+    group: database
+spec:
+  selector:
+    app: catalogdb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalogdb-lb
+  namespace: ecommerce
+  labels:
+    app: catalogdb
+    group: database
+spec:
+  type: LoadBalancer
+  selector:
+    app: catalogdb
+  ports:
+    - name: postgres
+      port: 5435
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: catalogdb
+  namespace: ecommerce
+  labels:
+    app: catalogdb
+    group: database
+spec:
+  serviceName: catalogdb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: catalogdb
+  template:
+    metadata:
+      labels:
+        app: catalogdb
+        group: database
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: catalogdb-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orderdb
+  namespace: ecommerce
+  labels:
+    app: orderdb
+    group: database
+spec:
+  selector:
+    app: orderdb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orderdb-lb
+  namespace: ecommerce
+  labels:
+    app: orderdb
+    group: database
+spec:
+  type: LoadBalancer
+  selector:
+    app: orderdb
+  ports:
+    - name: postgres
+      port: 5434
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: orderdb
+  namespace: ecommerce
+  labels:
+    app: orderdb
+    group: database
+spec:
+  serviceName: orderdb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orderdb
+  template:
+    metadata:
+      labels:
+        app: orderdb
+        group: database
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: orderdb-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paymentdb
+  namespace: ecommerce
+  labels:
+    app: paymentdb
+    group: database
+spec:
+  selector:
+    app: paymentdb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: paymentdb-lb
+  namespace: ecommerce
+  labels:
+    app: paymentdb
+    group: database
+spec:
+  type: LoadBalancer
+  selector:
+    app: paymentdb
+  ports:
+    - name: postgres
+      port: 5436
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: paymentdb
+  namespace: ecommerce
+  labels:
+    app: paymentdb
+    group: database
+spec:
+  serviceName: paymentdb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: paymentdb
+  template:
+    metadata:
+      labels:
+        app: paymentdb
+        group: database
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: paymentdb-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shippingdb
+  namespace: ecommerce
+  labels:
+    app: shippingdb
+    group: database
+spec:
+  selector:
+    app: shippingdb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: shippingdb-lb
+  namespace: ecommerce
+  labels:
+    app: shippingdb
+    group: database
+spec:
+  type: LoadBalancer
+  selector:
+    app: shippingdb
+  ports:
+    - name: postgres
+      port: 5437
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: shippingdb
+  namespace: ecommerce
+  labels:
+    app: shippingdb
+    group: database
+spec:
+  serviceName: shippingdb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: shippingdb
+  template:
+    metadata:
+      labels:
+        app: shippingdb
+        group: database
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: shippingdb-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reviewdb
+  namespace: ecommerce
+  labels:
+    app: reviewdb
+    group: database
+spec:
+  selector:
+    app: reviewdb
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: reviewdb-lb
+  namespace: ecommerce
+  labels:
+    app: reviewdb
+    group: database
+spec:
+  type: LoadBalancer
+  selector:
+    app: reviewdb
+  ports:
+    - name: postgres
+      port: 5438
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: reviewdb
+  namespace: ecommerce
+  labels:
+    app: reviewdb
+    group: database
+spec:
+  serviceName: reviewdb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: reviewdb
+  template:
+    metadata:
+      labels:
+        app: reviewdb
+        group: database
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          envFrom:
+            - secretRef:
+                name: reviewdb-credentials
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi

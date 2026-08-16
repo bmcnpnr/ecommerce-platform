@@ -1,0 +1,180 @@
+# Single-node Kafka in KRaft mode (broker + controller in one process).
+#
+# Two differences from the compose definition, both forced by Kubernetes:
+#
+# 1. KAFKA_LISTENERS binds 0.0.0.0 instead of the hostname `kafka`. Under
+#    compose, `kafka` resolves to the container's own IP so binding to it
+#    works. Here `kafka` is a Service VIP that exists on no interface, and
+#    the broker would fail to bind it.
+# 2. The controller quorum voter uses the StatefulSet's stable pod DNS name
+#    rather than the Service name — a controller must reach *itself*, not a
+#    load-balanced VIP. publishNotReadyAddresses on the headless Service is
+#    what makes that name resolve during startup, before the broker is up.
+#
+# The compose PLAINTEXT_HOST listener (advertised as localhost:9092) is gone:
+# it existed only for host-side clients. Use kafka-ui, or port-forward.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka-headless
+  namespace: ecommerce
+  labels:
+    app: kafka
+    group: messaging
+spec:
+  clusterIP: None
+  # The broker resolves its own controller-quorum address through this Service
+  # while it is still starting, i.e. while the pod is by definition not ready.
+  publishNotReadyAddresses: true
+  selector:
+    app: kafka
+  ports:
+    - name: internal
+      port: 29092
+      targetPort: internal
+    - name: controller
+      port: 9093
+      targetPort: controller
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kafka
+  namespace: ecommerce
+  labels:
+    app: kafka
+    group: messaging
+spec:
+  selector:
+    app: kafka
+  ports:
+    - name: internal
+      port: 29092
+      targetPort: internal
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: kafka
+  namespace: ecommerce
+  labels:
+    app: kafka
+    group: messaging
+spec:
+  serviceName: kafka-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kafka
+  template:
+    metadata:
+      labels:
+        app: kafka
+        group: messaging
+    spec:
+      # Load-bearing. Kubernetes injects Docker-link-style variables for every
+      # Service in the namespace, so the Service named `kafka` puts
+      # KAFKA_PORT=tcp://10.x.x.x:29092 into this very pod. cp-kafka's configure
+      # script reads KAFKA_PORT as the deprecated `port` broker setting, writes
+      # `port=tcp://10.x.x.x:29092` into server.properties, and the broker exits
+      # 1 about a second after start — after "Running in KRaft mode..." and
+      # before any Kafka log line, which makes it look like a storage problem.
+      # The giveaway is the "port is deprecated" warning in the container log.
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 60
+      initContainers:
+        # cp-kafka runs as appuser (uid 1000) and a freshly provisioned PVC is
+        # owned by root, so the KRaft storage format fails before the broker
+        # ever logs a line. Compose never hit this: Docker seeds a new named
+        # volume with the ownership of the image's directory, while a PVC
+        # starts as an empty root-owned directory.
+        - name: chown-data
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 1000:1000 /var/lib/kafka/data"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: kafka
+          image: confluentinc/cp-kafka:7.6.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: internal
+              containerPort: 29092
+            - name: controller
+              containerPort: 9093
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: broker,controller
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: 1@kafka-0.kafka-headless.ecommerce.svc.cluster.local:9093
+            - name: KAFKA_LISTENERS
+              value: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: PLAINTEXT://kafka:29092
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: CONTROLLER
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: PLAINTEXT
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "0"
+            - name: KAFKA_AUTO_CREATE_TOPICS_ENABLE
+              value: "true"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_HEAP_OPTS
+              value: -Xmx640m -Xms320m
+            # Only applied when formatting an empty data volume; an already
+            # formatted volume keeps the cluster id written into meta.properties.
+            - name: CLUSTER_ID
+              value: MkU3OEVBNTcwNTJENDM2Qk
+          resources:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+            limits:
+              memory: 1200Mi
+          # A TCP probe, not compose's kafka-broker-api-versions: that script
+          # starts a fresh JVM on every check, which at a 10s interval costs
+          # more CPU than the broker itself on a laptop-sized node.
+          startupProbe:
+            tcpSocket:
+              port: internal
+            periodSeconds: 5
+            failureThreshold: 36
+          readinessProbe:
+            tcpSocket:
+              port: internal
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            tcpSocket:
+              port: internal
+            periodSeconds: 20
+            failureThreshold: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi

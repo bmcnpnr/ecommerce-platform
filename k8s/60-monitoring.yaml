@@ -1,0 +1,847 @@
+# Prometheus / Alertmanager / Loki / Tempo / Grafana / Promtail.
+#
+# Every config file except Promtail's is reused verbatim from
+# ../../ecommerce-monitoring — those files address everything by service name
+# (prometheus:9090, tempo:4318, user-service:8081 …) and the Services in this
+# directory carry exactly the same names, so nothing needed rewriting. The
+# deploy script turns those files into ConfigMaps; see k8s/README.md for why
+# they are not inlined here.
+#
+# Promtail is the exception: its compose config discovers containers through
+# the Docker socket, which no longer exists here. The version below uses the
+# Kubernetes API instead, and adds a `cri` pipeline stage because containerd
+# writes logs in CRI format rather than Docker's JSON.
+#
+# Each stateful component gets a root init container that chowns its volume.
+# The images run as non-root (prometheus 65534, grafana 472, loki 10001) and a
+# freshly provisioned PVC is owned by root, so without this they start, fail to
+# open their data directory, and crash-loop.
+
+# ─── Prometheus ────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: prometheus-data
+  namespace: ecommerce
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: ecommerce
+  labels:
+    app: prometheus
+    group: monitoring
+spec:
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus-lb
+  namespace: ecommerce
+  labels:
+    app: prometheus
+spec:
+  type: LoadBalancer
+  selector:
+    app: prometheus
+  ports:
+    - name: http
+      port: 9090
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: ecommerce
+  labels:
+    app: prometheus
+    group: monitoring
+spec:
+  replicas: 1
+  strategy:
+    # ReadWriteOnce volume: a rolling update would deadlock waiting for the old
+    # pod to release it. Same reason applies to every PVC-backed workload here.
+    type: Recreate
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+        group: monitoring
+    spec:
+      initContainers:
+        - name: chown-data
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 65534:65534 /prometheus"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /prometheus
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v2.52.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=15d
+            - --web.console.libraries=/usr/share/prometheus/console_libraries
+            - --web.console.templates=/usr/share/prometheus/consoles
+            - --web.enable-lifecycle
+            # Tempo's metrics-generator remote-writes span metrics here.
+            - --web.enable-remote-write-receiver
+          ports:
+            - name: http
+              containerPort: 9090
+          resources:
+            requests:
+              cpu: 100m
+              memory: 384Mi
+            limits:
+              memory: 640Mi
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /etc/prometheus/prometheus.yml
+              subPath: prometheus.yml
+            - name: rules
+              mountPath: /etc/prometheus/rules
+            - name: data
+              mountPath: /prometheus
+      volumes:
+        - name: config
+          configMap:
+            name: prometheus-config
+        - name: rules
+          configMap:
+            name: prometheus-rules
+        - name: data
+          persistentVolumeClaim:
+            claimName: prometheus-data
+
+# ─── Alertmanager ──────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: alertmanager-data
+  namespace: ecommerce
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: ecommerce
+  labels:
+    app: alertmanager
+    group: monitoring
+spec:
+  selector:
+    app: alertmanager
+  ports:
+    - name: http
+      port: 9093
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager-lb
+  namespace: ecommerce
+  labels:
+    app: alertmanager
+spec:
+  type: LoadBalancer
+  selector:
+    app: alertmanager
+  ports:
+    - name: http
+      port: 9093
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: ecommerce
+  labels:
+    app: alertmanager
+    group: monitoring
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+        group: monitoring
+    spec:
+      initContainers:
+        - name: chown-data
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 65534:65534 /alertmanager"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /alertmanager
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.27.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --config.file=/etc/alertmanager/alertmanager.yml
+            - --storage.path=/alertmanager
+          ports:
+            - name: http
+              containerPort: 9093
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              memory: 128Mi
+          readinessProbe:
+            httpGet:
+              path: /-/ready
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 5
+          livenessProbe:
+            httpGet:
+              path: /-/healthy
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            failureThreshold: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/alertmanager/alertmanager.yml
+              subPath: alertmanager.yml
+            - name: data
+              mountPath: /alertmanager
+      volumes:
+        - name: config
+          configMap:
+            name: alertmanager-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: alertmanager-data
+
+# ─── Loki ──────────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loki-data
+  namespace: ecommerce
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: ecommerce
+  labels:
+    app: loki
+    group: monitoring
+spec:
+  selector:
+    app: loki
+  ports:
+    - name: http
+      port: 3100
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: ecommerce
+  labels:
+    app: loki
+    group: monitoring
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: loki
+  template:
+    metadata:
+      labels:
+        app: loki
+        group: monitoring
+    spec:
+      initContainers:
+        - name: chown-data
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 10001:10001 /loki"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /loki
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: loki
+          image: grafana/loki:3.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config.file=/etc/loki/loki-config.yml
+          ports:
+            - name: http
+              containerPort: 3100
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /etc/loki/loki-config.yml
+              subPath: loki-config.yml
+            - name: data
+              mountPath: /loki
+      volumes:
+        - name: config
+          configMap:
+            name: loki-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: loki-data
+
+# ─── Tempo ─────────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tempo-data
+  namespace: ecommerce
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: ecommerce
+  labels:
+    app: tempo
+    group: monitoring
+spec:
+  selector:
+    app: tempo
+  ports:
+    - name: http
+      port: 3200
+      targetPort: http
+    - name: otlp-grpc
+      port: 4317
+      targetPort: otlp-grpc
+    # Every Spring service exports spans to http://tempo:4318 via the
+    # OTEL_EXPORTER_OTLP_ENDPOINT in 02-config.yaml.
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: ecommerce
+  labels:
+    app: tempo
+    group: monitoring
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tempo
+  template:
+    metadata:
+      labels:
+        app: tempo
+        group: monitoring
+    spec:
+      initContainers:
+        - name: chown-data
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 10001:10001 /var/tempo"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /var/tempo
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: tempo
+          image: grafana/tempo:2.5.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config.file=/etc/tempo/tempo-config.yml
+          ports:
+            - name: http
+              containerPort: 3200
+            - name: otlp-grpc
+              containerPort: 4317
+            - name: otlp-http
+              containerPort: 4318
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /etc/tempo/tempo-config.yml
+              subPath: tempo-config.yml
+            - name: data
+              mountPath: /var/tempo
+      volumes:
+        - name: config
+          configMap:
+            name: tempo-config
+        - name: data
+          persistentVolumeClaim:
+            claimName: tempo-data
+
+# ─── Grafana ───────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-data
+  namespace: ecommerce
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: ecommerce
+  labels:
+    app: grafana
+    group: monitoring
+spec:
+  selector:
+    app: grafana
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana-lb
+  namespace: ecommerce
+  labels:
+    app: grafana
+spec:
+  type: LoadBalancer
+  selector:
+    app: grafana
+  ports:
+    # Host port 3001, matching docker-compose.yml's "3001:3000".
+    - name: http
+      port: 3001
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: ecommerce
+  labels:
+    app: grafana
+    group: monitoring
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+        group: monitoring
+    spec:
+      initContainers:
+        - name: chown-data
+          image: busybox:1.36
+          command: ["sh", "-c", "chown -R 472:472 /var/lib/grafana"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/grafana
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.1.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: GF_SECURITY_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: GF_SECURITY_ADMIN_USER
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: GF_SECURITY_ADMIN_PASSWORD
+            - name: GF_USERS_ALLOW_SIGN_UP
+              value: "false"
+            - name: GF_SERVER_ROOT_URL
+              value: http://localhost:3001
+            - name: GF_FEATURE_TOGGLES_ENABLE
+              value: traceqlEditor traceQLStreaming metricsSummary
+          resources:
+            requests:
+              cpu: 50m
+              memory: 192Mi
+            limits:
+              memory: 384Mi
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 15
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            initialDelaySeconds: 45
+            periodSeconds: 20
+            failureThreshold: 6
+          volumeMounts:
+            # The dashboards mount sits *inside* the data mount. kubelet mounts
+            # parents before children, so the PVC lands on /var/lib/grafana
+            # first and the ConfigMap on the subdirectory after.
+            - name: data
+              mountPath: /var/lib/grafana
+            - name: dashboards
+              mountPath: /var/lib/grafana/dashboards
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: grafana-data
+        - name: dashboards
+          configMap:
+            name: grafana-dashboards
+        - name: datasources
+          configMap:
+            name: grafana-datasources
+        - name: dashboard-provider
+          configMap:
+            name: grafana-dashboard-provider
+
+# ─── Promtail ──────────────────────────────────────────────────────────────
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: promtail
+  namespace: ecommerce
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: promtail-ecommerce
+rules:
+  - apiGroups: [""]
+    resources: ["nodes", "nodes/proxy", "services", "endpoints", "pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: promtail-ecommerce
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: promtail-ecommerce
+subjects:
+  - kind: ServiceAccount
+    name: promtail
+    namespace: ecommerce
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: promtail-config
+  namespace: ecommerce
+data:
+  promtail-config.yml: |
+    server:
+      http_listen_port: 9080
+      grpc_listen_port: 0
+
+    positions:
+      filename: /run/promtail/positions.yaml
+
+    clients:
+      - url: http://loki:3100/loki/api/v1/push
+
+    scrape_configs:
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        pipeline_stages:
+          # Must match the node's container runtime. containerd and CRI-O write
+          # '<ts> stdout F <line>' and need `cri`; cri-dockerd writes Docker's
+          # {"log":...,"stream":...,"time":...} JSON and needs `docker`. Get it
+          # wrong and lines still ship, but the regex below matches nothing and
+          # every log arrives unparsed with no level label. Check with:
+          #   kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}'
+          - cri: {}
+          # Spring Boot console pattern:
+          # 2024-01-01 12:00:00 [correlationId] [main] INFO  c.e.Foo - message
+          - regex:
+              expression: '^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+\[(?P<correlationId>[^\]]*)\]\s+\[(?P<thread>[^\]]+)\]\s+(?P<level>\w+)\s+(?P<logger>\S+)\s+-\s+(?P<message>.*)'
+          # Only bounded-cardinality fields may become stream labels.
+          # correlationId is unique per request and thread is near-unique;
+          # promoting either would create a Loki stream per request. They go in
+          # as structured metadata, which stays queryable without that cost.
+          - labels:
+              level:
+          - structured_metadata:
+              correlationId:
+              thread:
+          - timestamp:
+              source: timestamp
+              format: "2006-01-02 15:04:05"
+              location: "UTC"
+          - match:
+              selector: '{service=~".+"}'
+              stages:
+                - drop:
+                    expression: '.*\bDEBUG\b.*'
+                    drop_counter_reason: debug_log_dropped
+          - match:
+              selector: '{service=~".+"}'
+              stages:
+                - regex:
+                    expression: '"traceId"\s*:\s*"(?P<traceId>[a-f0-9]+)"'
+                - structured_metadata:
+                    traceId:
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_namespace]
+            action: keep
+            regex: ecommerce
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            target_label: service
+          # Same allow-list as the compose config: application logs only, not
+          # the monitoring stack's own chatter.
+          - source_labels: [service]
+            action: keep
+            regex: (user-service|product-service|catalog-service|order-service|payment-service|shipping-service|review-service|notification-service|api-gateway|service-discovery|kafka|frontend)
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+          - source_labels: [__meta_kubernetes_pod_container_name]
+            target_label: container
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: node
+          # Required, not cosmetic. Promtail tails only pods on its own node
+          # and decides that by comparing __host__ against its hostname. With
+          # no __host__ every discovered target is silently discarded — the
+          # symptom is promtail_targets_active_total 0 and no error anywhere.
+          # The DaemonSet overrides HOSTNAME with spec.nodeName to match, since
+          # a pod's real hostname is the pod name.
+          - source_labels: [__meta_kubernetes_pod_node_name]
+            target_label: __host__
+          # Resolves to /var/log/pods/<namespace>_<pod>_<uid>/<container>/*.log
+          - source_labels:
+              - __meta_kubernetes_pod_uid
+              - __meta_kubernetes_pod_container_name
+            separator: /
+            target_label: __path__
+            replacement: /var/log/pods/*$1/*.log
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: promtail
+  namespace: ecommerce
+  labels:
+    app: promtail
+    group: monitoring
+spec:
+  selector:
+    matchLabels:
+      app: promtail
+  template:
+    metadata:
+      labels:
+        app: promtail
+        group: monitoring
+    spec:
+      serviceAccountName: promtail
+      containers:
+        - name: promtail
+          image: grafana/promtail:3.1.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - -config.file=/etc/promtail/promtail-config.yml
+          env:
+            # Must equal the node name for the __host__ relabel above to match.
+            - name: HOSTNAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          ports:
+            - name: http
+              containerPort: 9080
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            # /var/log/pods is root-owned on the node.
+            runAsUser: 0
+          volumeMounts:
+            - name: config
+              mountPath: /etc/promtail
+            - name: positions
+              mountPath: /run/promtail
+            - name: pod-logs
+              mountPath: /var/log/pods
+              readOnly: true
+            - name: container-logs
+              mountPath: /var/log/containers
+              readOnly: true
+            # Under containerd the files in /var/log/pods are real, so the two
+            # mounts above are enough. On a cri-dockerd node they are symlinks
+            # into /var/lib/docker/containers and that path must be mounted too,
+            # or promtail globs the filenames and then fails every one with
+            # "failed to tail file, stat failed ... no such file or directory".
+      volumes:
+        - name: config
+          configMap:
+            name: promtail-config
+        - name: positions
+          hostPath:
+            path: /var/lib/promtail
+            type: DirectoryOrCreate
+        - name: pod-logs
+          hostPath:
+            path: /var/log/pods
+        - name: container-logs
+          hostPath:
+            path: /var/log/containers

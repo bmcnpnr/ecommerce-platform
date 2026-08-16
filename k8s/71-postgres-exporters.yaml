@@ -1,0 +1,534 @@
+# One postgres-exporter per database, matching docker-compose.yml.
+#
+# Unlike compose, every exporter listens on 9187 — each has its own Service, so
+# there is no host-port collision to work around and prometheus.yml's
+# postgres-exporter-<db>:9187 targets work unchanged.
+#
+# DATA_SOURCE_NAME (user, password, host and database in one URI) lives in the
+# same Secret as the database's own credentials, so a password rotation is a
+# one-line edit rather than three.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter-userdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-userdb
+    group: database
+    database: userdb
+spec:
+  selector:
+    app: postgres-exporter-userdb
+  ports:
+    - name: http
+      port: 9187
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter-userdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-userdb
+    group: database
+    database: userdb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter-userdb
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter-userdb
+        group: database
+        database: userdb
+    spec:
+      initContainers:
+        - name: wait-for-userdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z userdb 5432; do echo 'waiting for userdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:v0.15.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9187
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: userdb-credentials
+                  key: DATA_SOURCE_NAME
+            - name: PG_EXPORTER_EXTEND_QUERY_PATH
+              value: /etc/postgres-exporter/queries.yml
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 96Mi
+          volumeMounts:
+            - name: queries
+              mountPath: /etc/postgres-exporter
+      volumes:
+        - name: queries
+          configMap:
+            name: postgres-exporter-queries
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter-productdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-productdb
+    group: database
+    database: productdb
+spec:
+  selector:
+    app: postgres-exporter-productdb
+  ports:
+    - name: http
+      port: 9187
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter-productdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-productdb
+    group: database
+    database: productdb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter-productdb
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter-productdb
+        group: database
+        database: productdb
+    spec:
+      initContainers:
+        - name: wait-for-productdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z productdb 5432; do echo 'waiting for productdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:v0.15.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9187
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: productdb-credentials
+                  key: DATA_SOURCE_NAME
+            - name: PG_EXPORTER_EXTEND_QUERY_PATH
+              value: /etc/postgres-exporter/queries.yml
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 96Mi
+          volumeMounts:
+            - name: queries
+              mountPath: /etc/postgres-exporter
+      volumes:
+        - name: queries
+          configMap:
+            name: postgres-exporter-queries
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter-catalogdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-catalogdb
+    group: database
+    database: catalogdb
+spec:
+  selector:
+    app: postgres-exporter-catalogdb
+  ports:
+    - name: http
+      port: 9187
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter-catalogdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-catalogdb
+    group: database
+    database: catalogdb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter-catalogdb
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter-catalogdb
+        group: database
+        database: catalogdb
+    spec:
+      initContainers:
+        - name: wait-for-catalogdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z catalogdb 5432; do echo 'waiting for catalogdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:v0.15.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9187
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: catalogdb-credentials
+                  key: DATA_SOURCE_NAME
+            - name: PG_EXPORTER_EXTEND_QUERY_PATH
+              value: /etc/postgres-exporter/queries.yml
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 96Mi
+          volumeMounts:
+            - name: queries
+              mountPath: /etc/postgres-exporter
+      volumes:
+        - name: queries
+          configMap:
+            name: postgres-exporter-queries
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter-orderdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-orderdb
+    group: database
+    database: orderdb
+spec:
+  selector:
+    app: postgres-exporter-orderdb
+  ports:
+    - name: http
+      port: 9187
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter-orderdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-orderdb
+    group: database
+    database: orderdb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter-orderdb
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter-orderdb
+        group: database
+        database: orderdb
+    spec:
+      initContainers:
+        - name: wait-for-orderdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z orderdb 5432; do echo 'waiting for orderdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:v0.15.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9187
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: orderdb-credentials
+                  key: DATA_SOURCE_NAME
+            - name: PG_EXPORTER_EXTEND_QUERY_PATH
+              value: /etc/postgres-exporter/queries.yml
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 96Mi
+          volumeMounts:
+            - name: queries
+              mountPath: /etc/postgres-exporter
+      volumes:
+        - name: queries
+          configMap:
+            name: postgres-exporter-queries
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter-paymentdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-paymentdb
+    group: database
+    database: paymentdb
+spec:
+  selector:
+    app: postgres-exporter-paymentdb
+  ports:
+    - name: http
+      port: 9187
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter-paymentdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-paymentdb
+    group: database
+    database: paymentdb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter-paymentdb
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter-paymentdb
+        group: database
+        database: paymentdb
+    spec:
+      initContainers:
+        - name: wait-for-paymentdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z paymentdb 5432; do echo 'waiting for paymentdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:v0.15.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9187
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: paymentdb-credentials
+                  key: DATA_SOURCE_NAME
+            - name: PG_EXPORTER_EXTEND_QUERY_PATH
+              value: /etc/postgres-exporter/queries.yml
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 96Mi
+          volumeMounts:
+            - name: queries
+              mountPath: /etc/postgres-exporter
+      volumes:
+        - name: queries
+          configMap:
+            name: postgres-exporter-queries
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter-shippingdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-shippingdb
+    group: database
+    database: shippingdb
+spec:
+  selector:
+    app: postgres-exporter-shippingdb
+  ports:
+    - name: http
+      port: 9187
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter-shippingdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-shippingdb
+    group: database
+    database: shippingdb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter-shippingdb
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter-shippingdb
+        group: database
+        database: shippingdb
+    spec:
+      initContainers:
+        - name: wait-for-shippingdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z shippingdb 5432; do echo 'waiting for shippingdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:v0.15.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9187
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: shippingdb-credentials
+                  key: DATA_SOURCE_NAME
+            - name: PG_EXPORTER_EXTEND_QUERY_PATH
+              value: /etc/postgres-exporter/queries.yml
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 96Mi
+          volumeMounts:
+            - name: queries
+              mountPath: /etc/postgres-exporter
+      volumes:
+        - name: queries
+          configMap:
+            name: postgres-exporter-queries
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-exporter-reviewdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-reviewdb
+    group: database
+    database: reviewdb
+spec:
+  selector:
+    app: postgres-exporter-reviewdb
+  ports:
+    - name: http
+      port: 9187
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-exporter-reviewdb
+  namespace: ecommerce
+  labels:
+    app: postgres-exporter-reviewdb
+    group: database
+    database: reviewdb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-exporter-reviewdb
+  template:
+    metadata:
+      labels:
+        app: postgres-exporter-reviewdb
+        group: database
+        database: reviewdb
+    spec:
+      initContainers:
+        - name: wait-for-reviewdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z reviewdb 5432; do echo 'waiting for reviewdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: postgres-exporter
+          image: prometheuscommunity/postgres-exporter:v0.15.0
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 9187
+          env:
+            - name: DATA_SOURCE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: reviewdb-credentials
+                  key: DATA_SOURCE_NAME
+            - name: PG_EXPORTER_EXTEND_QUERY_PATH
+              value: /etc/postgres-exporter/queries.yml
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 96Mi
+          volumeMounts:
+            - name: queries
+              mountPath: /etc/postgres-exporter
+      volumes:
+        - name: queries
+          configMap:
+            name: postgres-exporter-queries

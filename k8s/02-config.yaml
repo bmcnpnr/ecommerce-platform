@@ -1,0 +1,36 @@
+# The Kubernetes equivalent of the x-java-env anchor in docker-compose.yml.
+# Every Spring Boot pod pulls this in with envFrom, so service-to-service
+# addressing stays a single edit.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: java-env
+  namespace: ecommerce
+data:
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+  KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+  ENVIRONMENT: development
+
+  # Eureka is a *second*, client-side discovery mechanism layered on top of
+  # Kubernetes Services: the gateway routes with lb://user-service, which
+  # resolves through Eureka, not through kube-dns. Registering the pod IP is
+  # what makes that work — a pod's hostname (user-service-7d4f9c...) is not
+  # resolvable by other pods, so the default hostname registration would give
+  # the gateway an address it cannot dial. Pod IPs are routable cluster-wide.
+  EUREKA_INSTANCE_PREFER_IP_ADDRESS: "true"
+
+  # Splits /actuator/health into /actuator/health/liveness and
+  # /actuator/health/readiness. Without this the only probe URL is the
+  # aggregate health endpoint, and a momentarily unreachable database would
+  # fail the liveness probe and have Kubernetes kill an otherwise healthy JVM.
+  MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED: "true"
+
+  # MaxRAMPercentage is read from the container's cgroup limit, which here is
+  # the pod's resources.limits.memory — same contract as compose's mem_limit.
+  # ActiveProcessorCount caps GC/ForkJoin/Netty pool sizing: the node reports
+  # 32 CPUs, so ten unconstrained JVMs would each start ~23 GC threads.
+  JAVA_OPTS: >-
+    -XX:MaxRAMPercentage=55
+    -XX:ActiveProcessorCount=2
+    -XX:+ExitOnOutOfMemoryError

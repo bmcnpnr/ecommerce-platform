@@ -55,6 +55,17 @@ x-db-healthcheck: &db-healthcheck
   timeout: 5s
   retries: 5
 
+# The json-file driver is unbounded by default, and a service that fails in a
+# tight retry loop writes at disk speed. notification-service did exactly that
+# against a poison-pill record on shipment.created and reached 992GB in one
+# run, filling the Docker VM disk. 50m x 3 caps any single container at 150MB.
+# (Kubernetes needs no equivalent: kubelet rotates at 10MB x 5 by default.)
+x-default-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
 
   # ─── Infrastructure ─────────────────────────────────────────────────
@@ -63,6 +74,7 @@ services:
     image: confluentinc/cp-kafka:7.6.0
     container_name: kafka
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 1200m
     ports:
       - "9092:9092"
@@ -101,6 +113,7 @@ services:
     image: postgres:16-alpine
     container_name: userdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 256m
     environment:
       POSTGRES_DB: userdb
@@ -120,6 +133,7 @@ services:
     image: postgres:16-alpine
     container_name: productdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 256m
     environment:
       POSTGRES_DB: productdb
@@ -139,6 +153,7 @@ services:
     image: postgres:16-alpine
     container_name: catalogdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 256m
     environment:
       POSTGRES_DB: catalogdb
@@ -158,6 +173,7 @@ services:
     image: postgres:16-alpine
     container_name: orderdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 256m
     environment:
       POSTGRES_DB: orderdb
@@ -177,6 +193,7 @@ services:
     image: postgres:16-alpine
     container_name: paymentdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 256m
     environment:
       POSTGRES_DB: paymentdb
@@ -196,6 +213,7 @@ services:
     image: postgres:16-alpine
     container_name: shippingdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 256m
     environment:
       POSTGRES_DB: shippingdb
@@ -215,6 +233,7 @@ services:
     image: postgres:16-alpine
     container_name: reviewdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 256m
     environment:
       POSTGRES_DB: reviewdb
@@ -238,6 +257,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: service-discovery
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 640m
     ports:
       - "8761:8761"
@@ -256,6 +276,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: user-service
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 768m
     ports:
       - "8081:8081"
@@ -282,6 +303,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: product-service
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 768m
     ports:
       - "8082:8082"
@@ -307,6 +329,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: catalog-service
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 768m
     ports:
       - "8083:8083"
@@ -332,6 +355,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: order-service
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 768m
     ports:
       - "8084:8084"
@@ -360,6 +384,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: payment-service
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 768m
     ports:
       - "8085:8085"
@@ -388,6 +413,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: shipping-service
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 768m
     ports:
       - "8086:8086"
@@ -416,6 +442,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: review-service
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 768m
     ports:
       - "8087:8087"
@@ -441,6 +468,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: notification-service
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 640m
     ports:
       - "8088:8088"
@@ -464,6 +492,7 @@ services:
       dockerfile: docker/Dockerfile
     container_name: api-gateway
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 768m
     ports:
       - "8080:8080"
@@ -485,6 +514,7 @@ services:
     image: prom/prometheus:v2.52.0
     container_name: prometheus
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 640m
     command:
       - --config.file=/etc/prometheus/prometheus.yml
@@ -514,6 +544,7 @@ services:
     image: grafana/grafana:11.1.0
     container_name: grafana
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 384m
     ports:
       - "3001:3000"
@@ -543,6 +574,7 @@ services:
     image: grafana/loki:3.1.0
     container_name: loki
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 512m
     command: -config.file=/etc/loki/loki-config.yml
     ports:
@@ -563,6 +595,7 @@ services:
     image: grafana/promtail:3.1.0
     container_name: promtail
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 256m
     command: -config.file=/etc/promtail/promtail-config.yml
     volumes:
@@ -577,6 +610,7 @@ services:
     image: grafana/tempo:2.5.0
     container_name: tempo
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 512m
     command: -config.file=/etc/tempo/tempo-config.yml
     ports:
@@ -601,6 +635,7 @@ services:
     image: prom/alertmanager:v0.27.0
     container_name: alertmanager
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 128m
     command:
       - --config.file=/etc/alertmanager/alertmanager.yml
@@ -624,6 +659,7 @@ services:
     image: prom/node-exporter:v1.8.1
     container_name: node-exporter
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 128m
     command:
       - --path.rootfs=/host
@@ -642,6 +678,7 @@ services:
     image: gcr.io/cadvisor/cadvisor:v0.49.1
     container_name: cadvisor
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 320m
     privileged: true
     # --docker_only drops the raw cgroup hierarchy, which on the Docker Desktop
@@ -667,6 +704,7 @@ services:
     image: danielqsj/kafka-exporter:v1.7.0
     container_name: kafka-exporter
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 128m
     command:
       - --kafka.server=kafka:29092
@@ -685,6 +723,7 @@ services:
     image: provectuslabs/kafka-ui:v0.7.2
     container_name: kafka-ui
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 512m
     ports:
       - "8090:8080"
@@ -703,6 +742,7 @@ services:
     image: prom/blackbox-exporter:v0.25.0
     container_name: blackbox-exporter
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 128m
     command: --config.file=/etc/blackbox/blackbox-config.yml
     ports:
@@ -716,6 +756,7 @@ services:
     image: nginx/nginx-prometheus-exporter:1.1.0
     container_name: nginx-exporter
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 64m
     command:
       - --nginx.scrape-uri=http://frontend:80/stub_status
@@ -732,6 +773,7 @@ services:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-userdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://useruser:userpass@userdb:5432/userdb?sslmode=disable
@@ -752,6 +794,7 @@ services:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-productdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://productuser:productpass@productdb:5432/productdb?sslmode=disable
@@ -772,6 +815,7 @@ services:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-catalogdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://cataloguser:catalogpass@catalogdb:5432/catalogdb?sslmode=disable
@@ -792,6 +836,7 @@ services:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-orderdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://orderuser:orderpass@orderdb:5432/orderdb?sslmode=disable
@@ -812,6 +857,7 @@ services:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-paymentdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://paymentuser:paymentpass@paymentdb:5432/paymentdb?sslmode=disable
@@ -832,6 +878,7 @@ services:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-shippingdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://shippinguser:shippingpass@shippingdb:5432/shippingdb?sslmode=disable
@@ -852,6 +899,7 @@ services:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-reviewdb
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 96m
     environment:
       DATA_SOURCE_NAME: postgresql://reviewuser:reviewpass@reviewdb:5432/reviewdb?sslmode=disable
@@ -880,6 +928,7 @@ services:
         VITE_API_BASE_URL: ${VITE_API_BASE_URL:-/}
     container_name: frontend
     restart: unless-stopped
+    logging: *default-logging
     mem_limit: 128m
     ports:
       - "3000:80"
