@@ -60,5 +60,25 @@ for svc in "${SERVICES[@]}" frontend; do
   echo "tagged ecommerce/$svc:local"
 done
 
+# ─── Refresh the kind node's image cache (kind provisioner only) ─────────────
+# Under Docker Desktop's kind provisioner the node runs its own containerd
+# with its own image cache. It *can* pull local-only images straight out of
+# Docker's image store, but imagePullPolicy: IfNotPresent never asks for a tag
+# it already holds — so a rebuild under the same ecommerce/<svc>:local tag is
+# invisible and the pod quietly keeps running the previous jar, which looks
+# exactly like "my change did not apply". An explicit pull on the node updates
+# the tag (only changed layers transfer; unchanged images are a no-op).
+# The kubeadm provisioner shares Docker's image store directly, has no
+# desktop-control-plane container, and skips this block.
+NODE=desktop-control-plane
+if docker exec "$NODE" true >/dev/null 2>&1; then
+  echo
+  echo "kind provisioner detected ($NODE): refreshing its image cache..."
+  for svc in "${SERVICES[@]}" frontend; do
+    docker exec "$NODE" crictl pull "docker.io/ecommerce/$svc:local" >/dev/null
+    echo "refreshed ecommerce/$svc:local on $NODE"
+  done
+fi
+
 echo
 echo "Done. Deploy with ./deploy.sh"

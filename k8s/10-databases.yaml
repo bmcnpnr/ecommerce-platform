@@ -1,4 +1,7 @@
-# One PostgreSQL instance per service, mirroring docker-compose.yml.
+# One database instance per service, mirroring docker-compose.yml: PostgreSQL
+# for six of them, MongoDB for catalogdb (catalog-service keeps a join-free read
+# model; see its README). The Mongo StatefulSet follows the same shape and is
+# described at its own definition below.
 #
 # StatefulSet rather than Deployment: the identity (userdb-0) and its PVC stay
 # bound together across restarts, and the default rolling update never runs two
@@ -211,6 +214,18 @@ spec:
           requests:
             storage: 2Gi
 ---
+# catalogdb — MongoDB 8, the one non-Postgres database. Same object names,
+# labels and StatefulSet shape as its neighbours so deploy.sh/deploy.ps1
+# (`rollout status statefulset/catalogdb`) and the catalog-service init
+# container (`nc -z catalogdb`) needed only the port changed.
+#
+# The PVC is mounted with subPath "mongo" for the same reason Postgres uses a
+# PGDATA subdirectory: the volume root belongs to the provisioner. It also
+# means a PVC left over from the Postgres catalogdb (pgdata/ at the root) does
+# not collide with mongod's files — but that PVC is dead weight; on a cluster
+# that ran the old engine, delete it once:
+#   kubectl -n ecommerce delete statefulset catalogdb
+#   kubectl -n ecommerce delete pvc data-catalogdb-0
 apiVersion: v1
 kind: Service
 metadata:
@@ -223,9 +238,9 @@ spec:
   selector:
     app: catalogdb
   ports:
-    - name: postgres
-      port: 5432
-      targetPort: postgres
+    - name: mongodb
+      port: 27017
+      targetPort: mongodb
 ---
 apiVersion: v1
 kind: Service
@@ -240,9 +255,11 @@ spec:
   selector:
     app: catalogdb
   ports:
-    - name: postgres
-      port: 5435
-      targetPort: postgres
+    - name: mongodb
+      # Same host port as docker-compose.yml, so mongosh/Compass sessions
+      # against localhost:27017 work on either stack.
+      port: 27017
+      targetPort: mongodb
 ---
 apiVersion: apps/v1
 kind: StatefulSet
@@ -266,41 +283,51 @@ spec:
     spec:
       terminationGracePeriodSeconds: 60
       containers:
-        - name: postgres
-          image: postgres:16-alpine
+        - name: mongodb
+          image: mongo:8.0
           imagePullPolicy: IfNotPresent
+          # WiredTiger sizes its cache from the cgroup limit and would otherwise
+          # claim all of it; 0.25 GB is the minimum. Matches docker-compose.yml.
+          args: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]
           ports:
-            - name: postgres
-              containerPort: 5432
+            - name: mongodb
+              containerPort: 27017
           envFrom:
             - secretRef:
                 name: catalogdb-credentials
-          env:
-            - name: PGDATA
-              value: /var/lib/postgresql/data/pgdata
           resources:
             requests:
               cpu: 25m
-              memory: 64Mi
+              memory: 128Mi
             limits:
-              memory: 256Mi
+              memory: 512Mi
+          # Authenticated ping, as in compose: the image's first boot runs a
+          # temporary auth-less mongod while creating the root user, and an
+          # unauthenticated ping would pass against that too early.
           readinessProbe:
             exec:
-              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+              command:
+                - sh
+                - -c
+                - mongosh -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "db.adminCommand('ping').ok" | grep -q 1
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5
             failureThreshold: 5
           livenessProbe:
             exec:
-              command: ["sh", "-c", "pg_isready -U $POSTGRES_USER -d $POSTGRES_DB"]
+              command:
+                - sh
+                - -c
+                - mongosh -u "$MONGO_INITDB_ROOT_USERNAME" -p "$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "db.adminCommand('ping').ok" | grep -q 1
             initialDelaySeconds: 45
             periodSeconds: 20
             timeoutSeconds: 5
             failureThreshold: 6
           volumeMounts:
             - name: data
-              mountPath: /var/lib/postgresql/data
+              mountPath: /data/db
+              subPath: mongo
   volumeClaimTemplates:
     - metadata:
         name: data

@@ -1,0 +1,80 @@
+# The MongoDB counterpart of 71-postgres-exporters.yaml — one exporter for the
+# one Mongo database (catalogdb), matching docker-compose.yml.
+#
+# prometheus.yml scrapes mongodb-exporter-catalogdb:9216, the exporter's
+# default port, so the shared monitoring config needs no Kubernetes-specific
+# edit. The connection URI (user, password, host and authSource in one string)
+# lives in catalogdb-credentials next to the database's own credentials, the
+# same way DATA_SOURCE_NAME does for the postgres exporters.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb-exporter-catalogdb
+  namespace: ecommerce
+  labels:
+    app: mongodb-exporter-catalogdb
+    group: database
+    database: catalogdb
+spec:
+  selector:
+    app: mongodb-exporter-catalogdb
+  ports:
+    - name: http
+      port: 9216
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongodb-exporter-catalogdb
+  namespace: ecommerce
+  labels:
+    app: mongodb-exporter-catalogdb
+    group: database
+    database: catalogdb
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb-exporter-catalogdb
+  template:
+    metadata:
+      labels:
+        app: mongodb-exporter-catalogdb
+        group: database
+        database: catalogdb
+    spec:
+      initContainers:
+        - name: wait-for-catalogdb
+          image: busybox:1.36
+          command: ["sh", "-c", "until nc -z catalogdb 27017; do echo 'waiting for catalogdb'; sleep 3; done"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 8Mi
+      containers:
+        - name: mongodb-exporter
+          image: percona/mongodb_exporter:0.53.0
+          imagePullPolicy: IfNotPresent
+          args:
+            - --collector.diagnosticdata
+            - --collector.dbstats
+            # Also emit the pre-0.20 metric names most community dashboards use.
+            - --compatible-mode
+            - --web.listen-address=:9216
+          ports:
+            - name: http
+              containerPort: 9216
+          env:
+            - name: MONGODB_URI
+              valueFrom:
+                secretKeyRef:
+                  name: catalogdb-credentials
+                  key: MONGODB_URI
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 96Mi

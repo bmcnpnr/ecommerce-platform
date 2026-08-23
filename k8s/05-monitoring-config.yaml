@@ -7,82 +7,228 @@
 ---
 apiVersion: v1
 data:
-  prometheus.yml: "global:\r\n  scrape_interval: 15s\r\n  evaluation_interval: 15s\r\n
-    \ scrape_timeout: 10s\r\n  external_labels:\r\n    cluster: ecommerce-local\r\n
-    \   environment: development\r\n\r\nalerting:\r\n  alertmanagers:\r\n    - static_configs:\r\n
-    \       - targets:\r\n            - alertmanager:9093\r\n\r\nrule_files:\r\n  -
-    /etc/prometheus/rules/*.yml\r\n\r\nscrape_configs:\r\n\r\n  # ─── Prometheus self-monitoring
-    ──────────────────────────────────────\r\n  - job_name: prometheus\r\n    static_configs:\r\n
-    \     - targets: ['localhost:9090']\r\n        labels:\r\n          service: prometheus\r\n\r\n
-    \ # ─── Spring Boot microservices ───────────────────────────────────────\r\n
-    \ - job_name: api-gateway\r\n    metrics_path: /actuator/prometheus\r\n    static_configs:\r\n
-    \     - targets: ['api-gateway:8080']\r\n        labels:\r\n          service:
-    api-gateway\r\n          group: application\r\n\r\n  - job_name: user-service\r\n
-    \   metrics_path: /actuator/prometheus\r\n    static_configs:\r\n      - targets:
-    ['user-service:8081']\r\n        labels:\r\n          service: user-service\r\n
-    \         group: application\r\n\r\n  - job_name: product-service\r\n    metrics_path:
-    /actuator/prometheus\r\n    static_configs:\r\n      - targets: ['product-service:8082']\r\n
-    \       labels:\r\n          service: product-service\r\n          group: application\r\n\r\n
-    \ - job_name: catalog-service\r\n    metrics_path: /actuator/prometheus\r\n    static_configs:\r\n
-    \     - targets: ['catalog-service:8083']\r\n        labels:\r\n          service:
-    catalog-service\r\n          group: application\r\n\r\n  - job_name: order-service\r\n
-    \   metrics_path: /actuator/prometheus\r\n    static_configs:\r\n      - targets:
-    ['order-service:8084']\r\n        labels:\r\n          service: order-service\r\n
-    \         group: application\r\n\r\n  - job_name: payment-service\r\n    metrics_path:
-    /actuator/prometheus\r\n    static_configs:\r\n      - targets: ['payment-service:8085']\r\n
-    \       labels:\r\n          service: payment-service\r\n          group: application\r\n\r\n
-    \ - job_name: shipping-service\r\n    metrics_path: /actuator/prometheus\r\n    static_configs:\r\n
-    \     - targets: ['shipping-service:8086']\r\n        labels:\r\n          service:
-    shipping-service\r\n          group: application\r\n\r\n  - job_name: review-service\r\n
-    \   metrics_path: /actuator/prometheus\r\n    static_configs:\r\n      - targets:
-    ['review-service:8087']\r\n        labels:\r\n          service: review-service\r\n
-    \         group: application\r\n\r\n  - job_name: notification-service\r\n    metrics_path:
-    /actuator/prometheus\r\n    static_configs:\r\n      - targets: ['notification-service:8088']\r\n
-    \       labels:\r\n          service: notification-service\r\n          group:
-    application\r\n\r\n  - job_name: service-discovery\r\n    metrics_path: /actuator/prometheus\r\n
-    \   static_configs:\r\n      - targets: ['service-discovery:8761']\r\n        labels:\r\n
-    \         service: service-discovery\r\n          group: application\r\n\r\n  #
-    ─── Infrastructure exporters ────────────────────────────────────────\r\n  - job_name:
-    node-exporter\r\n    static_configs:\r\n      - targets: ['node-exporter:9100']\r\n
-    \       labels:\r\n          service: node-exporter\r\n          group: infrastructure\r\n\r\n
-    \ - job_name: cadvisor\r\n    static_configs:\r\n      - targets: ['cadvisor:8080']\r\n
-    \       labels:\r\n          service: cadvisor\r\n          group: infrastructure\r\n\r\n
-    \ - job_name: kafka-exporter\r\n    static_configs:\r\n      - targets: ['kafka-exporter:9308']\r\n
-    \       labels:\r\n          service: kafka\r\n          group: messaging\r\n\r\n
-    \ # ─── Database exporters ──────────────────────────────────────────────\r\n
-    \ - job_name: postgres-exporter-userdb\r\n    static_configs:\r\n      - targets:
-    ['postgres-exporter-userdb:9187']\r\n        labels:\r\n          service: postgres\r\n
-    \         database: userdb\r\n          group: database\r\n\r\n  - job_name: postgres-exporter-productdb\r\n
-    \   static_configs:\r\n      - targets: ['postgres-exporter-productdb:9187']\r\n
-    \       labels:\r\n          service: postgres\r\n          database: productdb\r\n
-    \         group: database\r\n\r\n  - job_name: postgres-exporter-orderdb\r\n    static_configs:\r\n
-    \     - targets: ['postgres-exporter-orderdb:9187']\r\n        labels:\r\n          service:
-    postgres\r\n          database: orderdb\r\n          group: database\r\n\r\n  -
-    job_name: postgres-exporter-paymentdb\r\n    static_configs:\r\n      - targets:
-    ['postgres-exporter-paymentdb:9187']\r\n        labels:\r\n          service:
-    postgres\r\n          database: paymentdb\r\n          group: database\r\n\r\n
-    \ - job_name: postgres-exporter-shippingdb\r\n    static_configs:\r\n      - targets:
-    ['postgres-exporter-shippingdb:9187']\r\n        labels:\r\n          service:
-    postgres\r\n          database: shippingdb\r\n          group: database\r\n\r\n
-    \ - job_name: postgres-exporter-reviewdb\r\n    static_configs:\r\n      - targets:
-    ['postgres-exporter-reviewdb:9187']\r\n        labels:\r\n          service: postgres\r\n
-    \         database: reviewdb\r\n          group: database\r\n\r\n  - job_name:
-    postgres-exporter-catalogdb\r\n    static_configs:\r\n      - targets: ['postgres-exporter-catalogdb:9187']\r\n
-    \       labels:\r\n          service: postgres\r\n          database: catalogdb\r\n
-    \         group: database\r\n\r\n  # ─── Frontend (nginx exporter + blackbox)
-    ────────────────────────────\r\n  - job_name: nginx-exporter\r\n    static_configs:\r\n
-    \     - targets: ['nginx-exporter:9113']\r\n        labels:\r\n          service:
-    frontend-nginx\r\n          group: frontend\r\n\r\n  - job_name: blackbox-http\r\n
-    \   metrics_path: /probe\r\n    params:\r\n      module: [http_2xx]\r\n    static_configs:\r\n
-    \     - targets:\r\n          - http://api-gateway:8080/actuator/health\r\n          -
-    http://user-service:8081/actuator/health\r\n          - http://product-service:8082/actuator/health\r\n
-    \         - http://catalog-service:8083/actuator/health\r\n          - http://order-service:8084/actuator/health\r\n
-    \         - http://payment-service:8085/actuator/health\r\n          - http://shipping-service:8086/actuator/health\r\n
-    \         - http://review-service:8087/actuator/health\r\n          - http://notification-service:8088/actuator/health\r\n
-    \         - http://service-discovery:8761/actuator/health\r\n          - http://frontend:80/\r\n
-    \   relabel_configs:\r\n      - source_labels: [__address__]\r\n        target_label:
-    __param_target\r\n      - source_labels: [__param_target]\r\n        target_label:
-    instance\r\n      - target_label: __address__\r\n        replacement: blackbox-exporter:9115\r\n"
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+      scrape_timeout: 10s
+      external_labels:
+        cluster: ecommerce-local
+        environment: development
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+                - alertmanager:9093
+
+    rule_files:
+      - /etc/prometheus/rules/*.yml
+
+    scrape_configs:
+
+      # ─── Prometheus self-monitoring ──────────────────────────────────────
+      - job_name: prometheus
+        static_configs:
+          - targets: ['localhost:9090']
+            labels:
+              service: prometheus
+
+      # ─── Spring Boot microservices ───────────────────────────────────────
+      - job_name: api-gateway
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ['api-gateway:8080']
+            labels:
+              service: api-gateway
+              group: application
+
+      - job_name: user-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ['user-service:8081']
+            labels:
+              service: user-service
+              group: application
+
+      - job_name: product-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ['product-service:8082']
+            labels:
+              service: product-service
+              group: application
+
+      - job_name: catalog-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ['catalog-service:8083']
+            labels:
+              service: catalog-service
+              group: application
+
+      - job_name: order-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ['order-service:8084']
+            labels:
+              service: order-service
+              group: application
+
+      - job_name: payment-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ['payment-service:8085']
+            labels:
+              service: payment-service
+              group: application
+
+      - job_name: shipping-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ['shipping-service:8086']
+            labels:
+              service: shipping-service
+              group: application
+
+      - job_name: review-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ['review-service:8087']
+            labels:
+              service: review-service
+              group: application
+
+      - job_name: notification-service
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ['notification-service:8088']
+            labels:
+              service: notification-service
+              group: application
+
+      - job_name: service-discovery
+        metrics_path: /actuator/prometheus
+        static_configs:
+          - targets: ['service-discovery:8761']
+            labels:
+              service: service-discovery
+              group: application
+
+      # ─── Infrastructure exporters ────────────────────────────────────────
+      - job_name: node-exporter
+        static_configs:
+          - targets: ['node-exporter:9100']
+            labels:
+              service: node-exporter
+              group: infrastructure
+
+      - job_name: cadvisor
+        static_configs:
+          - targets: ['cadvisor:8080']
+            labels:
+              service: cadvisor
+              group: infrastructure
+
+      - job_name: kafka-exporter
+        static_configs:
+          - targets: ['kafka-exporter:9308']
+            labels:
+              service: kafka
+              group: messaging
+
+      # ─── Database exporters ──────────────────────────────────────────────
+      - job_name: postgres-exporter-userdb
+        static_configs:
+          - targets: ['postgres-exporter-userdb:9187']
+            labels:
+              service: postgres
+              database: userdb
+              group: database
+
+      - job_name: postgres-exporter-productdb
+        static_configs:
+          - targets: ['postgres-exporter-productdb:9187']
+            labels:
+              service: postgres
+              database: productdb
+              group: database
+
+      - job_name: postgres-exporter-orderdb
+        static_configs:
+          - targets: ['postgres-exporter-orderdb:9187']
+            labels:
+              service: postgres
+              database: orderdb
+              group: database
+
+      - job_name: postgres-exporter-paymentdb
+        static_configs:
+          - targets: ['postgres-exporter-paymentdb:9187']
+            labels:
+              service: postgres
+              database: paymentdb
+              group: database
+
+      - job_name: postgres-exporter-shippingdb
+        static_configs:
+          - targets: ['postgres-exporter-shippingdb:9187']
+            labels:
+              service: postgres
+              database: shippingdb
+              group: database
+
+      - job_name: postgres-exporter-reviewdb
+        static_configs:
+          - targets: ['postgres-exporter-reviewdb:9187']
+            labels:
+              service: postgres
+              database: reviewdb
+              group: database
+
+      # catalogdb is MongoDB (catalog-service keeps a join-free read model), so it
+      # is scraped through percona's mongodb_exporter rather than postgres-exporter.
+      # Default exporter port 9216, same Service name on compose and Kubernetes.
+      - job_name: mongodb-exporter-catalogdb
+        static_configs:
+          - targets: ['mongodb-exporter-catalogdb:9216']
+            labels:
+              service: mongodb
+              database: catalogdb
+              group: database
+
+      # ─── Frontend (nginx exporter + blackbox) ────────────────────────────
+      - job_name: nginx-exporter
+        static_configs:
+          - targets: ['nginx-exporter:9113']
+            labels:
+              service: frontend-nginx
+              group: frontend
+
+      - job_name: blackbox-http
+        metrics_path: /probe
+        params:
+          module: [http_2xx]
+        static_configs:
+          - targets:
+              - http://api-gateway:8080/actuator/health
+              - http://user-service:8081/actuator/health
+              - http://product-service:8082/actuator/health
+              - http://catalog-service:8083/actuator/health
+              - http://order-service:8084/actuator/health
+              - http://payment-service:8085/actuator/health
+              - http://shipping-service:8086/actuator/health
+              - http://review-service:8087/actuator/health
+              - http://notification-service:8088/actuator/health
+              - http://service-discovery:8761/actuator/health
+              - http://frontend:80/
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: __param_target
+          - source_labels: [__param_target]
+            target_label: instance
+          - target_label: __address__
+            replacement: blackbox-exporter:9115
 kind: ConfigMap
 metadata:
   name: prometheus-config
@@ -90,34 +236,91 @@ metadata:
 ---
 apiVersion: v1
 data:
-  database-alerts.yml: "groups:\r\n  - name: database.postgres\r\n    interval: 30s\r\n
-    \   rules:\r\n      - alert: PostgresDown\r\n        expr: pg_up == 0\r\n        for:
-    1m\r\n        labels:\r\n          severity: critical\r\n        annotations:\r\n
-    \         summary: \"PostgreSQL is down ({{ $labels.database }})\"\r\n          description:
-    \"PostgreSQL exporter for {{ $labels.database }} reports the database is unreachable.\"\r\n\r\n
-    \     - alert: PostgresTooManyConnections\r\n        # max_connections is server-scoped
-    and carries no datname label, so the\r\n        # previous 'sum by (datname, instance)'
-    on both sides produced an empty\r\n        # datname on the denominator and never
-    matched. Connections are summed\r\n        # across databases and compared per
-    instance.\r\n        expr: |\r\n          sum by (instance) (pg_stat_activity_count)\r\n
-    \         /\r\n          on(instance) group_left max by (instance) (pg_settings_max_connections)\r\n
-    \         > 0.80\r\n        for: 5m\r\n        labels:\r\n          severity:
-    warning\r\n        annotations:\r\n          summary: \"PostgreSQL instance {{
-    $labels.instance }} has too many connections\"\r\n          description: \"Connection
-    usage is {{ $value | humanizePercentage }} of max_connections.\"\r\n\r\n      -
-    alert: PostgresDeadlocks\r\n        expr: rate(pg_stat_database_deadlocks{datname!~\"template.*|postgres\"}[5m])
-    > 0\r\n        for: 5m\r\n        labels:\r\n          severity: warning\r\n        annotations:\r\n
-    \         summary: \"PostgreSQL deadlocks detected on {{ $labels.datname }}\"\r\n
-    \         description: \"Deadlock rate: {{ $value }} per second on database {{
-    $labels.datname }}.\"\r\n\r\n      - alert: PostgresSlowQueries\r\n        # Two
-    fixes: the custom query in queries.yml emits\r\n        # <query-key>_<column>,
-    i.e. pg_stat_activity_max_tx_duration_max_tx_duration;\r\n        # and the metric
-    is a gauge in seconds, so rate() over it could never\r\n        # exceed 60. Compare
-    the gauge directly.\r\n        expr: |\r\n          pg_stat_activity_max_tx_duration_max_tx_duration{datname!~\"template.*|postgres\"}
-    > 60\r\n        for: 5m\r\n        labels:\r\n          severity: warning\r\n
-    \       annotations:\r\n          summary: \"Long-running queries on {{ $labels.datname
-    }}\"\r\n          description: \"There are queries running for more than 60 seconds
-    on {{ $labels.datname }}.\"\r\n"
+  database-alerts.yml: |
+    groups:
+      - name: database.postgres
+        interval: 30s
+        rules:
+          - alert: PostgresDown
+            expr: pg_up == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "PostgreSQL is down ({{ $labels.database }})"
+              description: "PostgreSQL exporter for {{ $labels.database }} reports the database is unreachable."
+
+          - alert: PostgresTooManyConnections
+            # max_connections is server-scoped and carries no datname label, so the
+            # previous 'sum by (datname, instance)' on both sides produced an empty
+            # datname on the denominator and never matched. Connections are summed
+            # across databases and compared per instance.
+            expr: |
+              sum by (instance) (pg_stat_activity_count)
+              /
+              on(instance) group_left max by (instance) (pg_settings_max_connections)
+              > 0.80
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "PostgreSQL instance {{ $labels.instance }} has too many connections"
+              description: "Connection usage is {{ $value | humanizePercentage }} of max_connections."
+
+          - alert: PostgresDeadlocks
+            expr: rate(pg_stat_database_deadlocks{datname!~"template.*|postgres"}[5m]) > 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "PostgreSQL deadlocks detected on {{ $labels.datname }}"
+              description: "Deadlock rate: {{ $value }} per second on database {{ $labels.datname }}."
+
+          - alert: PostgresSlowQueries
+            # Two fixes: the custom query in queries.yml emits
+            # <query-key>_<column>, i.e. pg_stat_activity_max_tx_duration_max_tx_duration;
+            # and the metric is a gauge in seconds, so rate() over it could never
+            # exceed 60. Compare the gauge directly.
+            expr: |
+              pg_stat_activity_max_tx_duration_max_tx_duration{datname!~"template.*|postgres"} > 60
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Long-running queries on {{ $labels.datname }}"
+              description: "There are queries running for more than 60 seconds on {{ $labels.datname }}."
+
+      # catalogdb is MongoDB (catalog-service's read model), scraped through
+      # percona/mongodb_exporter; see prometheus.yml job mongodb-exporter-catalogdb.
+      - name: database.mongodb
+        interval: 30s
+        rules:
+          - alert: MongoDown
+            expr: mongodb_up == 0
+            for: 1m
+            labels:
+              severity: critical
+            annotations:
+              summary: "MongoDB is down ({{ $labels.database }})"
+              description: "mongodb_exporter for {{ $labels.database }} cannot reach the server."
+
+          - alert: MongoTooManyConnections
+            # serverStatus.connections: current in use vs. available headroom
+            # (mongodb_ss_* are the exporter's diagnosticdata metrics).
+            expr: |
+              sum by (instance) (mongodb_ss_connections{conn_type="current"})
+              /
+              (
+                sum by (instance) (mongodb_ss_connections{conn_type="current"})
+                + sum by (instance) (mongodb_ss_connections{conn_type="available"})
+              )
+              > 0.80
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "MongoDB instance {{ $labels.instance }} has too many connections"
+              description: "Connection usage is {{ $value | humanizePercentage }} of the server's connection limit."
   infrastructure-alerts.yml: "groups:\r\n  - name: infrastructure.containers\r\n    interval:
     30s\r\n    rules:\r\n      - alert: ContainerHighCpuUsage\r\n        # The value
     is in cores, not a ratio, so it is rendered as cores too —\r\n        # humanizePercentage
@@ -753,84 +956,212 @@ data:
     \"expr\": \"sum(rate(http_server_requests_seconds_count{application=\\\"api-gateway\\\",outcome=\\\"SERVER_ERROR\\\"}[5m]))
     by (uri,status)\", \"legendFormat\": \"5xx {{uri}} {{status}}\" }\r\n      ],\r\n
     \     \"datasource\": \"Prometheus\"\r\n    }\r\n  ]\r\n}\r\n"
-  04-databases.json: "{\r\n  \"title\": \"Databases\",\r\n  \"uid\": \"ecommerce-databases\",\r\n
-    \ \"tags\": [\"ecommerce\", \"database\", \"postgres\"],\r\n  \"timezone\": \"browser\",\r\n
-    \ \"schemaVersion\": 38,\r\n  \"refresh\": \"30s\",\r\n  \"time\": { \"from\":
-    \"now-1h\", \"to\": \"now\" },\r\n  \"templating\": {\r\n    \"list\": [{\r\n
-    \     \"name\": \"database\",\r\n      \"type\": \"query\",\r\n      \"datasource\":
-    \"Prometheus\",\r\n      \"query\": \"label_values(pg_up, database)\",\r\n      \"multi\":
-    false,\r\n      \"includeAll\": true,\r\n      \"allValue\": \".*\",\r\n      \"refresh\":
-    2\r\n    }]\r\n  },\r\n  \"panels\": [\r\n    {\r\n      \"id\": 1, \"type\":
-    \"stat\", \"title\": \"Databases Up\",\r\n      \"gridPos\": { \"x\": 0, \"y\":
-    0, \"w\": 4, \"h\": 4 },\r\n      \"fieldConfig\": {\r\n        \"defaults\":
-    {\r\n          \"thresholds\": { \"mode\": \"absolute\", \"steps\": [{ \"color\":
-    \"red\", \"value\": null }, { \"color\": \"green\", \"value\": 7 }] }\r\n        }\r\n
-    \     },\r\n      \"targets\": [{ \"expr\": \"count(pg_up == 1)\", \"legendFormat\":
-    \"Up\" }],\r\n      \"datasource\": \"Prometheus\"\r\n    },\r\n    {\r\n      \"id\":
-    2, \"type\": \"stat\", \"title\": \"Total Active Connections\",\r\n      \"gridPos\":
-    { \"x\": 4, \"y\": 0, \"w\": 4, \"h\": 4 },\r\n      \"fieldConfig\": { \"defaults\":
-    { \"unit\": \"short\" } },\r\n      \"targets\": [{ \"expr\": \"sum(pg_stat_activity_count{datname=~\\\"$database\\\"})\",
-    \"legendFormat\": \"Active connections\" }],\r\n      \"datasource\": \"Prometheus\"\r\n
-    \   },\r\n    {\r\n      \"id\": 3, \"type\": \"stat\", \"title\": \"Total Commits/s\",\r\n
-    \     \"gridPos\": { \"x\": 8, \"y\": 0, \"w\": 4, \"h\": 4 },\r\n      \"fieldConfig\":
-    { \"defaults\": { \"unit\": \"ops\" } },\r\n      \"targets\": [{ \"expr\": \"sum(rate(pg_stat_database_xact_commit{datname=~\\\"$database\\\",datname!~\\\"template.*|postgres\\\"}[5m]))\",
-    \"legendFormat\": \"commits/s\" }],\r\n      \"datasource\": \"Prometheus\"\r\n
-    \   },\r\n    {\r\n      \"id\": 4, \"type\": \"stat\", \"title\": \"Total Rollbacks/s\",\r\n
-    \     \"gridPos\": { \"x\": 12, \"y\": 0, \"w\": 4, \"h\": 4 },\r\n      \"fieldConfig\":
-    {\r\n        \"defaults\": {\r\n          \"unit\": \"ops\",\r\n          \"thresholds\":
-    { \"mode\": \"absolute\", \"steps\": [{ \"color\": \"green\", \"value\": null
-    }, { \"color\": \"yellow\", \"value\": 1 }, { \"color\": \"red\", \"value\": 10
-    }] }\r\n        }\r\n      },\r\n      \"targets\": [{ \"expr\": \"sum(rate(pg_stat_database_xact_rollback{datname=~\\\"$database\\\",datname!~\\\"template.*|postgres\\\"}[5m]))\",
-    \"legendFormat\": \"rollbacks/s\" }],\r\n      \"datasource\": \"Prometheus\"\r\n
-    \   },\r\n    {\r\n      \"id\": 5, \"type\": \"stat\", \"title\": \"Cache Hit
-    Ratio\",\r\n      \"gridPos\": { \"x\": 16, \"y\": 0, \"w\": 4, \"h\": 4 },\r\n
-    \     \"fieldConfig\": {\r\n        \"defaults\": {\r\n          \"unit\": \"percentunit\",\r\n
-    \         \"thresholds\": { \"mode\": \"absolute\", \"steps\": [{ \"color\": \"red\",
-    \"value\": null }, { \"color\": \"yellow\", \"value\": 0.9 }, { \"color\": \"green\",
-    \"value\": 0.99 }] }\r\n        }\r\n      },\r\n      \"targets\": [{\r\n        \"expr\":
-    \"sum(pg_stat_database_blks_hit{datname=~\\\"$database\\\",datname!~\\\"template.*|postgres\\\"})
-    / (sum(pg_stat_database_blks_hit{datname=~\\\"$database\\\",datname!~\\\"template.*|postgres\\\"})
-    + sum(pg_stat_database_blks_read{datname=~\\\"$database\\\",datname!~\\\"template.*|postgres\\\"}))\",\r\n
-    \       \"legendFormat\": \"Cache hit %\"\r\n      }],\r\n      \"datasource\":
-    \"Prometheus\"\r\n    },\r\n    {\r\n      \"id\": 6, \"type\": \"stat\", \"title\":
-    \"Deadlocks/s\",\r\n      \"gridPos\": { \"x\": 20, \"y\": 0, \"w\": 4, \"h\":
-    4 },\r\n      \"fieldConfig\": {\r\n        \"defaults\": {\r\n          \"unit\":
-    \"ops\",\r\n          \"thresholds\": { \"mode\": \"absolute\", \"steps\": [{
-    \"color\": \"green\", \"value\": null }, { \"color\": \"red\", \"value\": 0.01
-    }] }\r\n        }\r\n      },\r\n      \"targets\": [{ \"expr\": \"sum(rate(pg_stat_database_deadlocks{datname!~\\\"template.*|postgres\\\"}[5m]))\",
-    \"legendFormat\": \"deadlocks/s\" }],\r\n      \"datasource\": \"Prometheus\"\r\n
-    \   },\r\n    {\r\n      \"id\": 7, \"type\": \"table\", \"title\": \"Database
-    Health Overview\",\r\n      \"gridPos\": { \"x\": 0, \"y\": 4, \"w\": 24, \"h\":
-    6 },\r\n      \"targets\": [\r\n        { \"expr\": \"pg_up\", \"legendFormat\":
-    \"{{database}}\", \"instant\": true },\r\n        { \"expr\": \"pg_stat_activity_count\",
-    \"legendFormat\": \"connections\", \"instant\": true }\r\n      ],\r\n      \"datasource\":
-    \"Prometheus\"\r\n    },\r\n    {\r\n      \"id\": 8, \"type\": \"timeseries\",
-    \"title\": \"Active Connections per Database\",\r\n      \"gridPos\": { \"x\":
-    0, \"y\": 10, \"w\": 12, \"h\": 8 },\r\n      \"fieldConfig\": { \"defaults\":
-    { \"unit\": \"short\" } },\r\n      \"targets\": [{\r\n        \"expr\": \"pg_stat_activity_count{datname!~\\\"template.*|postgres\\\"}\",\r\n
-    \       \"legendFormat\": \"{{datname}}\"\r\n      }],\r\n      \"datasource\":
-    \"Prometheus\"\r\n    },\r\n    {\r\n      \"id\": 9, \"type\": \"timeseries\",
-    \"title\": \"Transaction Rate per Database\",\r\n      \"gridPos\": { \"x\": 12,
-    \"y\": 10, \"w\": 12, \"h\": 8 },\r\n      \"fieldConfig\": { \"defaults\": {
-    \"unit\": \"ops\" } },\r\n      \"targets\": [\r\n        { \"expr\": \"rate(pg_stat_database_xact_commit{datname!~\\\"template.*|postgres\\\"}[5m])\",
-    \"legendFormat\": \"{{datname}} commits\" },\r\n        { \"expr\": \"rate(pg_stat_database_xact_rollback{datname!~\\\"template.*|postgres\\\"}[5m])\",
-    \"legendFormat\": \"{{datname}} rollbacks\" }\r\n      ],\r\n      \"datasource\":
-    \"Prometheus\"\r\n    },\r\n    {\r\n      \"id\": 10, \"type\": \"timeseries\",
-    \"title\": \"Row Operations (tuples fetched/inserted/updated/deleted)\",\r\n      \"gridPos\":
-    { \"x\": 0, \"y\": 18, \"w\": 12, \"h\": 8 },\r\n      \"fieldConfig\": { \"defaults\":
-    { \"unit\": \"ops\" } },\r\n      \"targets\": [\r\n        { \"expr\": \"sum(rate(pg_stat_database_tup_fetched{datname=~\\\"$database\\\",datname!~\\\"template.*|postgres\\\"}[5m]))\",
-    \"legendFormat\": \"fetched\" },\r\n        { \"expr\": \"sum(rate(pg_stat_database_tup_inserted{datname=~\\\"$database\\\",datname!~\\\"template.*|postgres\\\"}[5m]))\",
-    \"legendFormat\": \"inserted\" },\r\n        { \"expr\": \"sum(rate(pg_stat_database_tup_updated{datname=~\\\"$database\\\",datname!~\\\"template.*|postgres\\\"}[5m]))\",
-    \"legendFormat\": \"updated\" },\r\n        { \"expr\": \"sum(rate(pg_stat_database_tup_deleted{datname=~\\\"$database\\\",datname!~\\\"template.*|postgres\\\"}[5m]))\",
-    \"legendFormat\": \"deleted\" }\r\n      ],\r\n      \"datasource\": \"Prometheus\"\r\n
-    \   },\r\n    {\r\n      \"id\": 11, \"type\": \"timeseries\", \"title\": \"HikariCP
-    Connection Pool (per service)\",\r\n      \"gridPos\": { \"x\": 12, \"y\": 18,
-    \"w\": 12, \"h\": 8 },\r\n      \"fieldConfig\": { \"defaults\": { \"unit\": \"short\"
-    } },\r\n      \"targets\": [\r\n        { \"expr\": \"hikaricp_connections_active\",
-    \"legendFormat\": \"{{application}} active\" },\r\n        { \"expr\": \"hikaricp_connections_idle\",
-    \"legendFormat\": \"{{application}} idle\" },\r\n        { \"expr\": \"hikaricp_connections_pending\",
-    \"legendFormat\": \"{{application}} pending\" }\r\n      ],\r\n      \"datasource\":
-    \"Prometheus\"\r\n    }\r\n  ]\r\n}\r\n"
+  04-databases.json: |
+    {
+      "title": "Databases",
+      "uid": "ecommerce-databases",
+      "tags": ["ecommerce", "database", "postgres", "mongodb"],
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "30s",
+      "time": { "from": "now-1h", "to": "now" },
+      "templating": {
+        "list": [{
+          "name": "database",
+          "type": "query",
+          "datasource": "Prometheus",
+          "query": "label_values(pg_up, database)",
+          "multi": false,
+          "includeAll": true,
+          "allValue": ".*",
+          "refresh": 2
+        }]
+      },
+      "panels": [
+        {
+          "id": 1, "type": "stat", "title": "Databases Up",
+          "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 7 }] }
+            }
+          },
+          "targets": [{ "expr": "(sum(pg_up) or vector(0)) + (sum(mongodb_up) or vector(0))", "legendFormat": "Up" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 2, "type": "stat", "title": "Total Active Connections",
+          "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [{ "expr": "sum(pg_stat_activity_count{datname=~\"$database\"})", "legendFormat": "Active connections" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 3, "type": "stat", "title": "Total Commits/s",
+          "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": { "defaults": { "unit": "ops" } },
+          "targets": [{ "expr": "sum(rate(pg_stat_database_xact_commit{datname=~\"$database\",datname!~\"template.*|postgres\"}[5m]))", "legendFormat": "commits/s" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 4, "type": "stat", "title": "Total Rollbacks/s",
+          "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 10 }] }
+            }
+          },
+          "targets": [{ "expr": "sum(rate(pg_stat_database_xact_rollback{datname=~\"$database\",datname!~\"template.*|postgres\"}[5m]))", "legendFormat": "rollbacks/s" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 5, "type": "stat", "title": "Cache Hit Ratio",
+          "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "percentunit",
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.9 }, { "color": "green", "value": 0.99 }] }
+            }
+          },
+          "targets": [{
+            "expr": "sum(pg_stat_database_blks_hit{datname=~\"$database\",datname!~\"template.*|postgres\"}) / (sum(pg_stat_database_blks_hit{datname=~\"$database\",datname!~\"template.*|postgres\"}) + sum(pg_stat_database_blks_read{datname=~\"$database\",datname!~\"template.*|postgres\"}))",
+            "legendFormat": "Cache hit %"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 6, "type": "stat", "title": "Deadlocks/s",
+          "gridPos": { "x": 20, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "ops",
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.01 }] }
+            }
+          },
+          "targets": [{ "expr": "sum(rate(pg_stat_database_deadlocks{datname!~\"template.*|postgres\"}[5m]))", "legendFormat": "deadlocks/s" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 7, "type": "table", "title": "Database Health Overview",
+          "gridPos": { "x": 0, "y": 4, "w": 24, "h": 6 },
+          "targets": [
+            { "expr": "pg_up", "legendFormat": "{{database}}", "instant": true },
+            { "expr": "mongodb_up", "legendFormat": "{{database}} (mongodb)", "instant": true },
+            { "expr": "pg_stat_activity_count", "legendFormat": "connections", "instant": true }
+          ],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 8, "type": "timeseries", "title": "Active Connections per Database",
+          "gridPos": { "x": 0, "y": 10, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [{
+            "expr": "pg_stat_activity_count{datname!~\"template.*|postgres\"}",
+            "legendFormat": "{{datname}}"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 9, "type": "timeseries", "title": "Transaction Rate per Database",
+          "gridPos": { "x": 12, "y": 10, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "ops" } },
+          "targets": [
+            { "expr": "rate(pg_stat_database_xact_commit{datname!~\"template.*|postgres\"}[5m])", "legendFormat": "{{datname}} commits" },
+            { "expr": "rate(pg_stat_database_xact_rollback{datname!~\"template.*|postgres\"}[5m])", "legendFormat": "{{datname}} rollbacks" }
+          ],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 10, "type": "timeseries", "title": "Row Operations (tuples fetched/inserted/updated/deleted)",
+          "gridPos": { "x": 0, "y": 18, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "ops" } },
+          "targets": [
+            { "expr": "sum(rate(pg_stat_database_tup_fetched{datname=~\"$database\",datname!~\"template.*|postgres\"}[5m]))", "legendFormat": "fetched" },
+            { "expr": "sum(rate(pg_stat_database_tup_inserted{datname=~\"$database\",datname!~\"template.*|postgres\"}[5m]))", "legendFormat": "inserted" },
+            { "expr": "sum(rate(pg_stat_database_tup_updated{datname=~\"$database\",datname!~\"template.*|postgres\"}[5m]))", "legendFormat": "updated" },
+            { "expr": "sum(rate(pg_stat_database_tup_deleted{datname=~\"$database\",datname!~\"template.*|postgres\"}[5m]))", "legendFormat": "deleted" }
+          ],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 11, "type": "timeseries", "title": "HikariCP Connection Pool (per service)",
+          "gridPos": { "x": 12, "y": 18, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            { "expr": "hikaricp_connections_active", "legendFormat": "{{application}} active" },
+            { "expr": "hikaricp_connections_idle", "legendFormat": "{{application}} idle" },
+            { "expr": "hikaricp_connections_pending", "legendFormat": "{{application}} pending" }
+          ],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 12, "type": "row", "title": "MongoDB — catalogdb (catalog-service read model)",
+          "gridPos": { "x": 0, "y": 26, "w": 24, "h": 1 },
+          "collapsed": false,
+          "panels": []
+        },
+        {
+          "id": 13, "type": "stat", "title": "MongoDB Up",
+          "gridPos": { "x": 0, "y": 27, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+            }
+          },
+          "targets": [{ "expr": "mongodb_up", "legendFormat": "{{database}}" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 14, "type": "stat", "title": "MongoDB Connections",
+          "gridPos": { "x": 4, "y": 27, "w": 4, "h": 4 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [{ "expr": "sum(mongodb_ss_connections{conn_type=\"current\"})", "legendFormat": "current" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 15, "type": "stat", "title": "MongoDB Ops/s",
+          "gridPos": { "x": 8, "y": 27, "w": 4, "h": 4 },
+          "fieldConfig": { "defaults": { "unit": "ops", "decimals": 2 } },
+          "targets": [{ "expr": "sum(rate(mongodb_ss_opcounters[5m]))", "legendFormat": "ops/s" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 16, "type": "stat", "title": "catalogdb data size",
+          "gridPos": { "x": 12, "y": 27, "w": 4, "h": 4 },
+          "fieldConfig": { "defaults": { "unit": "bytes" } },
+          "targets": [{ "expr": "sum(mongodb_dbstats_dataSize{exported_database=\"catalogdb\"})", "legendFormat": "dataSize" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 17, "type": "stat", "title": "MongoDB Driver Pool (catalog-service)",
+          "gridPos": { "x": 16, "y": 27, "w": 8, "h": 4 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            { "expr": "sum(mongodb_driver_pool_checkedout{application=\"catalog-service\"})", "legendFormat": "checked out" },
+            { "expr": "sum(mongodb_driver_pool_size{application=\"catalog-service\"})", "legendFormat": "pool size" }
+          ],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 18, "type": "timeseries", "title": "MongoDB Operations by type",
+          "gridPos": { "x": 0, "y": 31, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "ops" } },
+          "targets": [{ "expr": "rate(mongodb_ss_opcounters[5m])", "legendFormat": "{{legacy_op_type}}" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 19, "type": "timeseries", "title": "MongoDB Connections",
+          "gridPos": { "x": 12, "y": 31, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            { "expr": "mongodb_ss_connections{conn_type=\"current\"}", "legendFormat": "current" },
+            { "expr": "mongodb_ss_connections{conn_type=\"active\"}", "legendFormat": "active" }
+          ],
+          "datasource": "Prometheus"
+        }
+      ]
+    }
   05-kafka.json: "{\r\n  \"title\": \"Kafka\",\r\n  \"uid\": \"ecommerce-kafka\",\r\n
     \ \"tags\": [\"ecommerce\", \"kafka\", \"messaging\"],\r\n  \"timezone\": \"browser\",\r\n
     \ \"schemaVersion\": 38,\r\n  \"refresh\": \"30s\",\r\n  \"time\": { \"from\":

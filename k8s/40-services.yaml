@@ -259,7 +259,8 @@ spec:
               memory: 8Mi
         - name: wait-for-catalogdb
           image: busybox:1.36
-          command: ["sh", "-c", "until nc -z catalogdb 5432; do echo 'waiting for catalogdb'; sleep 3; done"]
+          # catalogdb is MongoDB (27017), not Postgres — see 10-databases.yaml.
+          command: ["sh", "-c", "until nc -z catalogdb 27017; do echo 'waiting for catalogdb'; sleep 3; done"]
           resources:
             requests:
               cpu: 10m
@@ -275,18 +276,20 @@ spec:
             - configMapRef:
                 name: java-env
           env:
-            - name: SPRING_DATASOURCE_URL
-              value: jdbc:postgresql://catalogdb:5432/catalogdb
+            # MongoDB: host instead of a JDBC URL; port, database name and
+            # authSource=admin are defaults in the service's application.yaml.
+            - name: SPRING_MONGODB_HOST
+              value: catalogdb
             - name: DB_USERNAME
               valueFrom:
                 secretKeyRef:
                   name: catalogdb-credentials
-                  key: POSTGRES_USER
+                  key: MONGO_INITDB_ROOT_USERNAME
             - name: DB_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: catalogdb-credentials
-                  key: POSTGRES_PASSWORD
+                  key: MONGO_INITDB_ROOT_PASSWORD
           resources:
             requests:
               cpu: 100m

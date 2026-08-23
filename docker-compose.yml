@@ -149,25 +149,45 @@ services:
       <<: *db-healthcheck
       test: ["CMD-SHELL", "pg_isready -U productuser -d productdb"]
 
+  # catalog-service is the one MongoDB-backed service: the catalog is a
+  # join-free read model of product-service (see ecommerce-catalog-service/
+  # README.md). The container name, volume name and depends_on wiring are
+  # unchanged so everything that addresses "catalogdb" keeps working; only the
+  # engine behind the name changed. A catalogdb-data volume created by the
+  # former Postgres image holds files Mongo cannot use — drop it once
+  # (`docker compose down --volumes`, or `rebuild.ps1` without -KeepData).
   catalogdb:
-    image: postgres:16-alpine
+    image: mongo:8.0
     container_name: catalogdb
     restart: unless-stopped
     logging: *default-logging
-    mem_limit: 256m
+    # WiredTiger sizes its cache from the cgroup limit (50% of limit - 1GB,
+    # minimum 256MB), which at this limit would be the entire container, so the
+    # cache is pinned to its minimum explicitly. 512m leaves headroom for the
+    # journal, connections and mongosh healthchecks on top of that cache.
+    mem_limit: 512m
+    command: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]
     environment:
-      POSTGRES_DB: catalogdb
-      POSTGRES_USER: cataloguser
-      POSTGRES_PASSWORD: catalogpass
+      # The root user lives in the admin database; clients authenticate with
+      # authSource=admin (spring.mongodb.authentication-database in the service).
+      MONGO_INITDB_ROOT_USERNAME: cataloguser
+      MONGO_INITDB_ROOT_PASSWORD: catalogpass
+      MONGO_INITDB_DATABASE: catalogdb
     ports:
-      - "5435:5432"
+      - "27017:27017"
     volumes:
-      - catalogdb-data:/var/lib/postgresql/data
+      - catalogdb-data:/data/db
     networks:
       - ecommerce-network
     healthcheck:
       <<: *db-healthcheck
-      test: ["CMD-SHELL", "pg_isready -U cataloguser -d catalogdb"]
+      # Authenticated on purpose: the image's first boot runs a temporary,
+      # auth-less mongod while it creates the root user, and an unauthenticated
+      # ping would report healthy against that and release catalog-service too
+      # early. $$ defers expansion to the container's shell.
+      test:
+        - CMD-SHELL
+        - mongosh -u "$$MONGO_INITDB_ROOT_USERNAME" -p "$$MONGO_INITDB_ROOT_PASSWORD" --authenticationDatabase admin --quiet --eval "db.adminCommand('ping').ok" | grep -q 1
 
   orderdb:
     image: postgres:16-alpine
@@ -335,7 +355,11 @@ services:
       - "8083:8083"
     environment:
       <<: *java-env
-      SPRING_DATASOURCE_URL: jdbc:postgresql://catalogdb:5432/catalogdb
+      # MongoDB, not a JDBC datasource — same DB_USERNAME/DB_PASSWORD contract
+      # as the other services, with the host in place of a JDBC URL. Port,
+      # database name and authSource=admin are defaults in the service's
+      # application.yaml.
+      SPRING_MONGODB_HOST: catalogdb
       DB_USERNAME: cataloguser
       DB_PASSWORD: catalogpass
     depends_on:
@@ -811,27 +835,6 @@ services:
     labels:
       database: productdb
 
-  postgres-exporter-catalogdb:
-    image: prometheuscommunity/postgres-exporter:v0.15.0
-    container_name: postgres-exporter-catalogdb
-    restart: unless-stopped
-    logging: *default-logging
-    mem_limit: 96m
-    environment:
-      DATA_SOURCE_NAME: postgresql://cataloguser:catalogpass@catalogdb:5432/catalogdb?sslmode=disable
-      PG_EXPORTER_EXTEND_QUERY_PATH: /etc/postgres-exporter/queries.yml
-    ports:
-      - "9189:9187"
-    volumes:
-      - ../ecommerce-monitoring/postgres-exporter/queries.yml:/etc/postgres-exporter/queries.yml:ro
-    networks:
-      - ecommerce-network
-    depends_on:
-      catalogdb:
-        condition: service_healthy
-    labels:
-      database: catalogdb
-
   postgres-exporter-orderdb:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     container_name: postgres-exporter-orderdb
@@ -915,6 +918,35 @@ services:
         condition: service_healthy
     labels:
       database: reviewdb
+
+  # ─── MongoDB Exporter (catalogdb) ────────────────────────────────────
+  # The Mongo counterpart of the postgres exporters above; prometheus.yml
+  # scrapes it as mongodb-exporter-catalogdb:9216 and database-alerts.yml
+  # fires MongoDown on mongodb_up == 0.
+  mongodb-exporter-catalogdb:
+    image: percona/mongodb_exporter:0.53.0
+    container_name: mongodb-exporter-catalogdb
+    restart: unless-stopped
+    logging: *default-logging
+    mem_limit: 96m
+    environment:
+      MONGODB_URI: mongodb://cataloguser:catalogpass@catalogdb:27017/admin
+    command:
+      - --collector.diagnosticdata
+      - --collector.dbstats
+      # Also emit the pre-0.20 metric names (mongodb_connections, mongodb_op_counters_total…)
+      # that most community dashboards use.
+      - --compatible-mode
+      - --web.listen-address=:9216
+    ports:
+      - "9216:9216"
+    networks:
+      - ecommerce-network
+    depends_on:
+      catalogdb:
+        condition: service_healthy
+    labels:
+      database: catalogdb
 
   # ─── Frontend ────────────────────────────────────────────────────────
   frontend:

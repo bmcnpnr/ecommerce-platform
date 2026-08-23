@@ -1,4 +1,5 @@
-# One postgres-exporter per database, matching docker-compose.yml.
+# One postgres-exporter per Postgres database, matching docker-compose.yml.
+# catalogdb is MongoDB and has its own exporter in 72-mongodb-exporters.yaml.
 #
 # Unlike compose, every exporter listens on 9187 — each has its own Service, so
 # there is no host-port collision to work around and prometheus.yml's
@@ -141,81 +142,6 @@ spec:
               valueFrom:
                 secretKeyRef:
                   name: productdb-credentials
-                  key: DATA_SOURCE_NAME
-            - name: PG_EXPORTER_EXTEND_QUERY_PATH
-              value: /etc/postgres-exporter/queries.yml
-          resources:
-            requests:
-              cpu: 10m
-              memory: 32Mi
-            limits:
-              memory: 96Mi
-          volumeMounts:
-            - name: queries
-              mountPath: /etc/postgres-exporter
-      volumes:
-        - name: queries
-          configMap:
-            name: postgres-exporter-queries
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: postgres-exporter-catalogdb
-  namespace: ecommerce
-  labels:
-    app: postgres-exporter-catalogdb
-    group: database
-    database: catalogdb
-spec:
-  selector:
-    app: postgres-exporter-catalogdb
-  ports:
-    - name: http
-      port: 9187
-      targetPort: http
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: postgres-exporter-catalogdb
-  namespace: ecommerce
-  labels:
-    app: postgres-exporter-catalogdb
-    group: database
-    database: catalogdb
-spec:
-  replicas: 1
-  selector:
-    matchLabels:
-      app: postgres-exporter-catalogdb
-  template:
-    metadata:
-      labels:
-        app: postgres-exporter-catalogdb
-        group: database
-        database: catalogdb
-    spec:
-      initContainers:
-        - name: wait-for-catalogdb
-          image: busybox:1.36
-          command: ["sh", "-c", "until nc -z catalogdb 5432; do echo 'waiting for catalogdb'; sleep 3; done"]
-          resources:
-            requests:
-              cpu: 10m
-              memory: 8Mi
-      containers:
-        - name: postgres-exporter
-          image: prometheuscommunity/postgres-exporter:v0.15.0
-          imagePullPolicy: IfNotPresent
-          ports:
-            - name: http
-              containerPort: 9187
-          env:
-            - name: DATA_SOURCE_NAME
-              valueFrom:
-                secretKeyRef:
-                  name: catalogdb-credentials
                   key: DATA_SOURCE_NAME
             - name: PG_EXPORTER_EXTEND_QUERY_PATH
               value: /etc/postgres-exporter/queries.yml

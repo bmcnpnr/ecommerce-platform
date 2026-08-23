@@ -19,6 +19,7 @@ resources:
   - 60-monitoring.yaml
   - 70-exporters.yaml
   - 71-postgres-exporters.yaml
+  - 72-mongodb-exporters.yaml
 
 # includeSelectors: false is load-bearing. The older commonLabels field folds
 # its labels into spec.selector as well, and a Deployment's selector is

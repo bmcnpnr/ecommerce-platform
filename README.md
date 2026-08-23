@@ -66,9 +66,12 @@ docker compose up -d
 
 Three layers, fastest first. The first two need no running stack.
 
-**Unit / slice tests (Maven, 67 tests across 7 services)** — H2 in place of Postgres,
-`spring-kafka-test` for the messaging paths. `service-discovery`, `api-gateway` and
-`notification-service` have context-load checks only.
+**Unit / slice tests (Maven, 90 tests across 7 services)** — H2 in place of Postgres
+for the JPA services, `spring-kafka-test` for the messaging paths. `service-discovery`,
+`api-gateway` and `notification-service` have context-load checks only.
+`catalog-service` (MongoDB) additionally runs its repository against a real
+`mongo:8.0` via Testcontainers — those 15 tests are skipped, not failed, when no
+Docker daemon is reachable, so `./build-all.sh` still passes with Docker stopped.
 
 ```bash
 ./build-all.sh                 # runs tests; omit --skip-tests
@@ -89,10 +92,10 @@ The MSW handlers use **relative** URLs so they track `VITE_API_BASE_URL=/`. If y
 switch the app back to an absolute base URL, the mocks must move with it or every
 request falls through unmatched.
 
-**End-to-end smoke test (19 checks)** — drives a running stack entirely through the
+**End-to-end smoke test (24 checks)** — drives a running stack entirely through the
 gateway, so it covers routing, Eureka discovery, JWT auth, the Feign hop into
-product-service, and the Kafka publish, asserting notification-service actually
-consumed the event.
+product-service, the MongoDB-backed catalog sync/read-back, and the Kafka publish,
+asserting notification-service actually consumed the event.
 
 ```bash
 docker compose up -d
@@ -128,6 +131,32 @@ the failures look like application bugs.
 
 Grafana signs in with `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD`
 (default `admin` / `admin`), overridable via `ecommerce-platform/.env`.
+
+## Databases
+
+One database per service. Six are PostgreSQL; `catalogdb` is **MongoDB**, because
+catalog-service keeps a join-free read model of product-service (one document per
+product, keyed by product id — see `ecommerce-catalog-service/README.md`).
+
+| Database   | Engine            | Host port | Service          |
+|------------|-------------------|-----------|------------------|
+| userdb     | postgres:16       | 5432      | user-service     |
+| productdb  | postgres:16       | 5433      | product-service  |
+| orderdb    | postgres:16       | 5434      | order-service    |
+| catalogdb  | **mongo:8.0**     | **27017** | catalog-service  |
+| paymentdb  | postgres:16       | 5436      | payment-service  |
+| shippingdb | postgres:16       | 5437      | shipping-service |
+| reviewdb   | postgres:16       | 5438      | review-service   |
+
+```bash
+docker compose exec catalogdb mongosh -u cataloguser -p catalogpass --authenticationDatabase admin catalogdb
+```
+
+If `catalogdb-data` was created by the former Postgres catalogdb it holds files
+Mongo cannot use — drop it once with `docker compose down --volumes` (or
+`rebuild.ps1` without `-KeepData`). Every metric exporter follows the engine:
+`postgres-exporter-<db>` for the six Postgres databases, `mongodb-exporter-catalogdb`
+(percona/mongodb_exporter, :9216) for Mongo.
 
 ## Resource limits
 

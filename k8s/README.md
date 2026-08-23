@@ -10,14 +10,15 @@ byte-for-byte.
 01-secrets.yaml              JWT, Grafana and the seven database credentials
 02-config.yaml               the java-env ConfigMap (x-java-env from compose)
 05-monitoring-config.yaml    GENERATED from ../../ecommerce-monitoring
-10-databases.yaml            7 postgres StatefulSets, one per service
+10-databases.yaml            7 database StatefulSets, one per service: 6 postgres + MongoDB for catalogdb
 20-kafka.yaml                single-node KRaft broker
 30-service-discovery.yaml    Eureka
 40-services.yaml             8 Spring services + the API gateway
 50-frontend.yaml             nginx SPA, with a Kubernetes-specific proxy config
 60-monitoring.yaml           Prometheus, Alertmanager, Loki, Tempo, Grafana, Promtail
 70-exporters.yaml            node-exporter, cAdvisor, Kafka exporter + UI, blackbox, nginx
-71-postgres-exporters.yaml   one exporter per database
+71-postgres-exporters.yaml   one exporter per Postgres database
+72-mongodb-exporters.yaml    mongodb_exporter for catalogdb
 ```
 
 ## Deploying
@@ -35,7 +36,7 @@ one to the other, which replaces the cluster with an empty one:
 | node name | `docker-desktop` | `desktop-control-plane` |
 | runtime | cri-dockerd | containerd |
 | `type: LoadBalancer` | binds on localhost | binds on localhost |
-| locally built images | shared | shared |
+| locally built images | shared | pulled from Docker on demand; a rebuilt tag needs `crictl pull` on the node (build-images does it) |
 | promtail stage | `docker: {}` | `cri: {}` |
 | kubelet log rotation | no | yes (10 MB × 5) |
 
@@ -65,7 +66,7 @@ missing.
 | Prometheus | http://localhost:9090 |
 | Alertmanager | http://localhost:9093 |
 | Kafka UI | http://localhost:8090 |
-| Databases | localhost:5432-5438, same ports as compose |
+| Databases | localhost:5432-5438 (Postgres) and localhost:27017 (catalogdb, MongoDB), same ports as compose |
 
 Docker Desktop implements `type: LoadBalancer` by binding the port on the host,
 so these are real host ports rather than port-forwards. Each is a separate
@@ -178,6 +179,14 @@ drift) or render them on demand. Edit the originals under
 kubectl apply -k .
 ```
 
+`prometheus.yml`, `alertmanager.yml`, `loki-config.yml` and `tempo-config.yml`
+are mounted with `subPath`, and subPath mounts never see ConfigMap updates — so
+after re-applying a changed config those pods need a restart
+(`kubectl -n ecommerce rollout restart deployment/prometheus`); the
+`--web.enable-lifecycle` reload endpoint cannot help because the file inside the
+pod has not changed. Rules and dashboards are directory mounts and refresh on
+their own within about a minute.
+
 `prometheus.yml` needed no changes at all: it addresses everything by service
 name and port, and those names are preserved here.
 
@@ -189,6 +198,7 @@ kubectl -n ecommerce logs -f deployment/order-service
 kubectl -n ecommerce rollout restart deployment/user-service
 kubectl -n ecommerce scale deployment/product-service --replicas=3   # Eureka handles the rest
 kubectl -n ecommerce exec -it userdb-0 -- psql -U useruser userdb
+kubectl -n ecommerce exec -it catalogdb-0 -- mongosh -u cataloguser -p catalogpass --authenticationDatabase admin catalogdb
 ```
 
 After rebuilding an image, the tag does not change, so Kubernetes has no reason
@@ -197,6 +207,20 @@ to restart anything:
 ```bash
 ./build-images.sh
 kubectl -n ecommerce rollout restart deployment/user-service
+```
+
+**catalogdb is MongoDB.** It keeps the StatefulSet name, Service name and PVC
+template of its Postgres neighbours, so `deploy.sh` and the init containers did not
+change — only the port (27017) and the image did. On a cluster that ran the
+earlier Postgres `catalogdb`, the reused PVC `data-catalogdb-0` still holds the old
+`pgdata/` directory; mongod lives in its own `mongo/` subPath and ignores it, but
+it is dead weight, so drop it once:
+
+```bash
+kubectl -n ecommerce delete statefulset catalogdb
+kubectl -n ecommerce delete pvc data-catalogdb-0
+kubectl -n ecommerce delete deployment,service postgres-exporter-catalogdb   # apply does not prune it
+./deploy.sh
 ```
 
 Teardown keeps data unless told otherwise:
@@ -210,7 +234,14 @@ Teardown keeps data unless told otherwise:
 
 **Images are never pulled.** They are tagged `ecommerce/<name>:local` with
 `imagePullPolicy: IfNotPresent`. Docker Desktop's kubeadm cluster shares the
-local image store, so no registry is involved. On any other cluster these
+local image store, so no registry is involved. The kind cluster does not: its
+node has its own containerd cache, fetches a local-only image from Docker the
+first time it is asked for and — because of `IfNotPresent` — never asks again
+for a tag it already holds. A rebuild under the same `:local` tag therefore
+ships the *old* jar until the node's copy is refreshed; `build-images.sh` /
+`build-images.ps1` run `crictl pull` on the node for every image when they
+detect the kind provisioner, so the documented flow stays correct on both.
+On any other cluster these
 manifests need real registry references — `docker-compose.registry.yml` already
 names the Docker Hub images to point at.
 

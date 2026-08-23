@@ -58,5 +58,35 @@ foreach ($svc in ($Services + 'frontend')) {
     Write-Host "tagged ecommerce/${svc}:local"
 }
 
+# ─── Refresh the kind node's image cache (kind provisioner only) ─────────────
+# Under Docker Desktop's kind provisioner the node runs its own containerd
+# with its own image cache. It can pull local-only images straight out of
+# Docker's image store, but imagePullPolicy: IfNotPresent never asks for a tag
+# it already holds - so a rebuild under the same ecommerce/<svc>:local tag is
+# invisible and the pod quietly keeps running the previous jar. An explicit
+# pull on the node updates the tag (only changed layers transfer). The kubeadm
+# provisioner shares Docker's image store directly and has no such node.
+$Node = 'desktop-control-plane'
+# Probe without letting a "No such container" on stderr become a terminating
+# error under $ErrorActionPreference = 'Stop' (PowerShell 5.1 wraps native
+# stderr lines in ErrorRecords when they are redirected).
+$NodePresent = $false
+$prevEap = $ErrorActionPreference
+$ErrorActionPreference = 'Continue'
+try {
+    cmd /c "docker exec $Node true >NUL 2>&1"
+    $NodePresent = ($LASTEXITCODE -eq 0)
+}
+finally { $ErrorActionPreference = $prevEap }
+if ($NodePresent) {
+    Write-Host ""
+    Write-Host "kind provisioner detected ($Node): refreshing its image cache..."
+    foreach ($svc in ($Services + 'frontend')) {
+        cmd /c "docker exec $Node crictl pull docker.io/ecommerce/${svc}:local >NUL 2>&1"
+        if ($LASTEXITCODE -ne 0) { throw "crictl pull failed for ecommerce/${svc}:local on $Node" }
+        Write-Host "refreshed ecommerce/${svc}:local on $Node"
+    }
+}
+
 Write-Host ""
 Write-Host "Done. Deploy with .\deploy.ps1"

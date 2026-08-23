@@ -100,6 +100,20 @@ chk "unknown product surfaces as client error" 404 "$(code -X POST -H "$AUTH" -H
 chk "confirm order (publishes order.placed)" 200 "$(code -X POST -H "$AUTH" "$GW/api/v1/orders/$ORDER_ID/confirm")"
 chk "list orders by customer" 200 "$(code -H "$AUTH" "$GW/api/v1/orders/customer/1")"
 
+# catalog-service is the MongoDB-backed read model: sync pulls the product over
+# Feign and upserts a document keyed by the product id; the reads below go
+# back through that document, so this covers the Mongo round trip end to end.
+note "Catalog read model (MongoDB): sync from product-service, then read back"
+chk "sync product into catalog"        200 "$(code -X POST -H "$AUTH" "$GW/api/v1/catalog/sync/$PRODUCT_ID")"
+chk "catalog entry by product id"      200 "$(code "$GW/api/v1/catalog/product/$PRODUCT_ID")"
+if curl -s --max-time 30 "$GW/api/v1/catalog/product/$PRODUCT_ID" | grep -q "\"productSku\":\"$SKU\""; then
+  printf '  \033[32mPASS\033[0m  %-52s sku=%s\n' "catalog entry carries the synced product" "$SKU"; pass=$((pass+1))
+else
+  printf '  \033[31mFAIL\033[0m  %s\n' "catalog entry does not carry sku $SKU"; fail=$((fail+1))
+fi
+chk "catalog search by name"           200 "$(code "$GW/api/v1/catalog/search?q=Smoke")"
+chk "unknown product is 404 in catalog" 404 "$(code "$GW/api/v1/catalog/product/999999")"
+
 note "Kafka consumer picked the event up"
 sleep 5
 if docker compose logs notification-service --since 2m 2>/dev/null \
