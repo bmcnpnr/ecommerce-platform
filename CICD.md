@@ -110,6 +110,27 @@ No `TESTCONTAINERS_HOST_OVERRIDE` is required for this Linux VM arrangement.
 The pipelines set only `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` for the mounted
 socket used by Testcontainers' cleanup container.
 
+## Contract tests in the pipeline
+
+Every repository that talks to another runs Pact contract tests as part of the
+ordinary `mvn verify` (they are plain Surefire tests — no broker, no Docker, the
+Kafka ones use an embedded KRaft broker):
+
+- Consumer tests (`*ConsumerPactTest`) generate `target/pacts/*.json` and fail if
+  the service's own client code cannot drive the recorded interactions.
+- Provider tests (`*ProviderPactTest`) replay the **committed** pacts in
+  `src/test/resources/pacts/` against the real application and fail if the service
+  no longer honours a consumer's expectations.
+
+Because each repository is its own CircleCI project, pacts are distributed as
+committed files rather than through a Pact broker: after changing a consumer's
+expectations run `./sync-pacts.sh` from `ecommerce-platform`, then commit the
+updated `src/test/resources/pacts/*.json` in the provider repositories alongside the
+consumer change. Nothing in `.circleci/config.yml` needs to change for this.
+Consumer tests bind Pact mock servers to fixed ports (18082/18083/18087 for
+product-service's consumers, 18181/18187 for the gateway's); they are inside the
+`verify` job's Docker container, so they cannot collide between pipelines.
+
 ## Deploy delivered images
 
 The normal `docker-compose.yml` remains optimized for local source builds. The

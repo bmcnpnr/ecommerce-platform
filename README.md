@@ -64,11 +64,11 @@ docker compose up -d
 
 ## Testing
 
-Three layers, fastest first. The first two need no running stack.
+Four layers, fastest first. The first three need no running stack.
 
-**Unit / slice tests (Maven, 102 tests across 7 services)** — H2 in place of Postgres
-for the JPA services, `spring-kafka-test` for the messaging paths. `service-discovery`,
-`api-gateway` and `notification-service` have context-load checks only.
+**Unit / slice tests (Maven)** — H2 in place of Postgres
+for the JPA services, `spring-kafka-test` for the messaging paths. `service-discovery` has none;
+`api-gateway` and `notification-service` are covered by the contract tests below.
 `catalog-service` (MongoDB) additionally runs its repository against a real
 `mongo:8.0` via Testcontainers — those 15 tests are skipped, not failed, when no
 Docker daemon is reachable, so `./build-all.sh` still passes with Docker stopped.
@@ -106,6 +106,52 @@ GW=http://otherhost:8080 ./smoke-test.sh
 Run it from Git Bash or WSL, **not PowerShell** — PowerShell 5.1 strips the double
 quotes out of a JSON body passed to `curl.exe`, so requests arrive malformed and
 the failures look like application bugs.
+
+
+**Contract tests (Pact, 24 interactions across 10 pacts)** — pin every
+service-to-service interface so a change on one side fails the *other* side's build
+instead of production. Consumer-driven with [pact-jvm](https://docs.pact.io/implementation_guides/jvm)
+4.7.5: each consumer owns a `*ConsumerPactTest` that exercises its **real** client
+code (the production Feign client and `FeignConfig`, or the production Kafka listener
+container via an embedded broker) against a Pact mock and records what it sends and
+which response/event fields it relies on; each provider owns a `*ProviderPactTest`
+that replays those pacts against the **real** application (controllers + JPA on H2
+over HTTP, or the real service/producer code serialized with the production Kafka
+`JsonSerializer`). Both run as ordinary Surefire tests, so `mvn verify`, CircleCI and
+`./build-all.sh` already execute them — no broker and no running stack.
+
+| Consumer → Provider | Transport | What is pinned |
+|---|---|---|
+| order-service → product-service | Feign | `GET /api/v1/products/{id}`, `PATCH /api/v1/products/{id}/stock` (`{"delta":n}`), 404 / 400 error shape |
+| catalog-service → product-service | Feign | `GET /api/v1/products/{id}` (all fields the Kotlin DTO needs), `GET /api/v1/categories`, 404 |
+| review-service → product-service | Feign | `GET /api/v1/products/{id}` existence check, 404 |
+| api-gateway → review-service | HTTP | `X-Username` / `X-User-Id` / `X-User-Role` headers injected after JWT validation |
+| api-gateway → user-service | HTTP + JWT | the same headers on `/api/v1/users/me`; the JWT claims user-service signs (`sub`, numeric `userId`, `role`, HS256/384/512) |
+| order-service ← payment-service | Kafka | `payment.completed`, `payment.failed` |
+| shipping-service ← payment-service | Kafka | `payment.completed` |
+| notification-service ← order-service | Kafka | `order.placed`, `order.cancelled` |
+| notification-service ← payment-service | Kafka | `payment.completed`, `payment.failed`, `payment.refunded` |
+| notification-service ← shipping-service | Kafka | `shipment.created`, `shipment.updated` |
+
+Kafka events travel as spring-kafka `JsonSerializer` output — note that `LocalDateTime`
+fields are **integer arrays** (`[y, M, d, H, m, s, nanos]`), not ISO strings; the pacts
+pin that form. Record key (`orderId`) and topic are part of each message's metadata.
+
+The repositories are independent Git projects and there is no Pact broker, so the
+pact files are the hand-off: a consumer test writes `target/pacts/<consumer>-<provider>.json`,
+the provider keeps a committed copy in `src/test/resources/pacts/` and verifies it on
+every build. After changing a consumer's expectations run
+
+```bash
+./sync-pacts.sh                 # regenerate all pacts, copy into providers, verify
+./sync-pacts.sh --verify-only   # replay the committed pacts against every provider
+.\sync-pacts.ps1                # PowerShell twin (-NoVerify / -VerifyOnly)
+```
+
+and commit the updated `src/test/resources/pacts/*.json` in the provider repositories
+together with the consumer change. A provider build that fails its `*ProviderPactTest`
+means that provider would break the named consumer; fix the provider or, if the change
+is intended, update the consumer and re-sync.
 
 ## Service ports
 
