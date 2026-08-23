@@ -66,7 +66,7 @@ docker compose up -d
 
 Three layers, fastest first. The first two need no running stack.
 
-**Unit / slice tests (Maven, 90 tests across 7 services)** — H2 in place of Postgres
+**Unit / slice tests (Maven, 102 tests across 7 services)** — H2 in place of Postgres
 for the JPA services, `spring-kafka-test` for the messaging paths. `service-discovery`,
 `api-gateway` and `notification-service` have context-load checks only.
 `catalog-service` (MongoDB) additionally runs its repository against a real

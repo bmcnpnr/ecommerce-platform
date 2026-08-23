@@ -232,6 +232,38 @@ Teardown keeps data unless told otherwise:
 
 ## Notes
 
+**Rollouts are hitless.** A `rollout restart` used to produce 30-second hangs
+and 500s for up to a minute: the gateway (and Feign callers) kept dialling the
+terminated pod's IP until Eureka stopped advertising it. Four things, all
+needed together, make a rollout invisible to callers now (measured: 0 failed
+requests, worst case ~0.4s, while catalog-service, the gateway itself and
+order-service were restarted back to back under continuous load — the same
+scenario failed 13 of ~430 requests before):
+
+- **Eureka server** (`service-discovery`): `use-read-only-response-cache: false`.
+  The read-only cache is refreshed only every 30s, so registrations,
+  deregistrations and status changes stayed invisible to every fetching client
+  for up to half a minute — the single biggest contributor.
+- **Eureka clients** (every Spring service): registry fetch every 5s, lease
+  renewal 5s / expiry 15s (defaults 30s / 30s / 90s), LoadBalancer cache 5s.
+  A *crashed* instance is gone within ~20s; a graceful stop does not wait for it.
+- **preStop drain** (`40-services.yaml`): before SIGTERM the pod POSTs
+  `OUT_OF_SERVICE` to its own `/actuator/serviceregistry`, then sleeps 15s while
+  still serving. Every peer has dropped it by then, so Boot's graceful shutdown
+  (default in Boot 4) only has in-flight requests to finish.
+  `terminationGracePeriodSeconds: 60` covers 15s drain + 30s graceful phase.
+- **Retry on connection failure only**: the gateway (`Retry` default filter,
+  `connect-timeout: 3000`) and the Feign clients (`FeignConfig.ConnectionFailureRetryer`,
+  `connect-timeout: 2000`) retry a request whose TCP connect failed — it never
+  reached an instance, so replaying any method is safe — and the LoadBalancer
+  picks the next instance. Read timeouts and 5xx are deliberately *not* retried.
+
+Two Eureka quirks to know when poking at this by hand: a client-reported UP
+after OUT_OF_SERVICE takes up to ~25s to reach the server (status replication is
+rate-limited; a fresh pod registers within seconds, which is what rollouts rely
+on), and `kubectl delete pod --grace-period=0` skips preStop — that is what the
+lease expiry and the connection-failure retry are for.
+
 **Images are never pulled.** They are tagged `ecommerce/<name>:local` with
 `imagePullPolicy: IfNotPresent`. Docker Desktop's kubeadm cluster shares the
 local image store, so no registry is involved. The kind cluster does not: its

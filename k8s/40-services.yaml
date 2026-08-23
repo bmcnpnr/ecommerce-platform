@@ -48,6 +48,8 @@ spec:
         app: user-service
         group: application
     spec:
+      # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
+      terminationGracePeriodSeconds: 60
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -70,6 +72,25 @@ spec:
           ports:
             - name: http
               containerPort: 8081
+          # Zero-downtime rollout, second half (the first is the Eureka tuning in
+          # every application.yaml). On termination Kubernetes runs this *before*
+          # SIGTERM: the pod marks itself OUT_OF_SERVICE in Eureka through the
+          # actuator and keeps serving for 15s — long enough for every peer to
+          # fetch the registry (5s) and expire its LoadBalancer cache (5s) — so
+          # nothing is routed to it by the time SIGTERM starts Boot's graceful
+          # shutdown (in-flight requests finish, then it deregisters). Without
+          # this, callers kept dialling the dead pod's IP for up to ~30s.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -qO- --post-data='{"status":"OUT_OF_SERVICE"}'
+                    --header='Content-Type: application/json'
+                    http://localhost:8081/actuator/serviceregistry || true;
+                    sleep 15
           envFrom:
             - configMapRef:
                 name: java-env
@@ -151,6 +172,8 @@ spec:
         app: product-service
         group: application
     spec:
+      # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
+      terminationGracePeriodSeconds: 60
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -173,6 +196,25 @@ spec:
           ports:
             - name: http
               containerPort: 8082
+          # Zero-downtime rollout, second half (the first is the Eureka tuning in
+          # every application.yaml). On termination Kubernetes runs this *before*
+          # SIGTERM: the pod marks itself OUT_OF_SERVICE in Eureka through the
+          # actuator and keeps serving for 15s — long enough for every peer to
+          # fetch the registry (5s) and expire its LoadBalancer cache (5s) — so
+          # nothing is routed to it by the time SIGTERM starts Boot's graceful
+          # shutdown (in-flight requests finish, then it deregisters). Without
+          # this, callers kept dialling the dead pod's IP for up to ~30s.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -qO- --post-data='{"status":"OUT_OF_SERVICE"}'
+                    --header='Content-Type: application/json'
+                    http://localhost:8082/actuator/serviceregistry || true;
+                    sleep 15
           envFrom:
             - configMapRef:
                 name: java-env
@@ -249,6 +291,8 @@ spec:
         app: catalog-service
         group: application
     spec:
+      # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
+      terminationGracePeriodSeconds: 60
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -272,6 +316,25 @@ spec:
           ports:
             - name: http
               containerPort: 8083
+          # Zero-downtime rollout, second half (the first is the Eureka tuning in
+          # every application.yaml). On termination Kubernetes runs this *before*
+          # SIGTERM: the pod marks itself OUT_OF_SERVICE in Eureka through the
+          # actuator and keeps serving for 15s — long enough for every peer to
+          # fetch the registry (5s) and expire its LoadBalancer cache (5s) — so
+          # nothing is routed to it by the time SIGTERM starts Boot's graceful
+          # shutdown (in-flight requests finish, then it deregisters). Without
+          # this, callers kept dialling the dead pod's IP for up to ~30s.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -qO- --post-data='{"status":"OUT_OF_SERVICE"}'
+                    --header='Content-Type: application/json'
+                    http://localhost:8083/actuator/serviceregistry || true;
+                    sleep 15
           envFrom:
             - configMapRef:
                 name: java-env
@@ -350,6 +413,8 @@ spec:
         app: order-service
         group: application
     spec:
+      # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
+      terminationGracePeriodSeconds: 60
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -379,6 +444,25 @@ spec:
           ports:
             - name: http
               containerPort: 8084
+          # Zero-downtime rollout, second half (the first is the Eureka tuning in
+          # every application.yaml). On termination Kubernetes runs this *before*
+          # SIGTERM: the pod marks itself OUT_OF_SERVICE in Eureka through the
+          # actuator and keeps serving for 15s — long enough for every peer to
+          # fetch the registry (5s) and expire its LoadBalancer cache (5s) — so
+          # nothing is routed to it by the time SIGTERM starts Boot's graceful
+          # shutdown (in-flight requests finish, then it deregisters). Without
+          # this, callers kept dialling the dead pod's IP for up to ~30s.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -qO- --post-data='{"status":"OUT_OF_SERVICE"}'
+                    --header='Content-Type: application/json'
+                    http://localhost:8084/actuator/serviceregistry || true;
+                    sleep 15
           envFrom:
             - configMapRef:
                 name: java-env
@@ -455,6 +539,8 @@ spec:
         app: payment-service
         group: application
     spec:
+      # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
+      terminationGracePeriodSeconds: 60
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -484,6 +570,25 @@ spec:
           ports:
             - name: http
               containerPort: 8085
+          # Zero-downtime rollout, second half (the first is the Eureka tuning in
+          # every application.yaml). On termination Kubernetes runs this *before*
+          # SIGTERM: the pod marks itself OUT_OF_SERVICE in Eureka through the
+          # actuator and keeps serving for 15s — long enough for every peer to
+          # fetch the registry (5s) and expire its LoadBalancer cache (5s) — so
+          # nothing is routed to it by the time SIGTERM starts Boot's graceful
+          # shutdown (in-flight requests finish, then it deregisters). Without
+          # this, callers kept dialling the dead pod's IP for up to ~30s.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -qO- --post-data='{"status":"OUT_OF_SERVICE"}'
+                    --header='Content-Type: application/json'
+                    http://localhost:8085/actuator/serviceregistry || true;
+                    sleep 15
           envFrom:
             - configMapRef:
                 name: java-env
@@ -560,6 +665,8 @@ spec:
         app: shipping-service
         group: application
     spec:
+      # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
+      terminationGracePeriodSeconds: 60
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -589,6 +696,25 @@ spec:
           ports:
             - name: http
               containerPort: 8086
+          # Zero-downtime rollout, second half (the first is the Eureka tuning in
+          # every application.yaml). On termination Kubernetes runs this *before*
+          # SIGTERM: the pod marks itself OUT_OF_SERVICE in Eureka through the
+          # actuator and keeps serving for 15s — long enough for every peer to
+          # fetch the registry (5s) and expire its LoadBalancer cache (5s) — so
+          # nothing is routed to it by the time SIGTERM starts Boot's graceful
+          # shutdown (in-flight requests finish, then it deregisters). Without
+          # this, callers kept dialling the dead pod's IP for up to ~30s.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -qO- --post-data='{"status":"OUT_OF_SERVICE"}'
+                    --header='Content-Type: application/json'
+                    http://localhost:8086/actuator/serviceregistry || true;
+                    sleep 15
           envFrom:
             - configMapRef:
                 name: java-env
@@ -665,6 +791,8 @@ spec:
         app: review-service
         group: application
     spec:
+      # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
+      terminationGracePeriodSeconds: 60
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -687,6 +815,25 @@ spec:
           ports:
             - name: http
               containerPort: 8087
+          # Zero-downtime rollout, second half (the first is the Eureka tuning in
+          # every application.yaml). On termination Kubernetes runs this *before*
+          # SIGTERM: the pod marks itself OUT_OF_SERVICE in Eureka through the
+          # actuator and keeps serving for 15s — long enough for every peer to
+          # fetch the registry (5s) and expire its LoadBalancer cache (5s) — so
+          # nothing is routed to it by the time SIGTERM starts Boot's graceful
+          # shutdown (in-flight requests finish, then it deregisters). Without
+          # this, callers kept dialling the dead pod's IP for up to ~30s.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -qO- --post-data='{"status":"OUT_OF_SERVICE"}'
+                    --header='Content-Type: application/json'
+                    http://localhost:8087/actuator/serviceregistry || true;
+                    sleep 15
           envFrom:
             - configMapRef:
                 name: java-env
@@ -763,6 +910,8 @@ spec:
         app: notification-service
         group: application
     spec:
+      # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
+      terminationGracePeriodSeconds: 60
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -785,6 +934,25 @@ spec:
           ports:
             - name: http
               containerPort: 8088
+          # Zero-downtime rollout, second half (the first is the Eureka tuning in
+          # every application.yaml). On termination Kubernetes runs this *before*
+          # SIGTERM: the pod marks itself OUT_OF_SERVICE in Eureka through the
+          # actuator and keeps serving for 15s — long enough for every peer to
+          # fetch the registry (5s) and expire its LoadBalancer cache (5s) — so
+          # nothing is routed to it by the time SIGTERM starts Boot's graceful
+          # shutdown (in-flight requests finish, then it deregisters). Without
+          # this, callers kept dialling the dead pod's IP for up to ~30s.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -qO- --post-data='{"status":"OUT_OF_SERVICE"}'
+                    --header='Content-Type: application/json'
+                    http://localhost:8088/actuator/serviceregistry || true;
+                    sleep 15
           envFrom:
             - configMapRef:
                 name: java-env
@@ -864,6 +1032,8 @@ spec:
         app: api-gateway
         group: application
     spec:
+      # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
+      terminationGracePeriodSeconds: 60
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -879,6 +1049,25 @@ spec:
           ports:
             - name: http
               containerPort: 8080
+          # Zero-downtime rollout, second half (the first is the Eureka tuning in
+          # every application.yaml). On termination Kubernetes runs this *before*
+          # SIGTERM: the pod marks itself OUT_OF_SERVICE in Eureka through the
+          # actuator and keeps serving for 15s — long enough for every peer to
+          # fetch the registry (5s) and expire its LoadBalancer cache (5s) — so
+          # nothing is routed to it by the time SIGTERM starts Boot's graceful
+          # shutdown (in-flight requests finish, then it deregisters). Without
+          # this, callers kept dialling the dead pod's IP for up to ~30s.
+          lifecycle:
+            preStop:
+              exec:
+                command:
+                  - sh
+                  - -c
+                  - >-
+                    wget -qO- --post-data='{"status":"OUT_OF_SERVICE"}'
+                    --header='Content-Type: application/json'
+                    http://localhost:8080/actuator/serviceregistry || true;
+                    sleep 15
           envFrom:
             - configMapRef:
                 name: java-env
