@@ -165,19 +165,28 @@ See [Frontend](frontend.md) for its structure and its API usage.
 
 ## 7. Tests
 
+The [Testing guide](testing.md) covers each layer in depth: base classes, conventions and troubleshooting.
+
 | Layer | Command | Needs |
 |---|---|---|
-| Unit, slice and contract tests, one service | `mvn -B verify` in the repo | nothing running. H2 replaces Postgres and an embedded broker replaces Kafka. catalog-service's Testcontainers tests are skipped without Docker. |
-| All services | `./build-all.sh` (without `--skip-tests`) | — |
-| Frontend | `npx vitest run` | — |
+| Unit and slice tests, one service (fast loop) | `mvn -B test` in the repo | nothing running, no Docker. H2 replaces Postgres and an embedded broker replaces Kafka. |
+| Unit, integration and contract tests, one service | `mvn -B verify` in the repo | Docker, for the `*IT` classes: Testcontainers starts `postgres:16-alpine`, `cp-kafka:7.6.0` or `mongo:8.0`, with real Flyway migrations. Start Docker Desktop first: most ITs fail without it (only order-service's skip). No running stack. Run one IT with `mvn -B verify -Dit.test=OrderFlowIT` |
+| All services | `./build-all.sh` (without `--skip-tests`) | Docker, as above |
+| Frontend | `npx vitest run` (`npm run test:coverage` for coverage) | — |
+| Frontend pacts | `npm run test:pact` in `ecommerce-frontend` | — |
 | End to end | `./smoke-test.sh` | the running stack |
 | Browser end to end | `npm run e2e:install` once, then `npm run e2e` in `ecommerce-frontend` | the running stack (`E2E_BASE_URL`, default `http://localhost:3000`). Report: `npm run e2e:report` |
-| Contracts across repos | `./sync-pacts.sh` | — |
+| Load | `PROFILE=smoke ./run-load.sh browse.js` in `load-tests` (also `checkout.js`; profiles `smoke`, `load`, `stress`) | the running stack, Docker for the k6 image. `checkout.js` writes real data |
+| Contracts across repos | `./sync-pacts.sh` | Node, for the frontend's pacts |
+
+A test that finds a bug is **disabled, not deleted**: it asserts the correct behaviour and carries `@Disabled("BUG: ...")` (Java, Kotlin) or `it.fails` (frontend). When you fix a bug, remove the marker; for `it.fails`, the test turns red the moment the bug is fixed, which is the cue. The catalogue is [Findings](findings.md#bugs-pinned-by-tests).
 
 If you change what a service **sends** or **expects** across a boundary (a Feign
 call, a response field another service reads, a Kafka event), run
 `./sync-pacts.sh`. Then commit the updated `src/test/resources/pacts/*.json` in
-the provider repositories together with your change. See
+the provider repositories together with your change. The SPA's calls are pinned too: after changing an API
+call in `ecommerce-frontend/src/api`, the same script regenerates `pacts/ecommerce-frontend-*.json` and copies
+them into the providers (`pacts-frontend/` for order and payment). See
 [Architecture: testing strategy](architecture.md#testing-strategy).
 
 ## 8. Conventions

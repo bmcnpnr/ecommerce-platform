@@ -6,7 +6,7 @@ The frontend is the platform's only user interface. It is a React single-page ap
 |---|---|
 | Repository | `ecommerce-frontend` |
 | Stack | React 18.3.1 · TypeScript 5.9.3 · Vite 6.4.1 · MUI 6.5.0 (plus `@mui/lab` for Timeline) · React Router 6.30.3 · TanStack Query 5.90.21 · zustand 5.0.11 · axios 1.13.6 · react-hook-form 7.71.2 with zod 3.25.76 · date-fns 4.1.0 |
-| Tests | Vitest 2.1.9 (jsdom 26) · Testing Library 16 · MSW 2.12.10. 42 tests. Browser end to end: Playwright 1.64.1, 26 tests against a running stack ([details](#end-to-end-tests-playwright)) |
+| Tests | Vitest 2.1.9 (jsdom 26) · Testing Library 16 · MSW 2.12.10. 391 unit tests at about 99% line coverage (@vitest/coverage-v8), plus 40 pact-js interactions ([details](#testing)). Browser end to end: Playwright 1.64.1, 26 tests against a running stack ([details](#end-to-end-tests-playwright)) |
 | Dev server | `npm run dev`: Vite on port 3000, `/api` proxied to `http://localhost:8080` |
 | Container | `nginx:1.27-alpine` listening on port 80. Host port 3000 (compose maps `3000:80`, the k8s Service `frontend-lb` listens on 3000) |
 | How it reaches the API | Images are built with `VITE_API_BASE_URL=/`, so axios calls the same-origin path `/api/v1/...`. nginx proxies `/api/` to `api-gateway:8080`, and the gateway routes by path prefix to the services through Eureka |
@@ -676,7 +676,8 @@ sequenceDiagram
 | `preview` | `vite preview` | Serves `dist/` on Vite's default port 4173. `preview.proxy` defaults to `server.proxy`, so `/api` is proxied as in dev |
 | `test` | `vitest` | Watch mode locally. CI runs `npm test -- --run` |
 | `test:ui` | `vitest --ui` | Vitest browser UI (`@vitest/ui` is installed) |
-| `test:coverage` | `vitest run --coverage` | Fails: no coverage provider (`@vitest/coverage-v8`) is installed |
+| `test:coverage` | `vitest run --coverage` | Unit tests with `@vitest/coverage-v8`, over `src/**` except the tests, mocks, `main.tsx` and type declarations. Writes text, HTML and `json-summary` reports |
+| `test:pact` | `vitest run --config vitest.pact.config.ts` | The pact-js consumer tests (Node environment, one fork). Writes `pacts/ecommerce-frontend-<provider>.json`. Excluded from `npm test` |
 | `e2e` | `playwright test` | Playwright suite against `E2E_BASE_URL` (default `http://localhost:3000`); needs a running stack |
 | `e2e:install` | `playwright install --with-deps chromium` | Downloads Chromium and its OS dependencies, once per machine |
 | `e2e:report` | `playwright show-report reports/html` | Opens the last e2e HTML report |
@@ -754,35 +755,48 @@ Other k8s details:
 
 ## Testing
 
-`npm test` runs Vitest with `globals`, the `jsdom` environment and `src/test/setup.ts`.
+`npm test` runs Vitest with `globals`, the `jsdom` environment and `src/test/setup.ts`: 391 tests in 37 files under `src/test/`, at about 99% of lines, 93% of functions and 92.6% of branches (`npm run test:coverage`). The pact tests in `src/test/pact/` are excluded and run with `npm run test:pact`.
 
-| File | Tests | What it covers |
-|---|---|---|
-| `src/test/api/authApi.test.ts` | 4 | `authApi.login` success and rejection on 401. `register` success and rejection on 409 |
-| `src/test/api/productsApi.test.ts` | 5 | `getProducts` (a page and an empty page), `getProductById` (found and 404), `searchProducts` (empty result) |
-| `src/test/components/ProductCard.test.tsx` | 7 | Name, price and brand rendering, the Add to Cart callback, the disabled button for OUT_OF_STOCK, the "Adding..." state, the review count |
-| `src/test/components/ProtectedRoute.test.tsx` | 5 | `ProtectedRoute` redirect and render. `AdminRoute` redirect for a customer and for an anonymous user, render for an admin |
-| `src/test/pages/LoginPage.test.tsx` | 4 | Fields render, zod "required" messages, a successful submit shows no alert, the link to register |
-| `src/test/pages/TrackingPage.test.tsx` | 4 | The form renders, the URL-parameter variant renders, a lookup shows the tracking number, the "required" message |
-| `src/test/store/authStore.test.ts` | 5 | Initial state, `login`, `logout` (also clears `cartOrderId`), `setCartOrderId`, `clearCart` |
-| `src/test/utils/formatters.test.ts` | 8 | USD currency, dates, `formatOrderStatus`, `truncateText` |
+| Folder | What it covers |
+|---|---|
+| `api/` | Every API module against MSW (auth, products, categories, orders, payments, reviews, shipments), and `axiosInterceptors` (token injection, the expiry check, the 401 redirect, error-message mapping, with `window.location` replaced because jsdom cannot navigate) |
+| `components/` | `ProductCard`, the product, review, order, layout and common components, `ProtectedRoute` and `AdminRoute` |
+| `hooks/` | `useAuth`, `useCart`, `useOrders`, `usePayments`, `useProducts`, `useReviews`, `useShipments`: queries, mutations, cache invalidation and error paths |
+| `pages/` | Login, register, home and routing, product list and detail, cart, checkout, orders, profile, tracking and the admin pages |
+| `store/`, `utils/` | `authStore`; the formatters and the zod validators |
 
 Infrastructure:
 
 - **`setup.ts`** loads the jest-dom matchers and starts the MSW node server with `onUnhandledRequest: 'warn'`, resetting the handlers after each test and closing the server at the end.
-- **`mocks/handlers.ts`** defines relative-path handlers for login, register, `/users/me`, the products list, a product by id, product search, categories, order creation, orders by customer, an order by id, reviews by product and their summary, payments by customer and shipment lookup by tracking number.
-- **`utils/renderWithProviders.tsx`** wraps a component in a fresh `QueryClient` (no retries, `gcTime` 0, `staleTime` 0), the MUI theme, `SnackbarProvider` and a `MemoryRouter`, and seeds the auth store as anonymous, customer or admin.
+- **`mocks/handlers.ts`** defines relative-path handlers for the endpoints the pages use. Tests override them per case with `server.use()` to drive error and edge paths.
+- **`utils/renderWithProviders.tsx`** wraps a component in a fresh `QueryClient` (no retries, `gcTime` 0, `staleTime` 0), the MUI theme, `SnackbarProvider` and a `MemoryRouter`, and seeds the auth store as anonymous, customer or admin. `createHookWrapper.tsx` does the same for hooks, `fixtures.ts` holds the shared DTOs and `LocationDisplay.tsx` exposes the router location for redirect assertions.
+
+**Known bugs are `it.fails` tests.** A test that finds a defect asserts the correct behaviour and is wrapped in `it.fails`, so the suite stays green while the bug exists, and turns **red when the bug is fixed**. Switch it to `it` in the fix. Eight exist: M1 (`TrackingPage.test.tsx`), M4 and A-6 (`CheckoutPage.test.tsx`), M8 (`axiosInterceptors.test.ts`), and the new [A-7 to A-10](findings.md#frontend-and-api) (`ProductComponents`, `ProductListPage`, `AdminPages` and `validators` tests). See [Findings](findings.md#bugs-pinned-by-tests).
 
 **The MSW relative-URL caveat** (platform README): the handlers use relative URLs (`BASE_URL = ''`) so that they track `VITE_API_BASE_URL=/`, and MSW resolves them against the jsdom origin. If the app is switched back to an absolute base URL, the mocks must move with it, or every request falls through unmatched. For the same reason, `vite.config.ts` pins `test.env.VITE_API_BASE_URL = '/'`. `.env` is gitignored and absent on a CI checkout, and without the pin the constant would fall back to the absolute `http://localhost:8080`, the relative handlers would stop matching, and the suite would pass locally while failing in CI.
 
+### Consumer contract tests (pact-js)
+
+`npm run test:pact` runs `@pact-foundation/pact` 17.1.4 (`PactV4`, specification V4) in a Node environment, with one fork and no file parallelism, because every file drives the same shared axios instance and the native mock server writes the pact files. The tests drive the **real** `src/api/*` modules and the real axios interceptors against a Pact mock server, and record exactly what the SPA sends, including `Authorization: Bearer <jwt>`. Each run rewrites `pacts/ecommerce-frontend-<provider>.json` (committed):
+
+| Provider | Interactions |
+|---|---|
+| user-service | 6 |
+| product-service | 11 |
+| order-service | 7 |
+| payment-service | 4 |
+| shipping-service | 4 |
+| review-service | 8 |
+
+The browser talks to the gateway, never to a service. A provider therefore verifies these pacts with gateway emulation: its test decodes the bearer token and sets `X-Username`, `X-User-Id` and `X-User-Role`, as the gateway's filter does. user, product and review extended their existing provider test. order and payment verify from `src/test/resources/pacts-frontend/` in `FrontendHttpProviderPactTest`, because their `pacts/` folder holds message pacts only. shipping uses `FrontendHttpProviderPactTest` with `@Consumer` filters in `pacts/`. `ecommerce-platform/sync-pacts.sh` (and the `.ps1`) run the frontend consumer and copy the files into each provider, into `pacts-frontend/` when that folder exists. See [Architecture: testing strategy](architecture.md#testing-strategy) and the repository README's "Contract tests (Pact)".
+
 Gaps:
 
-- No unit tests for the cart, checkout, order list and detail, product list and detail, the admin pages, the review components, or any hook. The Playwright suite covers those flows in a browser, but only against a running stack.
-- The axios interceptors (token injection, the expiry check, the 401 redirect, error-message mapping) are untested. jsdom does not implement navigation, so the `window.location.href` redirect cannot be observed as written.
-- The mocks are hand-written and not tied to the backend: there are no Pact consumer tests for the frontend, unlike the service-to-service contracts. They have already drifted (M12).
+- The MSW mocks are still hand-written, so the Vitest suite alone can pass while the real contract differs (M12). The pacts now pin what the SPA sends and which response fields it reads, and the providers verify them, which covers that drift for the six services.
 - Unmocked calls only warn. For example, the history request that TrackingPage makes in its tests (`/api/v1/shipments/1/history`) has no handler and goes to the real network.
-- Some assertions are weak. The LoginPage submit test only checks that no alert is visible, and the TrackingPage URL-parameter test only checks that the input exists, not that a lookup ran.
-- `npm run test:coverage` cannot run (no coverage provider installed).
+- Some older assertions are weak. The LoginPage submit test only checks that no alert is visible, and the TrackingPage URL-parameter test only checks that the input exists, not that a lookup ran.
+- Neither CircleCI pipeline runs `test:pact`. The providers verify the committed copies in their own `mvn verify`, so regenerate with `sync-pacts.sh` after changing an API call.
+- The remaining uncovered lines are mostly `main.tsx` (excluded) and defensive branches.
 
 ### End-to-end tests (Playwright)
 
@@ -815,7 +829,8 @@ Gaps:
 | nginx proxies `/actuator/` to the gateway on the public port | `nginx.conf`, the k8s ConfigMap | Exposes the gateway's health details, metrics, Prometheus output and the writable `serviceregistry` endpoint (the one the k8s preStop hook uses to set OUT_OF_SERVICE) to anyone who can reach port 3000 | Low |
 | Caching headers: `index.html` has no `Cache-Control`, and the unhashed `favicon.svg` is cached for a year as immutable | `nginx.conf` | A browser may keep an old `index.html` after a deploy. Favicon changes are not picked up | Low |
 | The k8s ConfigMap is mounted with `subPath`, and the pod's checksum annotation is the fixed string `"v1"` | `ecommerce-platform/k8s/50-frontend.yaml` | ConfigMap edits do not reach nginx until the annotation is bumped or the pod restarts | Low |
-| Test tooling: `test:coverage` cannot run, the MSW mocks have drifted (M12), unhandled requests only warn, and there are no contract tests | `package.json`, `src/test/mocks/handlers.ts`, `src/test/setup.ts` | The suite can pass while the real contract differs | Low |
+| Test tooling: the MSW mocks have drifted (M12), unhandled requests only warn, and CI does not run `test:pact` | `src/test/mocks/handlers.ts`, `src/test/setup.ts` | The Vitest suite can pass while the real contract differs. The pacts catch this only when `sync-pacts.sh` is run | Low |
+| Smaller UI defects found by the unit tests ([findings](findings.md) A-7 to A-11): one shared `isAdding` flag puts "Adding..." on every product card, `ProductForm` is declared inside `AdminProductsPage`'s render and loses typed input after a failed submit, `paymentSchema` accepts non-digit card numbers, and the admin reviews "All Reviews (n)" counts pending reviews that the list omits | `src/hooks/useCart.ts`, `src/pages/admin/AdminProductsPage.tsx`, `src/utils/validators.ts`, `src/pages/admin/AdminReviewsPage.tsx` | Confusing feedback and lost input in forms. Each is an `it.fails` test, except the count | Low |
 | Documentation drift. README: builder `node:20-alpine` (the Dockerfile uses `node:24-alpine`), login and register "Guest only" (not enforced), `/admin/orders` "View and update all orders" (own orders only), "no CORS needed in dev" (true only with `VITE_API_BASE_URL=/`). `.env.example` claims the variable sets the proxy target | `README.md`, `.env.example` | Misleads new developers | Low |
 | `@mui/lab` resolves to the dev nightly `6.0.0-dev.20240529-082515-213b5e33ab`, because a dev pre-release satisfies the range `^6.0.0-beta.25` | `package.json`, `package-lock.json` | An unreleased build ships in the production bundle (Timeline components) | Low |
 | Dead code: 7 uncalled API functions, 5 unused hooks (including the `usePendingReviews` stub), the `ROUTES` and `PAYMENT_METHODS` constants, the `updateProductSchema`, `updateReviewSchema` and `stockUpdateSchema` schemas, `clearCart`, the `CartState` type, several formatters, a `useUpdateOrderStatus` instance in OrderDetailPage that is never called, and `createShipment`'s ignored `estimatedDelivery` (M11) | `src/api/`, `src/hooks/`, `src/constants/index.ts`, `src/utils/`, `src/types/index.ts` | Maintenance noise and an API surface that suggests features the UI does not have | Low |

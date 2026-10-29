@@ -212,7 +212,7 @@ erDiagram
 
 Where the entities and the migrations differ:
 
-- The foreign keys exist only in the migrations. The entities hold `categoryId` and `parentCategoryId` as plain `Long`s, so under the `test` profile (H2, `ddl-auto: create-drop`, Flyway off) the schema is generated from the entities and has no foreign keys and none of the migration defaults. Tests therefore cannot see the foreign-key failures described in rules 2 and 9.
+- The foreign keys exist only in the migrations. The entities hold `categoryId` and `parentCategoryId` as plain `Long`s, so under the `test` profile (H2, `ddl-auto: create-drop`, Flyway off) the schema is generated from the entities and has no foreign keys and none of the migration defaults. The H2-based tests therefore cannot see the foreign-key failures described in rules 2 and 9; `ProductRepositoryIT` and `ProductApiIT` run the migrations on Postgres and do.
 - `updated_at DEFAULT CURRENT_TIMESTAMP` never applies: Hibernate always lists the column in its `INSERT` and writes `null` until the first update. `created_at` likewise always comes from the JVM (`LocalDateTime.now()` when the entity is built), not from the column default.
 - There are no `CHECK` constraints. `stock_quantity >= 0` and `price > 0` are enforced only by the application (`@Min` and `@DecimalMin` on create, the check in `updateStock()`).
 - There is no version column for optimistic locking (see rule 5).
@@ -273,11 +273,20 @@ Runtime: compose `mem_limit: 768m`, healthcheck `wget http://localhost:8082/actu
 
 | Class | Kind | What it covers |
 |---|---|---|
-| `service/ProductServiceTest` | Mockito unit test | Create (success, duplicate SKU), get by id (found, not found), stock decrement, insufficient stock, stock to zero sets `OUT_OF_STOCK`, soft delete sets `INACTIVE`. |
-| `controller/ProductControllerTest` | `@WebMvcTest` with a mocked service | 201 on create, 200 and 404 on get by id, 400 on insufficient stock, 400 on invalid create input. |
-| `contract/ProductServiceProviderPactTest` | Pact provider verification | Starts the whole application on a random port with the `test` profile (H2) and replays every interaction in `src/test/resources/pacts/`. |
+| `service/ProductServiceTest` | Mockito unit | products and categories: create (success, duplicate SKU), get, update, search, paging, stock changes (decrement, insufficient stock, to zero sets `OUT_OF_STOCK`), soft delete sets `INACTIVE` |
+| `controller/ProductControllerTest`, `controller/CategoryControllerTest` | `@WebMvcTest` with a mocked service | status codes, validation and error bodies of both controllers |
+| `exception/GlobalExceptionHandlerTest`, `filter/CorrelationIdFilterTest` | unit | exception mappings; the correlation ID |
+| `contract/ProductServiceProviderPactTest` | Pact provider | starts the whole application on a random port with the `test` profile (H2) and replays every pact in `src/test/resources/pacts/`: order, catalog and review (Feign) and the frontend (11 interactions) |
+| `integration/ProductRepositoryIT` | Testcontainers `postgres:16-alpine` | the real Flyway migrations; case-insensitive search that treats `LIKE` wildcards literally; paging; unique SKU and category name; **foreign keys** (unknown category, unknown parent, `ON DELETE SET NULL`); `numeric(19,4)` prices; defaults |
+| `integration/ProductApiIT` | full app on a random port, Postgres | category, product, search, page and stock flow; error responses; 40 concurrent stock decrements; sequential decrements stop exactly at zero |
 
-Not covered: `updateProduct()`, categories, search, paging and sorting, get by SKU, the category filter, concurrent stock updates, and the Flyway schema (tests run on an H2 schema generated from the entities).
+99 unit, slice and pact tests and 20 integration tests.
+
+**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
+
+- `ProductApiIT.concurrentDecrements_neverOversell`: 40 concurrent `-1` updates on stock 10 all succeed (I-5).
+- `ProductServiceTest.updateStock_drainingInactiveProduct_staysInactive`: a soft-deleted product becomes `OUT_OF_STOCK` at 0, then `ACTIVE` on restock (I-13).
+- `ProductApiIT.updateProduct_unknownStatus_is400`, `updateProduct_unknownCategory_is404`, `createCategory_unknownParent_is404`: an unknown status, `categoryId` or `parentCategoryId` returns 500 (A-4). The H2 profile has no foreign keys, so only Postgres shows the last two.
 
 ### Pact provider states and pinned interactions
 
@@ -301,6 +310,8 @@ The pact files are copied from the consumer repositories by `ecommerce-platform/
 | catalog-service | a request for product 999 | `GET /api/v1/products/999` | 404; `status`, `error`, `message` |
 | review-service | a request for product 1 | `GET /api/v1/products/1` | 200; `id` integer |
 | review-service | a request for product 999 | `GET /api/v1/products/999` | 404; `status`, `error`, `message` |
+
+The frontend's pact (`ecommerce-frontend-product-service.json`, 11 interactions) adds the paged list, product by id and 404, search, the category filter, the category list, and the admin create, update, stock, delete and create-category calls. The test emulates the gateway: it decodes the bearer token and sets `X-Username`, `X-User-Id` and `X-User-Role`.
 
 Every matcher checks a JSON type (`type`, `integer` or `number`), so the values in the pact are examples; a response passes as long as the listed fields exist with the right types. Extra fields are allowed, which also means the pacts do not prove that the consumers tolerate the extra fields product-service sends (they do, because Jackson 3 ignores unknown properties).
 

@@ -289,7 +289,7 @@ Where the entities and the migrations differ:
 - The database defaults for `status`, `created_at` and `updated_at` are never used, because the entities always supply values from Java.
 - There is no trigger on `updated_at`. Only `updateReview()` and `moderateReview()` change it.
 - `idx_reviews_product_id` and `idx_review_votes_review_id` duplicate the leading column of the two unique constraints' own indexes.
-- The tests run on H2 with `ddl-auto: create-drop` and Flyway disabled (`src/test/resources/application-test.yaml`), so neither the migrations nor the `CHECK` constraint are exercised by any test.
+- The unit and pact tests run on H2 with `ddl-auto: create-drop` and Flyway disabled (`src/test/resources/application-test.yaml`), which has neither the migrations nor the `CHECK` constraint. `ReviewRepositoryIT` runs both on Postgres.
 
 ## Security and identity
 
@@ -374,11 +374,24 @@ and the `java-env` ConfigMap.
 
 | Test | Kind | Covers |
 |---|---|---|
-| `service/ReviewServiceTest` | Mockito unit, 6 tests | create succeeds; duplicate throws `DuplicateReviewException`; delete by a non-owner non-admin throws `UnauthorizedReviewAccessException`; delete by `ADMIN` succeeds; unknown ID throws `ReviewNotFoundException`; summary of a product without reviews is all zeros |
-| `config/ConnectionFailureRetryerTest` | unit, 3 tests | connection failures are retried, then propagated after the last attempt; a read timeout is never retried; `clone()` starts a fresh attempt counter |
-| `config/FeignHttpMessageConvertersRaceTest` | concurrency, 1 test | 200 rounds of 48 threads hitting a cold converters instance never see an empty list |
+| `service/ReviewServiceTest` | Mockito unit | create, duplicate, update ownership, delete (owner, non-owner, `ADMIN`), unknown ID, votes, moderation, the summary with and without reviews |
+| `controller/ReviewControllerTest` | `@WebMvcTest` | the nine endpoints: identity headers, status codes, validation |
+| `client/ProductServiceClientFallbackTest` | unit | the fallback class (inactive, see Outbound calls) |
+| `config/ConnectionFailureRetryerTest`, `config/FeignHttpMessageConvertersRaceTest` | unit, concurrency | connection failures are retried, then propagated; a read timeout is never retried; 200 rounds of 48 threads never see an empty converter list |
+| `exception/GlobalExceptionHandlerTest`, `filter/CorrelationIdFilterTest` | unit | exception mappings; the correlation ID |
 | `contract/ProductServiceConsumerPactTest` | Pact **consumer** of product-service, 2 interactions | see below |
-| `contract/ReviewServiceProviderPactTest` | Pact **provider** for api-gateway, 2 interactions | see below |
+| `contract/ReviewServiceProviderPactTest` | Pact **provider** for api-gateway (2 interactions) and the frontend (8) | see below |
+| `integration/ReviewRepositoryIT` | Testcontainers `postgres:16-alpine` | the real migrations; one review per customer and product; the rating `CHECK` (1 to 5); one vote per customer and review; cascade delete of votes; finder and aggregate queries |
+| `integration/ReviewApiIT` | full app, Postgres, WireMock for product-service | create, duplicate, moderate, vote, summary; ownership from the gateway headers; deleting a review removes its votes; product-service erroring or dropping connections rejects the review and stores nothing |
+| `integration/ProductServiceDownIT` | full app, Postgres | with product-service unreachable, create is rejected after the connect retries and nothing is stored, while reads and votes keep working |
+
+90 unit, slice and pact tests and 22 integration tests.
+
+**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
+
+- `ReviewControllerTest.moderate_byNonAdmin_returns403`: `PATCH /reviews/{id}/moderate` never checks the role, so any customer approves their own review (S-1).
+- `ReviewApiIT.unknownProduct_isAClientError`: a review for a product that product-service answers 404 for returns 500, because `ReviewService` wraps it in a bare `RuntimeException` (R-4, A-4).
+- `ReviewApiIT.productClient_whenProductServiceFails_goesThroughTheFallback`: `spring.cloud.openfeign.circuitbreaker.enabled` is never set, so the fallback and the resilience4j configuration are dead (R-4).
 
 **Consumer pact with product-service** (`ProductServiceConsumerPactTest`). The
 test builds the real Feign client (the production `FeignConfig`, Boot's Jackson
@@ -405,10 +418,8 @@ which the gateway's `ReviewServiceConsumerPactTest` generates.
 State names are part of the contract and must stay verbatim. The committed pact
 copies matched the freshly generated ones at the time of writing.
 
-Not covered by any test: update ownership, votes, moderation, the summary with
-real data, validation error bodies, the exception handler, and the Flyway
-migrations. CI (`.circleci/config.yml`) runs `mvn -B -ntp verify`, so the Pact
-tests run on every build. The end-to-end `smoke-test.sh` does not touch reviews.
+The provider test also replays the frontend's pact (`ecommerce-frontend-review-service.json`, 8 interactions: approved reviews and the rating summary for product 1, create, edit and delete a review, a helpful vote, and the admin list and approve calls), with a gateway emulation that sets the identity headers from the bearer token. Apache HttpClient 5 re-sends an idempotent `GET` once on a reset connection, which `ReviewApiIT` observes as two requests at the wire (R-6). CI (`.circleci/config.yml`) runs `mvn -B -ntp verify`, so the Pact
+and integration tests run on every build. The end-to-end `smoke-test.sh` does not touch reviews.
 
 ## Code map
 

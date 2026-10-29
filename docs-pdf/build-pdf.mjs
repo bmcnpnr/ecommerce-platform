@@ -51,7 +51,7 @@ const PARTS = [
       'payment-service.md', 'shipping-service.md', 'review-service.md'],
   },
   { title: 'Events, data and security', entries: ['events.md', 'data-model.md', 'security.md'] },
-  { title: 'Operations', entries: ['observability.md', 'runbook.md'] },
+  { title: 'Operations', entries: ['observability.md', 'runbook.md', 'testing.md'] },
   { title: 'Decisions and findings', entries: ['findings.md', 'adr/'], order: ['README.md'] },
 ];
 

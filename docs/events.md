@@ -214,7 +214,11 @@ Producer-side failure modes, the same in all three producers:
 
 Every event type is pinned by a Pact message pact, written by the consumer and
 verified by the producer on every build. Each pact covers every field type and
-the record key. See [ADR-008](adr/ADR-008-pact-without-broker.md).
+the record key. See [ADR-008](adr/ADR-008-pact-without-broker.md). The pacts check the
+serialized shape only. The Testcontainers `*IT` classes in each producer and consumer repository complement them with real
+Kafka round trips: the order, payment and shipping ITs publish to and consume from a `cp-kafka:7.6.0` broker,
+and notification-service's `NotificationEventsIT` feeds all seven topics. `PoisonPillIT` there (two disabled tests) pins the
+missing dead-letter handling, [R-1](findings.md#messaging-reliability).
 
 | Pact | Topics |
 |---|---|

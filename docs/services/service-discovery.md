@@ -116,7 +116,7 @@ dashboard at `:8761`, which lists every registered instance and its status.
 
 ## Testing and CI
 
-There are no tests. CI is the GitHub Actions workflow
+There are no unit tests. `integration/EurekaServerIT` (7 tests, no Docker) boots the registry on a random port and drives it over HTTP: actuator health is `UP`, `/eureka/apps` answers in JSON and in XML for legacy clients, a registered instance shows up immediately, heartbeat, status override and cancel work, a heartbeat for an unknown instance is a 404 (so a client re-registers), and the dashboard is served. It runs in `mvn verify`. CI is the GitHub Actions workflow
 `.github/workflows/ci-cd.yml` (verify, then validate-image, then
 publish-image to Docker Hub). It replaced the repository's CircleCI pipeline;
 see [Architecture: CI/CD](../architecture.md#build-and-delivery).

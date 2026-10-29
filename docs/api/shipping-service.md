@@ -240,7 +240,7 @@ Any status may be set from any non-terminal status, including the current one or
 - `200 OK` with the updated [`ShipmentDTO`](#shipmentdto).
 - `400` with `Cannot update status of a DELIVERED shipment` (or `RETURNED`), or when the body is malformed.
 - `404` with `Shipment not found: {id}`.
-- `500` when `status` is missing or blank, `status` is not an enum name, or `location` or `description` exceeds the column length. In the last case the commit fails after `shipment.updated` has already been sent.
+- `500` when `status` is missing or blank, `status` is not an enum name, or `location` or `description` exceeds the column length. In the last case nothing is published: the history row's INSERT runs inside `save()` (IDENTITY id), before `shipment.updated` is sent, so the request rolls back first (pinned by `ShipmentLifecycleIT`). Publishing before commit is still a risk for genuine commit-time failures.
 
 **Side effects:**
 

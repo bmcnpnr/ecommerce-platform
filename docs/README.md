@@ -52,6 +52,7 @@ Kubernetes.
 | Document | Contents |
 |---|---|
 | [Onboarding](onboarding.md) | Prerequisites, first run, the everyday dev loop, debugging, tests, conventions |
+| [Testing guide](testing.md) | Every test layer: how to run it, where it lives, how to write one (base classes, Testcontainers, WireMock, pacts with gateway emulation), the BUG-marker convention, troubleshooting |
 | [Runbook](runbook.md) | Symptom → cause → fix, Kafka and database procedures, secret rotation, incident history |
 | [Platform README](../README.md) | Build scripts, ports, databases, resource limits, test layers |
 | [Kubernetes](../k8s/README.md) | The k8s deployment and everything that differs from compose |

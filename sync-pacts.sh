@@ -33,7 +33,8 @@ for arg in "$@"; do
     esac
 done
 
-# Repositories that own consumer pact tests (*ConsumerPactTest).
+# Maven repositories that own consumer pact tests (*ConsumerPactTest).
+# ecommerce-frontend (pact-js, `npm run test:pact`) is handled separately below.
 CONSUMERS=(
     ecommerce-api-gateway
     ecommerce-order-service
@@ -65,6 +66,36 @@ echo "============================================"
 echo "   Ecommerce Platform - Sync Pact contracts "
 echo "============================================"
 
+# copy_pacts <pact dir> <consumer name>: copies each <consumer>-<provider>.json into
+# ecommerce-<provider>/src/test/resources/pacts/ when it changed.
+copy_pacts() {
+    local dir="$1" consumer="$2" pact base provider dest
+    shopt -s nullglob
+    for pact in "$dir"/*.json; do
+        base="$(basename "$pact" .json)"
+        provider="${base#"$consumer"-}"
+        dest="$ROOT/ecommerce-$provider/src/test/resources/pacts"
+        # Providers whose pacts/ holds only message pacts verify the frontend's
+        # HTTP pact from a folder of its own (see their FrontendHttpProviderPactTest).
+        if [[ $consumer == ecommerce-frontend && -d "$dest-frontend" ]]; then
+            dest="$dest-frontend"
+        fi
+        if [[ ! -d "$ROOT/ecommerce-$provider" ]]; then
+            echo -e "\e[31mno repository for provider '$provider' ($pact)\e[0m"
+            FAILED+=("$base (no provider repo)")
+            continue
+        fi
+        mkdir -p "$dest"
+        if [[ -f "$dest/$base.json" ]] && cmp -s "$pact" "$dest/$base.json"; then
+            echo "  unchanged  $base.json"
+        else
+            cp "$pact" "$dest/$base.json"
+            echo -e "  \e[33mupdated\e[0m    $base.json -> ${dest#"$ROOT/"}/"
+        fi
+    done
+    shopt -u nullglob
+}
+
 if $GENERATE; then
     for repo in "${CONSUMERS[@]}"; do
         consumer="${repo#ecommerce-}"          # spring.application.name == repo name minus prefix
@@ -74,26 +105,18 @@ if $GENERATE; then
             FAILED+=("$repo (consumer)")
             continue
         fi
-        shopt -s nullglob
-        for pact in "$ROOT/$repo"/target/pacts/*.json; do
-            base="$(basename "$pact" .json)"
-            provider="${base#"$consumer"-}"
-            dest="$ROOT/ecommerce-$provider/src/test/resources/pacts"
-            if [[ ! -d "$ROOT/ecommerce-$provider" ]]; then
-                echo -e "\e[31mno repository for provider '$provider' ($pact)\e[0m"
-                FAILED+=("$base (no provider repo)")
-                continue
-            fi
-            mkdir -p "$dest"
-            if [[ -f "$dest/$base.json" ]] && cmp -s "$pact" "$dest/$base.json"; then
-                echo "  unchanged  $base.json"
-            else
-                cp "$pact" "$dest/$base.json"
-                echo -e "  \e[33mupdated\e[0m    $base.json -> ecommerce-$provider/src/test/resources/pacts/"
-            fi
-        done
-        shopt -u nullglob
+        copy_pacts "$ROOT/$repo/target/pacts" "$consumer"
     done
+
+    # The React frontend is the one non-Maven consumer: pact-js writes
+    # pacts/ecommerce-frontend-<provider>.json at its repo root.
+    echo "---------- generate: ecommerce-frontend ----------"
+    if (cd "$ROOT/ecommerce-frontend" && npm run --silent test:pact); then
+        copy_pacts "$ROOT/ecommerce-frontend/pacts" ecommerce-frontend
+    else
+        echo -e "\e[31mconsumer tests failed in ecommerce-frontend\e[0m"
+        FAILED+=("ecommerce-frontend (consumer)")
+    fi
 fi
 
 if $VERIFY; then

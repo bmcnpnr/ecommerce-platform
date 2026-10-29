@@ -190,7 +190,7 @@ Where the entity and the migration disagree, or the defaults never apply:
 - The `role`, `status` and `created_at` defaults never apply either: the entity always supplies them (`@Builder.Default`, plus an explicit `createdAt(LocalDateTime.now())` in `register()`).
 - Timestamps are `TIMESTAMP` without time zone, written from `LocalDateTime.now()` in the JVM's default time zone. Nothing in the Dockerfile, the compose file or the Kubernetes manifests sets one.
 - `spring.flyway.baseline-on-migrate: true` with the default baseline version 1: against a non-empty database that has no Flyway history table, Flyway records a baseline at version 1 and does not run V1.
-- Tests never run the migration. The `test` profile uses H2 with `ddl-auto: create-drop` and `spring.flyway.enabled: false`, so the schema in tests comes from the entity.
+- The unit and pact tests never run the migration: the `test` profile uses H2 with `ddl-auto: create-drop` and `spring.flyway.enabled: false`, so the schema there comes from the entity. `UserRepositoryIT` and `UserApiIT` run it on Postgres.
 
 ## Security and identity
 
@@ -327,11 +327,23 @@ Not used by this service: Kafka, Feign, Resilience4j, Spring Cloud LoadBalancer.
 
 | Test class | Kind | Covers |
 |---|---|---|
-| `src/test/.../service/UserServiceTest` | Mockito unit, 9 tests | register success, duplicate username, duplicate email; login success, wrong password, unknown user; `getUserById` found and not found; `deleteUser` sets `INACTIVE` |
-| `src/test/.../controller/UserControllerTest` | `@WebMvcTest` with a mocked `UserService`, 7 tests | register 201, duplicate 409, invalid input 400; login 200 with token, bad credentials 401; `GET /{id}` 200 and 404 |
-| `src/test/.../contract/UserServiceProviderPactTest` | Pact provider, 2 interactions | see below |
+| `service/UserServiceTest` | Mockito unit | register (success, duplicate username, duplicate email); login (success, wrong password, unknown user, inactive and suspended accounts); get by id; update; soft delete sets `INACTIVE` |
+| `service/JwtServiceTest` | unit | the token user-service issues: claims, expiry and signature |
+| `controller/UserControllerTest` | `@WebMvcTest` with a mocked `UserService` | every endpoint's status codes and validation errors |
+| `config/DataInitializerTest` | unit | the `admin` seed is created once and skipped when it already exists |
+| `exception/GlobalExceptionHandlerTest`, `filter/CorrelationIdFilterTest` | unit | each exception-to-status mapping including the client-error and catch-all handlers; the correlation ID in the MDC and the response header |
+| `contract/UserServiceProviderPactTest` | Pact provider | the gateway's pact (2 interactions) and the frontend's pact (6), see below |
+| `integration/UserRepositoryIT` | Testcontainers `postgres:16-alpine` | the real Flyway migration; defaults; enums stored as names; unique username and email (case-sensitive); column lengths |
+| `integration/UserApiIT` | full app on a random port, Postgres | register, login, then `/me` resolved from the issued token; duplicates 409; invalid payload 400 with field errors; seeded admin logs in; a soft-deleted user cannot log in; update; the password never appears in a response; the correlation ID is echoed; actuator health |
 
-All 18 passed in the last local build (`target/surefire-reports`). Not covered: `PUT /{id}`, `DELETE /{id}` through the controller, `/internal/{username}`, login of inactive or suspended accounts, `DataInitializer`, the client-error (400/405) and catch-all (500) handlers of `GlobalExceptionHandler`, and the Flyway migration (tests use H2 with `create-drop`). The controller test's mock `AuthResponse` uses `expiresIn(3600000L)`, a millisecond value in a field that holds seconds; the assertions do not check it.
+73 unit, slice and pact tests (`mvn test`) and 21 integration tests (`mvn verify`, needs Docker).
+
+**Disabled tests that pin bugs** (remove `@Disabled` when fixed; see [Findings](../findings.md#bugs-pinned-by-tests)):
+
+- `UserApiIT.customerCannotDeleteAnotherUsersAccount`: `DELETE` and `PUT /api/v1/users/{id}` have no ownership or `ADMIN` check (S-1).
+- `UserServiceTest.login_suspendedAccountWithWrongPassword_givesGenericError`: login checks the status before the password and so reveals `SUSPENDED` and `INACTIVE` accounts (S-11).
+
+The controller test's mock `AuthResponse` uses `expiresIn(3600000L)`, a millisecond value in a field that holds seconds; the assertions do not check it.
 
 ### Pact: user-service as provider for api-gateway
 
@@ -342,7 +354,7 @@ The gateway's consumer tests (`UserServiceConsumerPactTest`, `UserServiceJwtCons
 | `a profile request forwarded for the authenticated user alice` | HTTP | `GET /api/v1/users/me` with `X-Username: alice`, `X-User-Id: 42`, `X-User-Role: CUSTOMER` returns 200 `application/json` with `id` (integer), `username` equal to `"alice"` (proves the profile was resolved from `X-Username`), and `email`, `role`, `status` (strings). Replayed over HTTP through the real filter chain, controller, service and JPA. |
 | `a JWT issued to alice at login` | Message | The token from a real `UserService.login(alice, alice-password-1)`, decoded by the test into `{"header": <JOSE header>, "payload": <claims>}`. Pins `header.alg` matching `HS(256\|384\|512)`, `payload.sub` string, `payload.userId` integer, `payload.role` string, `payload.iat` and `payload.exp` integers. |
 
-The numeric `userId` matters: the gateway once read the claim as a `String`, JJWT threw `RequiredTypeException`, and every authenticated request got 401 (comment in the gateway's `JwtAuthenticationFilter`). Not pinned by any pact: the register and login request and response bodies (the frontend has no pact), `/{id}` and `/internal/{username}`. Run the Pact test alone with `mvn test -Dtest='*PactTest'`.
+The numeric `userId` matters: the gateway once read the claim as a `String`, JJWT threw `RequiredTypeException`, and every authenticated request got 401 (comment in the gateway's `JwtAuthenticationFilter`). The same provider test also replays the frontend's pact, `ecommerce-frontend-user-service.json` (6 interactions: login with the right and a wrong password, register, a duplicate registration, `/me`, update), through a gateway emulation that decodes the bearer token into `X-Username`, `X-User-Id` and `X-User-Role`. Not pinned by any pact: `/{id}` and `/internal/{username}`. Run the Pact test alone with `mvn test -Dtest='*PactTest'`.
 
 ## Code map
 

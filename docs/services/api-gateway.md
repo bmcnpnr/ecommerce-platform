@@ -199,7 +199,21 @@ all seven service APIs (`springdoc.swagger-ui.urls`).
 
 ## Testing
 
-There are no unit tests. Three Pact **consumer** tests in `src/test/java/.../contract/`
+75 unit, slice and pact tests (`mvn test`) and 43 integration tests (`mvn verify`; no Docker needed).
+
+| Class | Kind | Covers |
+|---|---|---|
+| `filter/JwtAuthenticationFilterTest` | unit | the public-path rules; token validation (missing, malformed, expired, signed with another secret, tampered claims or signature, unsigned `alg: none`, every HMAC strength user-service may use); the identity headers set from the claims (`sub`, numeric `userId`, `role`) |
+| `config/CorsConfigTest` | unit | any origin; preflight for allowed methods answered at the gateway and for others rejected; exposed headers; same-origin requests untouched |
+| `integration/GatewayRoutingIT` | full gateway on a random port, one WireMock per route | every route reaches its service with the path unchanged, and `/api-docs` is rewritten to the service's spec; query string, body, status and body pass back; a downstream 5xx is not retried; protected routes answer 401 without a token, with an invalid, expired or foreign-issuer token, and never reach the service; public routes need no token, but a write on a public read route still does; a valid token delivers the identity headers, and spoofed headers are overwritten on authenticated routes; CORS preflight is answered at the gateway; actuator health |
+| `contract/*ConsumerPactTest` | Pact consumer | below |
+
+**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
+
+- `JwtAuthenticationFilterTest.spoofedIdentityHeaders_areStrippedOnPublicRequests` and `GatewayRoutingIT.spoofedIdentityHeaders_doNotReachServicesOnPublicRoutes`: on public paths the client's `X-Username`, `X-User-Id` and `X-User-Role` are forwarded untouched, and review-service trusts `X-User-Role` (S-9).
+- `JwtAuthenticationFilterTest.internalUserEndpoint_isNotPublicAtTheEdge`: `/api/v1/users/internal/**` is public, so anyone can fetch any user's profile by username (S-2).
+
+Three Pact **consumer** tests in `src/test/java/.../contract/`
 boot the real gateway (routes, JWT filter, Retry filter, LoadBalancer) on a
 random port. `lb://` routes point at Pact mock servers through Spring Cloud's
 simple discovery client, on fixed ports 18187 (review) and 18181 (user).

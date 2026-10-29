@@ -84,28 +84,47 @@ docker compose up -d
 
 ## Testing
 
-Four layers, fastest first. The first three need no running stack.
+Seven layers. The unit, integration, frontend and contract tests need no running stack; the smoke, browser and load tests do.
 
-**Unit / slice tests (Maven)** — H2 in place of Postgres
-for the JPA services, `spring-kafka-test` for the messaging paths. `service-discovery` has none;
-`api-gateway` and `notification-service` are covered by the contract tests below.
-`catalog-service` (MongoDB) additionally runs its repository against a real
-`mongo:8.0` via Testcontainers — those 15 tests are skipped, not failed, when no
-Docker daemon is reachable, so `./build-all.sh` still passes with Docker stopped.
+**Unit / slice tests (Maven, Surefire `*Test`)** — 716 tests. Mockito services,
+`@WebMvcTest` controllers, `GlobalExceptionHandler`, `CorrelationIdFilter`, Kafka
+producers and consumers, Feign fallbacks and retryers, and the gateway's
+`JwtAuthenticationFilter` and `CorsConfig`. H2 stands in for Postgres in the JPA slices and
+`spring-kafka-test` for the broker. Only `service-discovery` has no unit tests.
+`catalog-service` (MongoDB) also runs its repository against a real
+`mongo:8.0` via Testcontainers; those tests are skipped, not failed, when no
+Docker daemon is reachable.
+
+**Integration tests (Maven, Failsafe `*IT`)** — 195 tests in every Maven repository,
+package `<base>.integration`, run by `mvn verify`. Each boots the whole service
+(`@SpringBootTest(RANDOM_PORT)`) against the **production images** in Testcontainers 2.x:
+`postgres:16-alpine`, `confluentinc/cp-kafka:7.6.0` and `mongo:8.0`. Flyway really runs and
+Hibernate uses `ddl-auto: validate`, so schema drift fails the build; the H2 test profile has no
+foreign keys, for example. They drive HTTP to database to Kafka flows and stub Feign
+downstreams with WireMock 3.13.1. The gateway IT puts a WireMock behind every route, and
+`EurekaServerIT` boots the registry. Container-backed ITs need Docker and fail without it (only order-service's skip).
 
 ```bash
-./build-all.sh                 # runs tests; omit --skip-tests
-cd ../ecommerce-user-service && mvn -B test      # or one service at a time
+./build-all.sh                 # runs mvn verify (unit + integration + pact); omit --skip-tests
+cd ../ecommerce-user-service && mvn -B test      # unit tests only, the fast loop
+cd ../ecommerce-user-service && mvn -B verify    # plus the *IT classes (needs Docker)
 ```
 
-**Frontend tests (Vitest + MSW, 42 tests)** — component, store, API-client and page
-tests with the network mocked at the request layer.
+**Bugs found by tests stay in the suite**, disabled. A test that finds a defect asserts the
+correct behaviour and carries `@Disabled("BUG: ...")` (Java, Kotlin) or `it.fails` (frontend).
+Remove the marker in the change that fixes the bug. Catalogue: `docs/findings.md`, "Bugs pinned by tests".
+
+**Frontend tests (Vitest + MSW, 391 tests)** — component, hook, store, API-client
+(including the axios interceptors), page and validator tests with the network mocked at the
+request layer, at about 99% of lines, 93% of functions and 92.6% of branches
+(`@vitest/coverage-v8`). Known bugs are `it.fails` tests.
 
 ```bash
 cd ../ecommerce-frontend
 npm test              # watch mode
 npx vitest run        # once, for CI
 npm run test:coverage
+npm run test:pact       # frontend consumer pacts, see Contract tests below
 ```
 
 The MSW handlers use **relative** URLs so they track `VITE_API_BASE_URL=/`. If you
@@ -145,8 +164,23 @@ quotes out of a JSON body passed to `curl.exe`, so requests arrive malformed and
 the failures look like application bugs.
 
 
-**Contract tests (Pact, 24 interactions across 10 pacts)** — pin every
-service-to-service interface so a change on one side fails the *other* side's build
+**Load tests (k6)** — `load-tests/` drives the gateway with `browse.js` (anonymous reads) and
+`checkout.js` (create order, add item, confirm) in the `grafana/k6:0.54.0` container, so it
+needs only Docker and a running stack. Profiles `smoke` (default), `load` and `stress`, with
+error-rate, check and per-request p95 thresholds; each run writes `reports/<script>-<profile>-<timestamp>/`.
+Manual: no pipeline runs it, and `checkout.js` creates real data, so use a disposable stack.
+
+```bash
+cd load-tests
+./run-load.sh browse.js
+PROFILE=load ./run-load.sh checkout.js
+```
+
+See `load-tests/README.md`.
+
+**Contract tests (Pact, 24 service-to-service interactions across 10 pacts, plus 40 frontend
+interactions across 6)** — pin every
+service-to-service interface and every call the SPA makes so a change on one side fails the *other* side's build
 instead of production. Consumer-driven with [pact-jvm](https://docs.pact.io/implementation_guides/jvm)
 4.7.5: each consumer owns a `*ConsumerPactTest` that exercises its **real** client
 code (the production Feign client and `FeignConfig`, or the production Kafka listener
@@ -156,6 +190,16 @@ that replays those pacts against the **real** application (controllers + JPA on 
 over HTTP, or the real service/producer code serialized with the production Kafka
 `JacksonJsonSerializer`). Both run as ordinary Surefire tests, so `mvn verify`, CI and
 `./build-all.sh` already execute them — no broker and no running stack.
+
+**Frontend pacts.** The React SPA is a consumer too. `npm run test:pact` (pact-js
+`@pact-foundation/pact` 17.1.4) drives the real `src/api/*` modules and axios interceptors against a
+Pact mock server and writes `ecommerce-frontend/pacts/ecommerce-frontend-<provider>.json` for six
+providers: user (6 interactions), product (11), order (7), payment (4), shipping (4), review (8).
+The SPA talks to the gateway, so each provider verifies with **gateway emulation**: the test decodes
+the bearer token and sets `X-Username` / `X-User-Id` / `X-User-Role`. user, product and review
+extended their existing provider test. order and payment verify from
+`src/test/resources/pacts-frontend/` (`FrontendHttpProviderPactTest`) because their `pacts/` holds
+message pacts only; shipping uses `FrontendHttpProviderPactTest` with `@Consumer` filters in `pacts/`.
 
 | Consumer → Provider | Transport | What is pinned |
 |---|---|---|
@@ -182,12 +226,13 @@ the provider keeps a committed copy in `src/test/resources/pacts/` and verifies 
 every build. After changing a consumer's expectations run
 
 ```bash
-./sync-pacts.sh                 # regenerate all pacts, copy into providers, verify
+./sync-pacts.sh                 # regenerate all pacts (incl. the frontend's), copy into providers, verify
 ./sync-pacts.sh --verify-only   # replay the committed pacts against every provider
 .\sync-pacts.ps1                # PowerShell twin (-NoVerify / -VerifyOnly)
 ```
 
-and commit the updated `src/test/resources/pacts/*.json` in the provider repositories
+and commit the updated `src/test/resources/pacts/*.json` (and `pacts-frontend/*.json`, where that
+folder exists) in the provider repositories
 together with the consumer change. A provider build that fails its `*ProviderPactTest`
 means that provider would break the named consumer; fix the provider or, if the change
 is intended, update the consumer and re-sync.

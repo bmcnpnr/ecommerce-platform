@@ -17,8 +17,8 @@ an independent CI project. Ten repositories own their pipeline in
 
 | Repository type | CI | Continuous delivery |
 |---|---|---|
-| Ten Java 25 / Spring Boot services | Maven verify on a Docker-enabled VM, tests, JAR and Docker build | Docker Hub image |
-| React / TypeScript frontend | Vitest, TypeScript/Vite and Docker build. Playwright e2e on demand (pipeline parameters `run-e2e`, `e2e-base-url`), against an environment that is already running | nginx Docker Hub image |
+| Ten Java 25 / Spring Boot services | Maven verify on a Docker-enabled VM (unit tests, Testcontainers integration tests, Pact), JAR and Docker build | Docker Hub image |
+| React / TypeScript frontend | Vitest (391 tests), TypeScript/Vite and Docker build. Playwright e2e on demand (pipeline parameters `run-e2e`, `e2e-base-url`), against an environment that is already running | nginx Docker Hub image |
 | Monitoring configuration | YAML/JSON, Prometheus, Alertmanager validation | Versioned config bundle |
 | Platform orchestration | Compose, ShellCheck, PowerShell parser | Versioned deployment bundle |
 
@@ -98,8 +98,19 @@ mounted at the same absolute path inside the build container, and the host
 Docker socket is mounted with the job user's UID/GID. A dedicated writable
 build home keeps Maven/Testcontainers state isolated and makes UID differences
 between machine-image revisions harmless. This is the supported
-"Docker wormhole" layout: future Testcontainers tests can start PostgreSQL,
-Kafka, or other dependencies without changing the CircleCI executor.
+"Docker wormhole" layout, and it is what lets the integration tests start
+PostgreSQL, Kafka and MongoDB without changing the CircleCI executor.
+
+Every Maven repository now has a `*IT` integration suite (195 tests in
+total) run by maven-failsafe in the `verify` phase, next to the Surefire unit
+tests. `mvn -B -ntp verify` therefore runs both, and writes both
+`target/surefire-reports` and `target/failsafe-reports`. The pipelines collect both
+directories for the CircleCI test summary. The ITs use pinned production images
+(`postgres:16-alpine`, `confluentinc/cp-kafka:7.6.0`, `mongo:8.0`) with Flyway and
+`ddl-auto: validate`, and WireMock for downstream services. The container-backed ITs
+need a Docker daemon, which CI already mounts. Without one they fail at startup, except
+order-service's, which skip. The gateway and Eureka ITs need no containers. Nothing in
+the pipeline had to change for it.
 
 When adding integration tests to a service:
 
@@ -110,10 +121,11 @@ When adding integration tests to a service:
 3. Keep Testcontainers cleanup enabled and do not enable reusable containers in
    CI. Pin dependency image versions so upstream `latest` changes cannot break
    a build unexpectedly.
-4. Run fast tests with Surefire. Name integration tests `*IT` and configure
-   Maven Failsafe when a service needs a distinct integration-test phase.
-5. Keep `mvn verify` as the CI entry point. Both `target/surefire-reports` and
-   `target/failsafe-reports` are already collected by CircleCI.
+4. Run fast tests with Surefire. Name integration tests `*IT` in the
+   `<base>.integration` package; Failsafe picks them up in `verify`.
+5. Keep `mvn verify` as the CI entry point.
+6. A test that finds a bug asserts the correct behaviour and is `@Disabled("BUG: ...")`,
+   so the build stays green. Remove the marker with the fix.
 
 No `TESTCONTAINERS_HOST_OVERRIDE` is required for this Linux VM arrangement.
 The pipelines set only `TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE` for the mounted
@@ -123,7 +135,8 @@ socket used by Testcontainers' cleanup container.
 
 Every repository that talks to another runs Pact contract tests as part of the
 ordinary `mvn verify` (they are plain Surefire tests — no broker, no Docker, the
-Kafka ones use an embedded KRaft broker):
+Kafka ones use an embedded KRaft broker). The frontend is a consumer as well, with
+one difference noted below:
 
 - Consumer tests (`*ConsumerPactTest`) generate `target/pacts/*.json` and fail if
   the service's own client code cannot drive the recorded interactions.
@@ -136,9 +149,28 @@ committed files rather than through a Pact broker: after changing a consumer's
 expectations run `./sync-pacts.sh` from `ecommerce-platform`, then commit the
 updated `src/test/resources/pacts/*.json` in the provider repositories alongside the
 consumer change. Nothing in `.circleci/config.yml` needs to change for this.
+
+**Frontend pacts.** `ecommerce-frontend` writes `pacts/ecommerce-frontend-<provider>.json` with
+`npm run test:pact` (pact-js, 6 providers, 40 interactions). `sync-pacts.sh` / `.ps1` run it after the
+JVM consumers and copy each file into the provider: `src/test/resources/pacts/` for user, product and
+review, `src/test/resources/pacts-frontend/` for order and payment (whose `pacts/` holds message pacts
+only), and `pacts/` for shipping. The providers verify them in `mvn verify` with a gateway emulation
+(decode the bearer, set `X-Username`, `X-User-Id`, `X-User-Role`), so a provider change that breaks
+the SPA fails the provider's build. The frontend's own pipeline does **not** run `test:pact` (its
+`verify` runs `npm test -- --run`, which excludes `src/test/pact/`), so regenerate and commit the
+pacts with `sync-pacts.sh` whenever an API call in the SPA changes.
 Consumer tests bind Pact mock servers to fixed ports (18082/18083/18087 for
 product-service's consumers, 18181/18187 for the gateway's); they are inside the
 `verify` job's Docker container, so they cannot collide between pipelines.
+
+## Load tests
+
+`ecommerce-platform/load-tests` holds k6 scripts (`browse.js`, `checkout.js`; profiles `smoke`, `load`,
+`stress`) that run in the `grafana/k6:0.54.0` container against a running stack through the gateway. They are
+manual and opt-in, like the smoke test and the Playwright suite: no pipeline starts a stack, so none runs
+them. Run `./run-load.sh` from `load-tests/` against a disposable environment after a deployment; each run
+writes `reports/<script>-<profile>-<timestamp>/summary.{json,txt}` and exits non-zero if a threshold fails,
+so it can gate a manual release step. See `load-tests/README.md`.
 
 ## Deploy delivered images
 

@@ -403,15 +403,22 @@ The service has no Feign, resilience4j or JWT configuration.
 
 ## Testing
 
-Run everything with `mvn verify`. GitHub Actions (`.github/workflows/ci-cd.yml`) runs `mvn -B -ntp verify` and validates the image. It publishes the image for `develop`, `main`, `master` and `v*` tags.
+Run everything with `mvn verify` (106 unit, slice and pact tests, plus 17 integration tests that need Docker). GitHub Actions (`.github/workflows/ci-cd.yml`) runs `mvn -B -ntp verify` and validates the image. It publishes the image for `develop`, `main`, `master` and `v*` tags.
 
 | Class | Kind | What it covers |
 |---|---|---|
-| `service/ShipmentServiceTest` | Mockito unit | REST creation succeeds with `PENDING`. A duplicate order throws `InvalidShipmentStateException`. An unknown tracking number throws `ShipmentNotFoundException`. Updating a `DELIVERED` shipment throws `InvalidShipmentStateException` |
-| `service/ShippingServiceTest`, `controller/ShippingControllerTest` | Unit and `@WebMvcTest` | Only the `/hello` scaffold |
-| `contract/PaymentEventsConsumerPactTest` | Pact consumer (`@SpringBootTest`, profile `test`, `@EmbeddedKafka`) | Publishes the pact's example `payment.completed` as raw bytes with no type headers to an embedded broker. It lets the production path process the record: `KafkaProducerConfig`'s container factory, `StringDeserializer` with `JsonMessageConverter`, and the listener. The repository and producer are mocked. It asserts that the saved shipment has `orderId` 7 and `customerId` `customer-42`, and that `shipment.created` is published with `shipmentId` 31. It writes `target/pacts/shipping-service-payment-service.json` |
-| `contract/ShipmentEventsProviderPactTest` | Pact provider (`@SpringBootTest`, profile `test`) | Replays notification-service's pact (`src/test/resources/pacts/notification-service-shipping-service.json`). `shipment.created` comes from the real `PaymentEventConsumer` (state `payment 501 for order 7 has completed`). `shipment.updated` comes from the real `updateShipmentStatus()` with `SHIPPED`, `Istanbul hub` and `Left the warehouse` (state `shipment 31 for order 7 is being shipped`). Payloads are serialized with the production `ProducerFactory`'s serializer |
-| `contract/KafkaPactDsl` | Helper | Builds `LocalDateTime` matchers in the integer-array form, with a minimum of 5 elements |
+| `service/ShipmentServiceTest` | Mockito unit | REST creation (`PENDING`, duplicate order), lookups, status update with history and event (terminal states reject updates), history query, mapping |
+| `controller/ShipmentControllerTest` | `@WebMvcTest` | every endpoint's status codes and errors |
+| `messaging/PaymentEventConsumerTest`, `messaging/ShipmentEventProducerTest` | unit | the `payment.completed` listener (creation, duplicate skip) and the two event records |
+| `exception/GlobalExceptionHandlerTest`, `filter/CorrelationIdFilterTest` | unit | exception mappings; the correlation ID |
+| `service/ShippingServiceTest`, `controller/ShippingControllerTest` | Unit and `@WebMvcTest` | only the `/hello` scaffold |
+| `contract/PaymentEventsConsumerPactTest` | Pact consumer (`@SpringBootTest`, profile `test`, `@EmbeddedKafka`) | publishes the pact's example `payment.completed` as raw bytes with no type headers to an embedded broker and lets the production path process it (`KafkaProducerConfig`'s container factory, `StringDeserializer` and `JacksonJsonMessageConverter`) |
+| `contract/ShipmentEventsProviderPactTest` | Pact provider (`@SpringBootTest`, profile `test`) | replays notification-service's pact (`src/test/resources/pacts/notification-service-shipping-service.json`): `shipment.created` from the real `PaymentEventConsumer`, `shipment.updated` from `ShipmentService` |
+| `contract/FrontendHttpProviderPactTest` | Pact provider, HTTP | the frontend's 4 interactions (anonymous tracking of a known and an unknown number, the shipment of order 7, the history of shipment 31), selected with `@Consumer` filters in `pacts/`, with a gateway emulation for the identity headers |
+| `contract/KafkaPactDsl` | Helper | builds `LocalDateTime` matchers in the integer-array form, with a minimum of 5 elements |
+| `integration/ShipmentRepositoryIT` | Testcontainers `postgres:16-alpine` | both Flyway migrations; unique tracking number; not-null columns; column lengths; the event history cascades from its shipment and comes back oldest first; the foreign key |
+| `integration/PaymentCompletedFlowIT` | full app, Postgres, Kafka | `payment.completed` creates the shipment and publishes `shipment.created`; a redelivered event is idempotent |
+| `integration/ShipmentLifecycleIT` | full app, Postgres, Kafka | the full lifecycle updates the row, writes history and publishes `shipment.updated`; a terminal shipment rejects further updates without side effects; lookups and errors over HTTP; an over-long location is rolled back and publishes nothing |
 
 **Pact roles:**
 
@@ -432,11 +439,12 @@ Run everything with `mvn verify`. GitHub Actions (`.github/workflows/ci-cd.yml`)
 
 Because the file sits under `src/main`, it ships inside the production jar, where H2 is absent, so activating the profile in a container would fail at startup. It belongs in `src/test/resources`.
 
-**Gaps:**
+**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
 
-- No `ShipmentController` MVC test exists, so the validation-returns-500 defect below is not caught.
-- No test covers a successful status update, the history, or the consumer's duplicate-skip branch.
-- The Flyway migrations never run in tests.
+- `ShipmentControllerTest` (two tests): there is no `MethodArgumentNotValidException` handler, so a validation failure on `POST /api/v1/shipments` and a blank status on `PATCH /{id}/status` return 500 instead of 400 (A-4).
+- `ShipmentLifecycleIT.unknownStatus_is400_andChangesNothing`: an unknown status makes `ShipmentStatus.valueOf` throw, returned as 500 (A-4).
+
+**Gaps:** the unit and pact tests run on H2 with Flyway disabled, but `*IT` classes run both migrations on Postgres.
 
 ## Code map
 

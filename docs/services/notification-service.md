@@ -398,7 +398,20 @@ accept connections.
 
 ## Testing
 
-There are no unit tests. Three Pact **consumer** test classes in
+46 unit, slice and pact tests (`mvn test`) and 11 integration tests (`mvn verify`, needs Docker). The service went from seven tests, all Pact, to full coverage of its consumers.
+
+| Class | Kind | Covers |
+|---|---|---|
+| `consumer/OrderEventConsumerTest`, `PaymentEventConsumerTest`, `ShipmentEventConsumerTest` | Mockito unit | each `@KafkaListener` method hands its event to the right `NotificationService` method |
+| `service/NotificationServiceTest` | unit | each handler logs one `[NOTIFICATION]` line with the expected fields |
+| `config/KafkaConsumerConfigTest` | unit | one container factory per event type, each with its own `JacksonJsonDeserializer<T>` |
+| `contract/*ConsumerPactTest` | Pact consumer, 7 interactions | the payloads, below |
+| `integration/NotificationEventsIT` | full app, `cp-kafka:7.6.0` | all seven topics: a raw record reaches the matching `NotificationService` method, including a `LocalDateTime` ETA and timestamps without seconds or nanos; a tombstone is not notified and the next record still is |
+| `integration/PoisonPillIT` | full app, `cp-kafka:7.6.0` | an undeserializable record is skipped and the next one still processed (2 tests, **disabled**) |
+
+**Disabled tests that pin a bug** (see [Findings](../findings.md#bugs-pinned-by-tests)): both `PoisonPillIT` tests, a record that is not JSON and a wrong-typed field (the `shipment.created` incident). The factories use a bare `JacksonJsonDeserializer`, with no `ErrorHandlingDeserializer` and no dead-letter recoverer. `DefaultErrorHandler` refuses `SerializationException`s, so the container re-polls the same offset in a tight loop (about 185,000 error lines in 30 seconds, around 3.9 GB of logs a minute) and the partition stays blocked (R-1). Each test truncates the partition it poisons and the class closes its context, so it cannot poison the other ITs once enabled.
+
+Three Pact **consumer** test classes in
 `src/test/java/com/ecommerce/notificationservice/contract/` pin the payloads this
 service relies on, one per producer:
 
@@ -427,8 +440,7 @@ serialize the captured event with the value serializer from the production
 pacts at the time of writing. CI (`.circleci/config.yml`) runs `mvn -B -ntp verify`,
 so all seven tests run on every build.
 
-Not covered: the poison-pill path (nothing tests what happens when a record does
-not deserialize), the log output itself, and the unused default factory.
+Not covered: the unused default factory.
 
 End to end, `smoke-test.sh` confirms an order and checks that `orderId=<id>`
 appears in the last two minutes of `docker compose logs notification-service`. It

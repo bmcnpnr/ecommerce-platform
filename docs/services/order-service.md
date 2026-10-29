@@ -468,13 +468,13 @@ Entities versus migrations:
   defaults. Hibernate always inserts explicit values, so the DB defaults only matter for manual inserts.
 - **Indexes:** the entities declare no indexes. `idx_orders_customer` serves `OrderRepository.findByCustomerId()`; no
   query filters on `status`, so `idx_orders_status` is unused.
-- **Cascades:** `ON DELETE CASCADE` and `orphanRemoval = true` are never exercised, because nothing deletes orders or
-  removes lines.
+- **Cascades:** `ON DELETE CASCADE` and `orphanRemoval = true` are never used by the application, because nothing deletes orders or
+  removes lines. `OrderRepositoryIT` exercises both against Postgres.
 - **Missing constraints:** no CHECK constraints (quantity can be zero or negative, status is free text at DB level)
   and no version column, so there is no optimistic locking.
 - **Fetching:** `orderItems` is `EAGER`; `findByCustomerId()` loads each order's lines with a separate query.
-- **Tests:** the test profile replaces Postgres with H2 and `ddl-auto: create-drop` with Flyway disabled, so no test
-  runs the migrations.
+- **Tests:** the `test` profile (unit and pact tests) replaces Postgres with H2 and `ddl-auto: create-drop` with Flyway disabled. The
+  `*IT` classes run the migrations on Postgres with `ddl-auto: validate`.
 
 ## Security and identity
 
@@ -603,28 +603,27 @@ a test-scoped dependency and not in the jar. catalog-service and review-service 
 
 ## Testing
 
-23 tests; the last recorded run (`target/surefire-reports`) passed all of them. CI (`.circleci/config.yml`) runs
+97 unit, slice and pact tests (`mvn test`) and 16 integration tests (`mvn verify`, needs Docker). CI (`.circleci/config.yml`) runs
 `mvn -B -ntp verify` in `cimg/openjdk:25.0`. It then builds the image, and on `develop`, `main`, `master` and `v*`
 tags publishes it to Docker Hub.
 
 | Class | Kind | Covers |
 |---|---|---|
-| `service/OrderServiceTest` (6) | Mockito unit | create; add item reserves stock with `delta = -2`; add to unknown order (404 path); add to CANCELLED order; cancel SHIPPED order rejected; get unknown order |
-| `controller/OrderControllerTest` (3) | `@WebMvcTest` | `GET /hello`; `POST /api/v1/orders?customerId=` returns 201 and the body; `GET /{orderId}` |
-| `config/ConnectionFailureRetryerTest` (3) | unit | connection failures retried up to the limit; read timeout never retried; `clone()` resets the counter |
-| `config/FeignHttpMessageConvertersRaceTest` (1) | concurrency | 48 threads × 200 rounds never observe an empty converter list |
-| `contract/ProductServiceConsumerPactTest` (4) | Pact consumer, HTTP | see below |
-| `contract/PaymentEventsConsumerPactTest` (2) | Pact consumer, Kafka | see below |
-| `contract/OrderEventsProviderPactTest` (2) | Pact provider, Kafka | see below |
+| `service/OrderServiceTest` | Mockito unit | create; add item (stock reserved with `delta = -2`, unknown order, CANCELLED order, unknown product, insufficient stock); confirm; cancel (restores stock, rejects SHIPPED); status updates; reads; the product-service failure paths |
+| `controller/OrderControllerTest` | `@WebMvcTest` | every endpoint's status codes, validation and error bodies |
+| `messaging/OrderEventProducerTest`, `messaging/PaymentEventConsumerTest` | unit | the `order.placed` and `order.cancelled` records (topic, key, payload); `payment.completed` and `payment.failed` handling, including an unknown order |
+| `client/ProductServiceClientFallbackTest` | unit | the fallback class (inactive in production, see Outbound calls) |
+| `config/ConnectionFailureRetryerTest`, `config/FeignHttpMessageConvertersRaceTest` | unit, concurrency | connection failures retried up to the limit, a read timeout never; 48 threads × 200 rounds never see an empty converter list |
+| `exception/GlobalExceptionHandlerTest`, `filter/CorrelationIdFilterTest` | unit | exception mappings; the correlation ID |
+| `contract/ProductServiceConsumerPactTest` (4), `PaymentEventsConsumerPactTest` (2), `OrderEventsProviderPactTest` (2) | Pact | see below |
+| `contract/FrontendHttpProviderPactTest` | Pact provider, HTTP | the frontend's 7 interactions, see below |
+| `integration/OrderRepositoryIT` | Testcontainers `postgres:16-alpine` | the real Flyway migrations; cascade and orphan removal; `numeric` rounding to four places; status stored as its name; `findByCustomerId` |
+| `integration/OrderFlowIT` | full app, Postgres, Kafka, WireMock for product-service | create, add item, place: the rows persist and `order.placed` is published; cancel restores stock and publishes `order.cancelled`; unknown product 404 and insufficient stock 400 leave the order untouched |
+| `integration/PaymentEventsIT` | full app, Postgres, Kafka | `payment.completed` marks the order `PAID`; `payment.failed` cancels it; an event for an unknown order is skipped and the listener keeps consuming |
 
-Not covered:
-- confirm;
-- `PATCH /status`;
-- the legacy `/products` endpoint;
-- the exception-handler mappings (except what the pacts touch);
-- the circuit breaker;
-- concurrency;
-- anything against PostgreSQL or Flyway. Testcontainers is not used, although the CI job passes the Docker socket.
+**Disabled test that pins a bug** (see [Findings](../findings.md#bugs-pinned-by-tests)): `OrderServiceTest.cancelOrder_alreadyCancelled_isRejectedWithoutRestoringStockAgain`. Cancelling a `CANCELLED` order restores stock a second time and publishes a duplicate `order.cancelled` (I-3).
+
+Open design questions with no test yet, because the intended rules are undecided: items can be added after `CONFIRMED` (I-8), `PaymentEventConsumer` overwrites the status whatever it is, so a late `payment.completed` flips `CANCELLED` to `PAID` (R-3), and `PATCH /status` accepts any transition (I-9). Not covered: the legacy `/products` endpoint and the circuit breaker.
 
 **Pacts** (pact-jvm 4.7.5, spec V4, no broker). Pact files are handed over by `ecommerce-platform/sync-pacts.sh`.
 The copies in the provider repositories match the files last generated here.
@@ -663,6 +662,8 @@ The copies in the provider repositories match the files last generated here.
     - `order.cancelled`: `orderId`, `customerId`, `cancelledAt`;
     - for both: `kafka_topic`, and `kafka_key` matching `\d+`.
   - **Not pinned:** `items`, which notification-service does not read.
+
+**Provider for the frontend** (`FrontendHttpProviderPactTest`, 7 interactions in `src/test/resources/pacts-frontend/ecommerce-frontend-order-service.json`, kept apart from `pacts/`, which holds message pacts only): create an order for a customer, get order 7, a customer's orders, add 2 of product 1, confirm, cancel, and an admin status change to `SHIPPED`. The test boots the whole application and emulates the gateway by decoding the bearer token into `X-Username`, `X-User-Id` and `X-User-Role`.
 
 Run only the pacts with `mvn test -Dtest='*PactTest'`.
 

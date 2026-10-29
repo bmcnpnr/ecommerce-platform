@@ -338,7 +338,19 @@ Paths are relative to `src/test/kotlin/com/ecommerce/`.
 | `catalogservice/config/ConnectionFailureRetryerTest` | unit test | Connection refused and connect timeouts are retried then propagated; read timeouts are not retried; `clone()` resets the counter. |
 | `catalogservice/config/FeignHttpMessageConvertersRaceTest` | concurrency test | 200 rounds of 48 threads hitting a cold converter instance never observe an empty list. |
 | `catalogservice/contract/ProductServiceConsumerPactTest` | Pact consumer | Runs the real Feign client, the production `FeignConfig` and Boot's Jackson against a Pact mock server on fixed port 18083, driven through `CatalogService.syncFromProductService()`; writes `target/pacts/catalog-service-product-service.json`. |
-| `catalog/controller/CatalogControllerTest.kt`, `catalog/service/CatalogServiceTest.kt` | placeholders | Only a package line and the comment "Replaced"; no tests. |
+| `catalogservice/exception/GlobalExceptionHandlerTest`, `catalogservice/filter/CorrelationIdFilterTest` | unit | exception mappings, including the catch-all that turns Spring MVC's own 400s into 500; the correlation ID |
+| `catalogservice/client/ProductServiceClientFallbackTest`, `catalogservice/config/CatalogCollectionInitializerTest` | unit | the inactive fallback; the startup backfill and index creation logic |
+| `catalogservice/integration/CatalogApiIT` | full app, `mongo:8.0`, WireMock for product-service | sync stores the projection and a second sync updates in place, keeping the catalog-owned fields; get by id and the 404 envelope with the caller's correlation ID; browse paging; by category; featured; PATCH; search ranking and the substring fallback |
+| `catalogservice/integration/ProductServiceFailureIT` | full app, `mongo:8.0`, WireMock | product-service answering 500, being down (after the connection retries) or returning an undecodable body fails the sync and writes nothing; the sync works again on recovery; a failing categories call only costs the category name |
+| `catalogservice/integration/CatalogCollectionInitializerIT` | full app, `mongo:8.0` | startup creates every index; on a fresh database it creates the collection and a second run changes nothing; a legacy document is backfilled and then updatable |
+| `catalog/controller/CatalogControllerTest.kt`, `catalog/service/CatalogServiceTest.kt` | placeholders | Only a package line and the comment "Replaced"; no tests. The web layer is covered by `CatalogApiIT` |
+
+69 unit, slice and pact tests and 20 integration tests. The repository test skips without Docker; the ITs fail.
+
+**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
+
+- `CatalogApiIT` "malformed requests are client errors, not server errors": a non-numeric id, a missing `q`, `size=0` and an unreadable PATCH body answer 500 instead of 400, because the catch-all swallows Spring MVC's exceptions (A-4).
+- `ProductServiceFailureIT` "syncing a product that does not exist upstream is a 404": product-service's 404 surfaces as 500 (R-4).
 
 Pinned by the consumer pact (verified by `ProductServiceProviderPactTest` in product-service after `ecommerce-platform/sync-pacts.sh` copies it there):
 
@@ -348,7 +360,7 @@ Pinned by the consumer pact (verified by `ProductServiceProviderPactTest` in pro
 | a request for all categories | `categories exist` | `GET /api/v1/categories` | 200; array of at least one `{id integer, name string, description string}` |
 | a request for product 999 | `product 999 does not exist` | `GET /api/v1/products/999` | 404; `status` integer, `error`, `message` strings |
 
-Not covered by any test: the web layer (controller mappings, `GlobalExceptionHandler`, JSON binding of the PATCH body and the JSON shape of `CatalogEntryDTO`), and the 500 that a Feign failure produces at the HTTP level. The repository test's "blank -> everything" assertion passes because both test product names contain a space; it does not show that a blank query returns every entry.
+The repository test's "blank -> everything" assertion passes because both test product names contain a space; it does not show that a blank query returns every entry.
 
 CI (`.circleci/config.yml`) runs `mvn -B -ntp verify` in `cimg/openjdk:25.0` with the Docker socket mounted, so the Testcontainers test runs there.
 

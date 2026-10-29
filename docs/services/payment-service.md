@@ -365,13 +365,18 @@ The service has no Feign, resilience4j or JWT configuration.
 
 ## Testing
 
-Run everything with `mvn verify`. CircleCI (`.circleci/config.yml`) runs `mvn -B -ntp verify`, validates the image and publishes it for `develop`, `main`, `master` and `v*` tags.
+Run everything with `mvn verify` (61 unit, slice and pact tests, plus 18 integration tests that need Docker). CircleCI (`.circleci/config.yml`) runs `mvn -B -ntp verify`, validates the image and publishes it for `develop`, `main`, `master` and `v*` tags.
 
 | Class | Kind | What it covers |
 |---|---|---|
-| `service/PaymentServiceTest` | Mockito unit | Initiating a payment succeeds and returns `PENDING`. Initiating when a `COMPLETED` payment exists throws `PaymentAlreadyProcessedException`. Processing a non-`PENDING` payment throws `PaymentAlreadyProcessedException`. Refunding a non-`COMPLETED` payment throws `InvalidPaymentStateException`. Getting an unknown id throws `PaymentNotFoundException` |
-| `controller/PaymentControllerTest` | `@WebMvcTest` | `POST /api/v1/payments` returns 201. `GET /api/v1/payments/1` returns 200. An unknown id returns 404 |
-| `contract/PaymentEventsProviderPactTest` | Pact provider (`@SpringBootTest`, profile `test`) | Replays the three consumer pacts in `src/test/resources/pacts/` against the real `PaymentService` and `PaymentEventProducer`. The repository and `KafkaTemplate` are mocked. Payloads are serialized with the serializer configured on the production `ProducerFactory`. For completed and failed events, the test re-runs `processPayment()` on a fresh `PENDING` payment, up to 500 times, until the random draw takes the wanted branch |
+| `service/PaymentServiceTest` | Mockito unit | initiate (success returns `PENDING`, a `COMPLETED` payment blocks it), process (a non-`PENDING` payment throws `PaymentAlreadyProcessedException`, success and decline branches), refund (only from `COMPLETED`), queries and mapping |
+| `controller/PaymentControllerTest` | `@WebMvcTest` | the endpoints' status codes, validation and error bodies |
+| `messaging/PaymentEventProducerTest` | unit | the three event records: topic, key, payload |
+| `exception/GlobalExceptionHandlerTest`, `filter/CorrelationIdFilterTest` | unit | exception mappings; the correlation ID |
+| `contract/PaymentEventsProviderPactTest` | Pact provider (`@SpringBootTest`, profile `test`) | replays the three consumer pacts in `src/test/resources/pacts/` against the real `PaymentService` and `PaymentEventProducer` |
+| `contract/FrontendHttpProviderPactTest` | Pact provider, HTTP | the frontend's 4 interactions in `src/test/resources/pacts-frontend/` (initiate a payment for order 7, process payment 501, payment of order 7, and one for an order with none), with a gateway emulation that sets `X-Username`, `X-User-Id`, `X-User-Role` from the bearer token. Kept apart from `pacts/`, which holds message pacts only |
+| `integration/PaymentRepositoryIT` | Testcontainers `postgres:16-alpine` | the real migration; `numeric(19,4)` amounts (and rejection beyond it); `updated_at`; unique `transaction_id` with many nulls; not-null columns and defaults; `order_id` is **not** unique |
+| `integration/PaymentFlowIT` | full app, Postgres, Kafka | initiate, complete, refund: rows persist and the three events are published; a decline stores the reason and publishes `payment.failed`; state guards and errors over HTTP |
 
 **Pact role:** this service is the provider for three consumer pacts, which `ecommerce-platform/sync-pacts.sh` copies here.
 
@@ -399,11 +404,13 @@ The pacts check types only, so the provider may add fields. Run only the contrac
 
 Because the file sits under `src/main`, it is packaged into the production jar. H2 is a test-scoped dependency and is not, so starting a deployed container with the `test` profile would fail.
 
-**Gaps:**
+**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
 
-- Only the Pact test exercises the success and decline branches of `processPayment()` and a successful refund, and it uses mocks.
-- No test covers validation errors, invalid `method` values, a second payment for the same order, or concurrency.
-- Tests run on H2 with Flyway disabled, so no test ever executes the migration.
+- `PaymentFlowIT.initiateTwiceForSameOrder_keepsOrderLookupWorking`: `payments.order_id` is not unique, so a retry after a failed payment adds a second row, and then `GET /payments/order/{id}` and further initiates return 500 (I-6).
+- `GlobalExceptionHandlerTest`: a non-JSON body returns 500 instead of 415, and an unknown URL 500 instead of 404 (A-4).
+- `PaymentFlowIT.initiate_unknownMethod_returns400`: an unknown `method` makes `PaymentMethod.valueOf` throw, returned as 500 (A-4).
+
+**Gaps:** the unit and pact tests run on H2 with Flyway disabled, but the `*IT` classes run the migration on Postgres. Concurrent payments for one order are not tested.
 
 ## Code map
 
