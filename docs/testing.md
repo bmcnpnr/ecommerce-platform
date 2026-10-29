@@ -16,6 +16,9 @@ for the bugs the tests have found, see [Findings: bugs pinned by tests](findings
 | Smoke | `ecommerce-platform/smoke-test.sh` | `./smoke-test.sh` | running stack |
 | Browser end to end | `ecommerce-frontend/e2e/` | `npm run e2e` | running stack |
 | Load | `ecommerce-platform/load-tests/` | `./run-load.sh browse.js` | running stack, Docker |
+| Security, per service | `<repo>/src/test/**/security/*SecurityTest`, `integration/*SecurityIT`, `ecommerce-frontend/src/test/security/` | `mvn verify -Dgroups=security`, `npx vitest run src/test/security` | as unit / integration |
+| Penetration (live) | `ecommerce-frontend/e2e/security/` | `npm run e2e:security` | running stack |
+| Scanners (SCA, secrets, misconfig, DAST) | `ecommerce-platform/security-tests/` | `./run-security.sh` | Docker; DAST: running stack |
 
 `mvn test` is the fast inner loop. `mvn verify` is the whole suite and is what CI runs: Surefire
 runs `*Test` in the `test` phase, then Failsafe runs `*IT` in `integration-test` and fails the
@@ -179,6 +182,37 @@ the `grafana/k6` container. `PROFILE=smoke` (1 VU, 30 s) proves the script works
 (50 and 10 VUs); `stress` climbs to 4× peak. Thresholds (error rate < 1%, checks > 99%, a p95 budget per request)
 make the run exit non-zero when they fail. Each run writes `load-tests/reports/<script>-<profile>-<time>/`.
 `checkout.js` creates real users, products and orders, so point it at a disposable stack. Details: [load-tests/README.md](../load-tests/README.md).
+
+## Security tests
+
+Security has its own layer at every level, so a control is proven in isolation, in its service and in the deployed system.
+[Security](security.md) describes the controls. [Findings](findings.md) lists the holes, and each one is pinned by at least one of these tests.
+
+| Level | Where | What it proves |
+|---|---|---|
+| Unit (`@Tag("security")`, `*SecurityTest`) | `src/test/**/security/` in every Java repo | the gateway's JWT filter against hand-built JOSE headers, missing claims, path tricks and log injection; token issuing, BCrypt, mass assignment, role and ownership checks, and error-body leakage per controller; committed config (actuator exposure, JWT secret fallback) |
+| Integration (`@Tag("security")`, `*SecurityIT`) | `src/test/**/integration/` | the same controls on real Postgres, Mongo, Kafka and Netty: SQL and NoSQL injection, ReDoS, forged and malformed Kafka events, raw-socket path traversal, smuggling and oversized headers at the gateway, anonymous Eureka registration |
+| Frontend (`*.security.test.ts(x)`) | `ecommerce-frontend/src/test/security/` | XSS payloads through every component that renders user data, a source scan for dangerous sinks, token handling, route guards, open redirects, and the nginx config |
+| Penetration | `ecommerce-frontend/e2e/security/` ([README](../../ecommerce-frontend/e2e/security/README.md)) | an attacker customer against a victim customer on the live stack, plus stored XSS run in Chromium, business-logic tampering and network exposure |
+| Scanners | `ecommerce-platform/security-tests/run-security.sh` | Trivy (dependency CVEs, image CVEs, k8s, Dockerfile and compose misconfiguration), Gitleaks (secrets in every repo's history), OWASP ZAP (authenticated API scan of every OpenAPI spec, and a baseline scan of the SPA), npm audit |
+
+```bash
+# only the security tests of one service
+mvn verify -Dgroups=security
+# ...and see every pinned hole fail
+mvn verify -Dgroups=security -Djunit.jupiter.conditions.deactivate='org.junit.*DisabledCondition'
+
+cd ecommerce-frontend && npx vitest run src/test/security && npm run e2e:security
+
+cd ecommerce-platform/security-tests
+./run-security.sh sca secrets misconfig npm      # static, no stack needed
+./run-security.sh dast-api dast-web images       # against the running stack
+```
+
+Known holes follow the bug convention above: `@Disabled("BUG S-<n>: ...")`, `it.fails` or `test.fail(true, 'S-<n>: ...')`.
+Each one was run enabled and seen failing for the stated reason.
+ZAP's rule levels are in `security-tests/zap-rules.conf`: injection, traversal and RCE rules fail the run, and the known header findings (S-7) are warnings.
+Scan reports go to `security-tests/reports/<time>/summary.md`.
 
 ## In CI
 

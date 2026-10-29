@@ -303,6 +303,68 @@ patch releases bring them.
 **D-3.** Move the services to springdoc 3.0.x like the gateway, and keep the
 whole platform on one version.
 
+## Security test findings (2026-10-29)
+
+A dedicated security suite was added at every level (see [Testing: security tests](testing.md#security-tests)).
+It found the holes below. Every one is pinned by a test that asserts the secure behaviour: `@Disabled("BUG S-<n>: ...")` in Java and Kotlin,
+`it.fails` in Vitest, `test.fail(true, 'S-<n>: ...')` in Playwright. Each was run enabled and seen failing for the stated reason.
+Ids that would duplicate an older finding reuse it (S-1, S-3, S-4, S-6 to S-11, I-1, I-2, I-6, I-8 are re-pinned at more levels).
+
+### High and medium
+
+| Id | Finding | Severity | Pinned in |
+|---|---|---|---|
+| S-19 | `ecommerce-frontend/pacts/*.json` (and the provider copies) commit bearer tokens signed with the default secret and valid until 2100, **one of them `ADMIN`**. Against any stack that runs the default `JWT_SECRET` (S-4), they are working admin credentials. Verified live. Fix: rotate the secret (S-4) and give the pact tokens a test-only secret. | High | e2e `authentication.spec.ts`, Gitleaks |
+| S-98 | **Known-vulnerable dependencies in every service jar.** Trivy, scanning the built jars: 111 critical and 435 high findings across the 10 jars. Most come from the Spring Boot 4.0.1 managed stack: spring-boot (fixed in 4.0.6), spring-webmvc and spring-webflux 7.0.2 (7.0.9), tomcat-embed-core 11.0.15 (11.0.25) and spring-security-web 7.0.2 (7.0.4). The rest: bcprov-jdk18on 1.81 (1.85), kafka-clients 4.1.1 (4.1.2), netty-handler in the gateway, and freemarker in Eureka. Fix: bump the Boot parent to the latest 4.0.x in all ten poms and re-run `run-security.sh sca`. | High | `security-tests/run-security.sh sca`, `images` |
+| S-99 | Frontend dependencies: axios 1.13.6 has 12 HIGH advisories (fixed in 1.20.0), and form-data 4.0.5 has one (4.0.6). `npm audit --audit-level=critical` passes. | Medium | `run-security.sh sca`, `npm` |
+| S-75 | Payment takeover: re-initiating a payment for an unpaid order overwrites another customer's PENDING or FAILED payment row (customer, amount, card) | High | payment `PaymentSecurityIT`, `PaymentServiceSecurityTest` |
+| S-76 | A REFUNDED payment can be re-initiated and completed again | Medium | payment |
+| S-77 | `/payments/{id}/process` has no locking: concurrent calls each publish `payment.completed` | Medium | payment `PaymentSecurityIT` |
+| S-84 | shipping creates a shipment from a `payment.completed` with a zero, negative or missing amount (no producer authentication on the topic) | Medium | shipping `ShipmentSecurityIT` |
+| S-63 | order accepts a negative or null price from product-service, so a total goes negative or an item is free | Medium | order `OrderServiceSecurityTest` |
+| S-82 | Shipment status can skip states or move backwards (PENDING→DELIVERED, SHIPPED→PENDING) and publishes `shipment.updated` | Medium | shipping |
+| S-83 | Tracking numbers carry 36 random bits on an unauthenticated endpoint that returns personal data (S-8) | Medium | shipping `ShipmentServiceSecurityTest` |
+| S-14 | No rate limiting, lockout or CAPTCHA on login | Medium | e2e |
+| S-16 | No token revocation: a deactivated account keeps working for the token's lifetime | Medium | e2e |
+| S-18 | Grafana runs with `admin`/`admin` on a published port | Medium | e2e `exposure.spec.ts` |
+| S-31 | review-service turns a missing or blank `X-Username` into a shared user `anonymous` that can create reviews, vote and take the per-product review slot (reachable directly or after any gateway mistake) | Medium | review |
+| S-33 | Unapproved (PENDING, REJECTED) reviews are readable by anyone, by id, by customer and with `approvedOnly=false` | Medium | review `ReviewSecurityIT` |
+| S-52 | catalog stores any `imageUrl`: `javascript:`, `data:text/html`, `file:`, 1 MB strings. The SPA doesn't render `imageUrl` today, so it is latent stored XSS. | Medium | catalog `CatalogDataIntegritySecurityIT` |
+| S-13 | Log forging at the gateway: an unauthenticated token's `alg` header is logged verbatim, so CR/LF writes fake lines into the gateway log (and Loki) | Medium | gateway `JwtAuthenticationFilterSecurityTest` |
+| S-95 | Log forging in notification-service: CR/LF in event fields (customer id, failure reason, tracking number, ...) writes fake log lines | Medium | notification `NotificationLogSecurityTest` |
+| S-94 | The SPA interpolates the tracking number into the API path unencoded, so a crafted `/tracking/<n>` link sends the visitor's authenticated GET to another API path | Medium | frontend `tokenHandling.security.test.tsx` |
+| S-17 | The only password rule is a length of 8 (`password` and `12345678` are accepted) | Medium | e2e |
+
+### Low
+
+| Id | Finding | Pinned in |
+|---|---|---|
+| S-12 | The gateway accepts signed tokens with no `exp` (eternal) or no `sub` (forwarded as `X-Username: ""`) | gateway unit |
+| S-15 | Registration answers 409 naming the existing username or email (account enumeration) | e2e |
+| S-20 | Login for an unknown user skips BCrypt, so it is measurably faster than a wrong password (timing enumeration) | user unit |
+| S-30 | review-service compares the role case-insensitively (`admin`, `Admin` count as `ADMIN`) | review |
+| S-32 | Authors can vote on their own review, and votes count on unpublished reviews | review |
+| S-42, S-48, S-50, S-51, S-70 to S-74 | Missing input bounds: fractional stock deltas truncated; prices and amounts beyond NUMERIC(19,4) or below a cent; negative or zero catalog prices; arbitrary currency strings; non-digit `cardLastFour`; `orderId` 0 or negative | product, catalog, payment |
+| S-44 | Soft-deleted products are still served by id and SKU | product |
+| S-53 | catalog has no maximum page size (`size=100000000` returns everything) | catalog |
+| S-64, S-65 | Items can be added after confirmation (also I-8); blank `customerId` accepted | order |
+| S-90 | The axios interceptor attaches the bearer token to absolute third-party URLs (no caller today) | frontend |
+| S-91, S-92 | The SPA's guards trust the persisted `isAuthenticated` flag and ignore expiry (UI only; the API still refuses) | frontend |
+| S-93 | Open redirect: after login the SPA navigates to an unvalidated `intendedPath` (`//evil.com`, `javascript:`) | frontend |
+| S-96 | notification-service logs event fields without a length cap | notification |
+| S-97 | `health.show-details: always` on notification-service and discovery (S-6 for the others) | notification, discovery |
+| S-21, S-34, S-41, S-56, S-61, S-78, S-81 | 400 bodies echo framework text and Java type names; order's Feign error also leaks the internal URL, client interface and downstream body | per service |
+| S-23, S-24, S-35, S-37, S-40, S-45 to S-47, S-54, S-62, S-66, S-79, S-80, S-86, S-87 | Client input answered with 500: passwords over 72 bytes, unknown paths, wrong Content-Type, NUL bytes, over-long strings, page offset overflow, unknown sort property, a concurrent-initiate race | per service |
+| S-22 | Address fields have no size limit (200 KB accepted) | user |
+| S-36, S-43, S-57 | No `X-Content-Type-Options: nosniff` on service responses (S-7 at the edge) | review, product, catalog |
+| S-49, S-55 | `X-Correlation-Id` is reflected and logged unvalidated, at any length | product, catalog |
+
+### Corrections from the suite
+
+- S-1 is narrower than its row above says. user-service `PUT`/`DELETE /users/{id}` do check owner or `ADMIN`, and review moderation does check the role (case-insensitively, S-30). `GET /users/{id}` still has no ownership check.
+- S-11: the code checks the password before the status. The status message only reaches someone who already has the password.
+- What was verified secure (tests pass, keep them green): JWT signature, `alg` and expiry handling at the gateway; header stripping in any letter case; SQL injection in every Postgres service (LIKE wildcards escaped too); Mongo operator, regex and ReDoS input in catalog; XSS payloads render as text in every SPA view; mass assignment of server-controlled fields; Kafka type-header and polymorphic-JSON attacks; XXE in Eureka; payload size and CL/TE smuggling at the gateway.
+
 ## Bugs pinned by tests
 
 A test that finds a bug asserts the correct behaviour and is disabled, so `mvn verify` stays green. Remove the `@Disabled` (or switch `it.fails` to `it`) in the same change that fixes the bug.
