@@ -53,6 +53,29 @@ $docs += New-ConfigMapDoc 'postgres-exporter-queries'  @("$MonDir\postgres-expor
 # it. WriteAllLines defaults to UTF-8 without one.
 [System.IO.File]::WriteAllLines((Join-Path $K8sDir '05-monitoring-config.yaml'), $docs)
 
+# Application secrets live in the git-ignored ..\.env, never in the manifests
+# (S-4). init-secrets.ps1 creates it, or adds keys it lacks; it never changes an
+# existing value. Pods read Secrets at start, so after rotating a value run
+# `kubectl -n ecommerce rollout restart deployment` as well.
+Write-Host ""
+Write-Host "Creating Secrets from ..\.env..."
+& (Join-Path $K8sDir '..\init-secrets.ps1')
+$secrets = @{}
+Get-Content (Join-Path $K8sDir '..\.env') | ForEach-Object { if ($_ -match '^([A-Z_]+)=(.*)$') { $secrets[$Matches[1]] = $Matches[2] } }
+kubectl apply -f (Join-Path $K8sDir '00-namespace.yaml')
+$yaml = kubectl -n $Ns create secret generic platform-secrets `
+    "--from-literal=JWT_SECRET=$($secrets.JWT_SECRET)" `
+    "--from-literal=ADMIN_PASSWORD=$($secrets.ADMIN_PASSWORD)" `
+    "--from-literal=GF_SECURITY_ADMIN_USER=$($secrets.GRAFANA_ADMIN_USER)" `
+    "--from-literal=GF_SECURITY_ADMIN_PASSWORD=$($secrets.GRAFANA_ADMIN_PASSWORD)" `
+    --dry-run=client -o yaml
+$yaml | kubectl apply -f -
+$yaml = kubectl -n $Ns create secret generic eureka-credentials `
+    "--from-literal=EUREKA_USERNAME=$($secrets.EUREKA_USERNAME)" `
+    "--from-literal=EUREKA_PASSWORD=$($secrets.EUREKA_PASSWORD)" `
+    --dry-run=client -o yaml
+$yaml | kubectl apply -f -
+
 Write-Host ""
 Write-Host "Applying manifests..."
 kubectl apply -k $K8sDir
@@ -87,13 +110,21 @@ foreach ($svc in @('prometheus','alertmanager','loki','tempo','grafana')) {
     kubectl -n $Ns rollout status "deployment/$svc" --timeout=5m
 }
 
+# Grafana only reads GF_SECURITY_ADMIN_PASSWORD when it creates its database, and
+# the database lives on a volume, so an existing install keeps its old password
+# (S-18) unless it is reset explicitly.
+kubectl -n $Ns exec deploy/grafana -- grafana cli admin reset-admin-password $secrets.GRAFANA_ADMIN_PASSWORD | Out-Null
+if ($LASTEXITCODE -eq 0) { Write-Host "Grafana admin password synced from ..\.env" }
+else { Write-Warning "could not set Grafana's admin password; it may still be the old one" }
+
 Write-Host ""
 kubectl -n $Ns get pods -o wide
 Write-Host ""
 Write-Host "Frontend        http://localhost:3000"
 Write-Host "API gateway     http://localhost:8080"
-Write-Host "Eureka          http://localhost:8761"
-Write-Host "Grafana         http://localhost:3001   (admin/admin)"
+Write-Host "Eureka          http://localhost:8761   (eureka / EUREKA_PASSWORD)"
+Write-Host "Grafana         http://localhost:3001   (GRAFANA_ADMIN_USER / GRAFANA_ADMIN_PASSWORD)"
+Write-Host "Logins are in ..\.env; ..\init-secrets.ps1 -Print shows them."
 Write-Host "Prometheus      http://localhost:9090"
 Write-Host "Alertmanager    http://localhost:9093"
 Write-Host "Kafka UI        http://localhost:8090"

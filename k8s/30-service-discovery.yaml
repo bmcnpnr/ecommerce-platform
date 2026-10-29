@@ -67,6 +67,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: java-env
+            - secretRef:
+                name: eureka-credentials
           resources:
             requests:
               cpu: 100m

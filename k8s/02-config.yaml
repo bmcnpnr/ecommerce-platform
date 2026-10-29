@@ -7,7 +7,9 @@ metadata:
   name: java-env
   namespace: ecommerce
 data:
-  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+  # Eureka requires credentials (S-10). The placeholders are resolved by Spring from the
+  # EUREKA_USERNAME / EUREKA_PASSWORD variables the eureka-credentials Secret provides.
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://${EUREKA_USERNAME}:${EUREKA_PASSWORD}@service-discovery:8761/eureka/
   OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
   KAFKA_BOOTSTRAP_SERVERS: kafka:29092
   ENVIRONMENT: development

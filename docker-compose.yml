@@ -33,7 +33,8 @@ volumes:
 # ActiveProcessorCount caps GC/ForkJoin/Netty pool sizing — the VM reports 32
 # CPUs, so ten JVMs would otherwise each spin up ~23 GC threads.
 x-java-env: &java-env
-  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://service-discovery:8761/eureka/
+  # Eureka needs credentials (S-10); they come from .env (./init-secrets.sh).
+  EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://${EUREKA_USERNAME:-eureka}:${EUREKA_PASSWORD:?run ./init-secrets.sh to create .env}@service-discovery:8761/eureka/
   OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
   ENVIRONMENT: development
   JAVA_OPTS: >-
@@ -283,6 +284,8 @@ services:
       - "8761:8761"
     environment:
       <<: *java-env
+      EUREKA_USERNAME: ${EUREKA_USERNAME:-eureka}
+      EUREKA_PASSWORD: ${EUREKA_PASSWORD:?run ./init-secrets.sh to create .env}
     networks:
       - ecommerce-network
     healthcheck:
@@ -305,7 +308,9 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://userdb:5432/userdb
       DB_USERNAME: useruser
       DB_PASSWORD: userpass
-      JWT_SECRET: ${JWT_SECRET:-myVerySecretJwtKeyThatIsAtLeast32CharactersLongForHS256}
+      JWT_SECRET: ${JWT_SECRET:?run ./init-secrets.sh to create .env}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?run ./init-secrets.sh to create .env}
     depends_on:
       userdb:
         condition: service_healthy
@@ -522,7 +527,7 @@ services:
       - "8080:8080"
     environment:
       <<: *java-env
-      JWT_SECRET: ${JWT_SECRET:-myVerySecretJwtKeyThatIsAtLeast32CharactersLongForHS256}
+      JWT_SECRET: ${JWT_SECRET:?run ./init-secrets.sh to create .env}
     depends_on:
       service-discovery:
         condition: service_healthy
@@ -574,7 +579,7 @@ services:
       - "3001:3000"
     environment:
       GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
-      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?run ./init-secrets.sh to create .env}
       GF_USERS_ALLOW_SIGN_UP: "false"
       GF_SERVER_ROOT_URL: http://localhost:3001
       GF_FEATURE_TOGGLES_ENABLE: traceqlEditor traceQLStreaming metricsSummary

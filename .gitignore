@@ -1,2 +1,4 @@
 docs-pdf/node_modules/
 dist/
+# generated secrets (init-secrets.sh): never commit
+.env

@@ -94,6 +94,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: java-env
+            - secretRef:
+                name: eureka-credentials
           env:
             - name: SPRING_DATASOURCE_URL
               value: jdbc:postgresql://userdb:5432/userdb
@@ -112,6 +114,12 @@ spec:
                 secretKeyRef:
                   name: platform-secrets
                   key: JWT_SECRET
+            # Seeds (or rotates the old default of) the admin account (S-3).
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: platform-secrets
+                  key: ADMIN_PASSWORD
           resources:
             requests:
               cpu: 100m
@@ -218,6 +226,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: java-env
+            - secretRef:
+                name: eureka-credentials
           env:
             - name: SPRING_DATASOURCE_URL
               value: jdbc:postgresql://productdb:5432/productdb
@@ -338,6 +348,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: java-env
+            - secretRef:
+                name: eureka-credentials
           env:
             # MongoDB: host instead of a JDBC URL; port, database name and
             # authSource=admin are defaults in the service's application.yaml.
@@ -466,6 +478,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: java-env
+            - secretRef:
+                name: eureka-credentials
           env:
             - name: SPRING_DATASOURCE_URL
               value: jdbc:postgresql://orderdb:5432/orderdb
@@ -592,6 +606,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: java-env
+            - secretRef:
+                name: eureka-credentials
           env:
             - name: SPRING_DATASOURCE_URL
               value: jdbc:postgresql://paymentdb:5432/paymentdb
@@ -718,6 +734,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: java-env
+            - secretRef:
+                name: eureka-credentials
           env:
             - name: SPRING_DATASOURCE_URL
               value: jdbc:postgresql://shippingdb:5432/shippingdb
@@ -837,6 +855,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: java-env
+            - secretRef:
+                name: eureka-credentials
           env:
             - name: SPRING_DATASOURCE_URL
               value: jdbc:postgresql://reviewdb:5432/reviewdb
@@ -956,6 +976,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: java-env
+            - secretRef:
+                name: eureka-credentials
           resources:
             requests:
               cpu: 100m
@@ -1071,6 +1093,8 @@ spec:
           envFrom:
             - configMapRef:
                 name: java-env
+            - secretRef:
+                name: eureka-credentials
           env:
             - name: JWT_SECRET
               valueFrom:

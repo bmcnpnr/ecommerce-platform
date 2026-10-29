@@ -25,6 +25,11 @@ case "$(uname -s)" in
   *) NET_ARGS=(--network host) ;;
 esac
 
+# Seeding products needs the admin (product writes are admin-only).
+if [ -z "${ADMIN_PASSWORD:-}" ] && [ -f "$DIR/../.env" ]; then
+  set -a; . "$DIR/../.env"; set +a
+fi
+
 RUN="reports/${SCRIPT%.js}-$PROFILE-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$DIR/$RUN"
 
@@ -32,5 +37,6 @@ mkdir -p "$DIR/$RUN"
 MSYS_NO_PATHCONV=1 docker run --rm -i "${NET_ARGS[@]}" \
   -v "$DIR:/scripts" -w /scripts \
   -e GW="$GW" -e PROFILE="$PROFILE" \
+  -e ADMIN_USERNAME="${ADMIN_USERNAME:-admin}" -e ADMIN_PASSWORD="${ADMIN_PASSWORD:-}" \
   "$K6_IMAGE" run --summary-export "$RUN/summary.json" "$SCRIPT" 2>&1 | tee "$DIR/$RUN/summary.txt"
 exit "${PIPESTATUS[0]}"

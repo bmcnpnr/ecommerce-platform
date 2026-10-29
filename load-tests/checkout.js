@@ -7,7 +7,7 @@
 //   PROFILE=load ./run-load.sh checkout.js
 import http from 'k6/http';
 import { check, sleep, group } from 'k6';
-import { GW, authHeaders, registerAndLogin, createProduct, scenarioFor } from './lib/api.js';
+import { GW, adminLogin, authHeaders, registerAndLogin, createProduct, scenarioFor } from './lib/api.js';
 
 const PROFILE = __ENV.PROFILE || 'smoke';
 
@@ -25,18 +25,17 @@ export const options = {
 };
 
 export function setup() {
-  const token = registerAndLogin('loadadmin');
-  return { productId: createProduct(token) };
+  return { productId: createProduct(adminLogin()) };
 }
 
-let token; // per-VU, survives iterations
+let customer; // per-VU, survives iterations
 
 export default function ({ productId }) {
-  if (!token) token = registerAndLogin('loadvu');
-  const auth = authHeaders(token);
+  if (!customer) customer = registerAndLogin('loadvu');
+  const auth = authHeaders(customer.token);
 
   group('checkout', () => {
-    const order = http.post(`${GW}/api/v1/orders?customerId=${__VU}`, null, { ...auth, tags: { name: 'create order' } });
+    const order = http.post(`${GW}/api/v1/orders?customerId=${customer.username}`, null, { ...auth, tags: { name: 'create order' } });
     if (!check(order, { 'create order 201': (r) => r.status === 201 })) return;
     const orderId = order.json('orderId');
 

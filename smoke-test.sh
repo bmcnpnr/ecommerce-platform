@@ -11,7 +11,17 @@
 #   ./smoke-test.sh              # against localhost:8080
 #   GW=http://host:8080 ./smoke-test.sh
 #
+# Product and catalog writes are admin-only, so the script logs in as the admin
+# too: ADMIN_USERNAME / ADMIN_PASSWORD from the environment, else from the .env
+# that init-secrets.sh generates next to this script.
+#
 set -uo pipefail
+
+if [ -z "${ADMIN_PASSWORD:-}" ] && [ -f "$(dirname "$0")/.env" ]; then
+  set -a; . "$(dirname "$0")/.env"; set +a
+fi
+ADMIN_USERNAME="${ADMIN_USERNAME:-admin}"
+ADMIN_PASSWORD="${ADMIN_PASSWORD:?set ADMIN_PASSWORD or run ./init-secrets.sh}"
 
 GW="${GW:-http://localhost:8080}"
 STAMP="$(date +%s)"
@@ -63,11 +73,24 @@ else
 fi
 AUTH="Authorization: Bearer $TOKEN"
 
+ADMIN_TOKEN=$(curl -s --max-time 30 -X POST -H 'Content-Type: application/json' \
+  -d "{\"username\":\"$ADMIN_USERNAME\",\"password\":\"$ADMIN_PASSWORD\"}" "$GW/api/v1/users/login" \
+  | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+if [ -n "$ADMIN_TOKEN" ]; then
+  printf '  \033[32mPASS\033[0m  %s\n' "admin login"; pass=$((pass+1))
+else
+  printf '  \033[31mFAIL\033[0m  %s\n' "admin login (check ADMIN_PASSWORD)"; fail=$((fail+1))
+fi
+ADMIN_AUTH="Authorization: Bearer $ADMIN_TOKEN"
+
 note "Gateway authentication enforcement"
 chk "authenticated request accepted" 200 "$(code -H "$AUTH" "$GW/api/v1/users/me")"
 chk "missing token rejected"         401 "$(code "$GW/api/v1/users/me")"
 chk "forged token rejected"          401 "$(code -H 'Authorization: Bearer not-a-real-token' "$GW/api/v1/users/me")"
 chk "wrong verb on a route"          405 "$(code -X GET -H "$AUTH" "$GW/api/v1/orders")"
+chk "customer cannot create a product" 403 "$(code -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+  -d '{"sku":"NOPE","name":"n","price":1,"stockQuantity":1}' "$GW/api/v1/products")"
+chk "internal endpoints are not routed" 404 "$(code -H "$ADMIN_AUTH" "$GW/api/v1/users/internal/admin")"
 
 note "Public reads routed through Eureka (lb://)"
 for path in products categories catalog; do
@@ -75,7 +98,7 @@ for path in products categories catalog; do
 done
 
 note "Order flow: Feign to product-service, Kafka on confirm"
-PRODUCT_ID=$(curl -s --max-time 30 -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+PRODUCT_ID=$(curl -s --max-time 30 -X POST -H "$ADMIN_AUTH" -H 'Content-Type: application/json' \
   -d "{\"sku\":\"$SKU\",\"name\":\"Smoke Test Widget\",\"description\":\"created by smoke-test.sh\",\"price\":19.99,\"stockQuantity\":100,\"brand\":\"ACME\"}" \
   "$GW/api/v1/products" | sed -n 's/.*"id":\([0-9]*\).*/\1/p' | head -1)
 if [ -n "$PRODUCT_ID" ]; then
@@ -84,7 +107,7 @@ else
   printf '  \033[31mFAIL\033[0m  %s\n' "create product"; fail=$((fail+1))
 fi
 
-ORDER_ID=$(curl -s --max-time 30 -X POST -H "$AUTH" "$GW/api/v1/orders?customerId=1" \
+ORDER_ID=$(curl -s --max-time 30 -X POST -H "$AUTH" "$GW/api/v1/orders?customerId=$USERNAME" \
   | sed -n 's/.*"orderId":\([0-9]*\).*/\1/p')
 if [ -n "$ORDER_ID" ]; then
   printf '  \033[32mPASS\033[0m  %-52s id=%s\n' "create order" "$ORDER_ID"; pass=$((pass+1))
@@ -98,13 +121,14 @@ chk "add item to order" 200 "$(code -X POST -H "$AUTH" -H 'Content-Type: applica
 chk "unknown product surfaces as client error" 404 "$(code -X POST -H "$AUTH" -H 'Content-Type: application/json' \
   -d '{"productId":999999,"quantity":1}' "$GW/api/v1/orders/$ORDER_ID/items")"
 chk "confirm order (publishes order.placed)" 200 "$(code -X POST -H "$AUTH" "$GW/api/v1/orders/$ORDER_ID/confirm")"
-chk "list orders by customer" 200 "$(code -H "$AUTH" "$GW/api/v1/orders/customer/1")"
+chk "list orders by customer" 200 "$(code -H "$AUTH" "$GW/api/v1/orders/customer/$USERNAME")"
+chk "another customer's orders are refused" 403 "$(code -H "$AUTH" "$GW/api/v1/orders/customer/$ADMIN_USERNAME")"
 
 # catalog-service is the MongoDB-backed read model: sync pulls the product over
 # Feign and upserts a document keyed by the product id; the reads below go
 # back through that document, so this covers the Mongo round trip end to end.
 note "Catalog read model (MongoDB): sync from product-service, then read back"
-chk "sync product into catalog"        200 "$(code -X POST -H "$AUTH" "$GW/api/v1/catalog/sync/$PRODUCT_ID")"
+chk "sync product into catalog"        200 "$(code -X POST -H "$ADMIN_AUTH" "$GW/api/v1/catalog/sync/$PRODUCT_ID")"
 chk "catalog entry by product id"      200 "$(code "$GW/api/v1/catalog/product/$PRODUCT_ID")"
 if curl -s --max-time 30 "$GW/api/v1/catalog/product/$PRODUCT_ID" | grep -q "\"productSku\":\"$SKU\""; then
   printf '  \033[32mPASS\033[0m  %-52s sku=%s\n' "catalog entry carries the synced product" "$SKU"; pass=$((pass+1))

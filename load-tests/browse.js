@@ -5,7 +5,7 @@
 //   PROFILE=load ./run-load.sh browse.js
 import http from 'k6/http';
 import { check, sleep, group } from 'k6';
-import { GW, registerAndLogin, createProduct, scenarioFor } from './lib/api.js';
+import { GW, adminLogin, createProduct, scenarioFor } from './lib/api.js';
 
 const PROFILE = __ENV.PROFILE || 'smoke';
 
@@ -24,8 +24,7 @@ export const options = {
 
 // One product synced into the catalog so the by-id and search reads hit real data.
 export function setup() {
-  const token = registerAndLogin('loadseed');
-  const productId = createProduct(token);
+  const productId = createProduct(adminLogin());
   http.post(`${GW}/api/v1/catalog/sync/${productId}`, null,
     { headers: { Authorization: `Bearer ${token}` }, tags: { name: 'catalog sync' } });
   return { productId };

@@ -13,7 +13,16 @@ export function authHeaders(token) {
   return { headers: { ...JSON_HEADERS, Authorization: `Bearer ${token}` } };
 }
 
-/** Registers a fresh user and returns its JWT. Fails the iteration on error. */
+/** Product writes are admin-only: run-load.sh passes ADMIN_USERNAME / ADMIN_PASSWORD from ../.env. */
+export function adminLogin() {
+  const username = __ENV.ADMIN_USERNAME || 'admin';
+  const res = http.post(`${GW}/api/v1/users/login`, JSON.stringify({ username, password: __ENV.ADMIN_PASSWORD }),
+    { headers: JSON_HEADERS, tags: { name: 'login' } });
+  check(res, { 'admin login 200': (r) => r.status === 200 }) || fail(`admin login ${res.status}: set ADMIN_PASSWORD`);
+  return res.json('token');
+}
+
+/** Registers a fresh user and returns its JWT and username. Fails the iteration on error. */
 export function registerAndLogin(prefix) {
   const username = `${prefix}${Date.now()}${Math.floor(Math.random() * 1e6)}`;
   const reg = http.post(`${GW}/api/v1/users/register`, JSON.stringify({
@@ -25,7 +34,7 @@ export function registerAndLogin(prefix) {
   const login = http.post(`${GW}/api/v1/users/login`, JSON.stringify({ username, password: PASSWORD }),
     { headers: JSON_HEADERS, tags: { name: 'login' } });
   check(login, { 'login 200': (r) => r.status === 200 }) || fail(`login ${login.status}`);
-  return login.json('token');
+  return { token: login.json('token'), username };
 }
 
 /** Creates a product with plenty of stock so checkout iterations never run dry. */
