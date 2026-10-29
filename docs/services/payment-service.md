@@ -5,14 +5,14 @@ payment-service records payments for orders and settles them against a simulated
 | | |
 |---|---|
 | Repository | `ecommerce-payment-service` |
-| Stack | Java 25 · Spring Boot 4.0.1 · Spring MVC · Spring Data JPA (Hibernate 7.2) · Flyway · spring-kafka 4.0 (producer only) · Spring Cloud 2025.1.1 Eureka client · springdoc-openapi 2.8.5 · Micrometer (Prometheus) + OpenTelemetry tracing · Lombok |
+| Stack | Java 25 · Spring Boot 4.0.9 · Spring MVC · Spring Data JPA (Hibernate 7.2) · Flyway · spring-kafka 4.0 (producer only) · Spring Cloud 2025.1.4 Eureka client · springdoc-openapi 2.8.5 · Micrometer (Prometheus) + OpenTelemetry tracing · Lombok |
 | Port | 8085 |
 | Eureka service ID | `payment-service` |
 | Gateway routes | `/api/v1/payments/**` (JWT required on every path) |
 | Data store | PostgreSQL 16 `paymentdb` (Flyway). docker-compose publishes it on host port 5436 |
 | Publishes | `payment.completed`, `payment.failed`, `payment.refunded` |
 | Consumes | None. A listener container factory is configured, but no `@KafkaListener` exists |
-| Calls | None. The service has no Feign or HTTP client |
+| Calls | `order-service` (Feign, `GET /internal/v1/orders/{id}`) before accepting a payment |
 | Called by | The frontend through the gateway: `CheckoutPage` creates and processes payments, `OrderDetailPage` reads by order. No service calls it synchronously |
 
 ## Responsibilities
@@ -25,7 +25,7 @@ payment-service records payments for orders and settles them against a simulated
 
 The service does not do the following:
 
-- It does not check that the order exists, belongs to the caller, can still be paid, or costs what the client says.
+- It does not own order data: it asks order-service whether the order exists, is `CONFIRMED`, belongs to the payer and costs exactly the amount sent.
 - It does not consume `order.placed`. Only notification-service consumes that topic.
 - It never starts a refund itself.
 - It stores no card data apart from the four digits the client sends in `cardLastFour`.
@@ -67,7 +67,7 @@ sequenceDiagram
 | Field | Column | Java type | REST JSON | Notes |
 |---|---|---|---|---|
 | `id` | `id` | `Long` | number | `BIGSERIAL` identity |
-| `orderId` | `order_id` | `Long` | number | Client-supplied, never verified |
+| `orderId` | `order_id` | `Long` | number | Client-supplied, verified against order-service |
 | `customerId` | `customer_id` | `String` | string | Client-supplied. The frontend sends the username |
 | `amount` | `amount` | `BigDecimal` | number | Client-supplied, at least 0.01. Stored as `NUMERIC(19,4)`, so values read back carry 4 decimals (`99.9800`) |
 | `currency` | `currency` | `String` | string | Defaults to `USD`. Accepts any string of at most 3 characters |
@@ -112,39 +112,37 @@ stateDiagram-v2
 
 ## Business rules
 
-1. **The client decides what is paid.** `PaymentService.initiatePayment()` copies `orderId`, `customerId`, `amount`, `currency`, `method` and `cardLastFour` from the request. The service never calls order-service. As a result:
-   - the amount is never compared with the order total;
-   - the order's existence, owner and status are never checked;
-   - `currency` defaults to `USD` when the request omits it.
-2. **Duplicate protection is partial.** `initiatePayment()` looks up the order's payment with `PaymentRepository.findByOrderId()`.
-   - It returns 409 (`Payment already completed for order: {orderId}`) only when that payment is `COMPLETED`.
-   - An existing `PENDING`, `FAILED` or `REFUNDED` payment does not block a new one, and `payments.order_id` has no unique constraint.
-   - `findByOrderId()` returns an `Optional`. Once an order has two rows, it throws `IncorrectResultSizeDataAccessException`. From then on, every `POST /api/v1/payments` and every `GET /api/v1/payments/order/{orderId}` for that order returns 500.
-3. **The method must match an enum name exactly.** `PaymentMethod.valueOf(request.getMethod())` is case-sensitive. Any other value raises `IllegalArgumentException`, which the exception handler turns into a 500.
-4. **Only `PENDING` payments can be processed.** For any other status, `processPayment()` throws `PaymentAlreadyProcessedException`, which returns 409 with `Payment already in status: {status}`. Each payment is processed once at most. The check is not safe against concurrent calls, because there is no row lock and no `@Version`.
+1. **The order decides what is paid.** `OrderVerifier` (called by `initiatePayment()`) asks order-service for the order: unknown is 404, not `CONFIRMED` is 409, owned by someone other than `customerId` is 403, `amount` different from `totalAmount` is 400, and an unreachable order-service is 503 (a payment is never accepted blind). `customerId` must be the caller's `X-Username` unless `ADMIN`. `currency` defaults to `USD`; it must match `^[A-Z]{3}$`, `cardLastFour` is exactly 4 digits, `amount` has at most 15 integer digits and 2 decimals.
+2. **One payment per order.** `payments.order_id` is unique (`V2`). `initiatePayment()` looks the payment up with `PaymentRepository.findByOrderId()`:
+   - `COMPLETED` is 409 (`Payment already completed for order: {orderId}`);
+   - a payment of another customer is 409, and `REFUNDED` or `PROCESSING` is 409;
+   - the same customer may retry only a `PENDING` or `FAILED` payment, which is reset and reused;
+   - a concurrent create is 409 (unique violation or version conflict), not 500.
+3. **The method must match an enum name exactly.** `PaymentMethod.valueOf(request.getMethod())` is case-sensitive. Any other value is 400 `Unsupported payment method: {method}`.
+4. **Only `PENDING` payments can be processed.** For any other status, `processPayment()` throws `PaymentAlreadyProcessedException`, which returns 409 with `Payment already in status: {status}`. Each payment is processed once at most. The `@Version` column (`V3`) makes a concurrent second call fail with 409, so only one event is published.
 5. **The gateway is a random draw.** `processPayment()` evaluates `ThreadLocalRandom.current().nextInt(10) < 8`. Eight of the ten equally likely values succeed, so 80 % of payments succeed and 20 % are declined. The amount, method and card make no difference. There is no external call, delay or retry.
    - **Success:** the status becomes `COMPLETED`. `transactionId` is set to `TXN-` followed by the first 8 hex digits of a random UUID in upper case (for example `TXN-1A2B3C4D`, 32 random bits). `updatedAt` is set to now. The service publishes `payment.completed`.
    - **Decline:** the status becomes `FAILED` and `failureReason` is set to the constant `Payment declined by gateway`. `transactionId` stays null and `updatedAt` is set to now. The service publishes `payment.failed`.
    - Both branches return HTTP 200. A decline is not an error status, so the caller has to read `status`.
 6. **No reader ever sees `PROCESSING`.** `processPayment()` sets `PROCESSING` and calls `save()`, then sets the final status in the same transaction. The entity is managed and nothing flushes in between. The only UPDATE written at commit therefore carries `COMPLETED` or `FAILED`.
-7. **Refunds.** `refundPayment()` accepts only `COMPLETED` payments. Any other status returns 400 with `Can only refund COMPLETED payments. Current: {status}`.
+7. **Refunds.** Admin only. `refundPayment()` accepts only `COMPLETED` payments. Any other status returns 400 with `Can only refund COMPLETED payments. Current: {status}`.
    - A refund is always for the full amount, because there is no amount parameter.
    - The status becomes `REFUNDED`, which is terminal. `transactionId` is kept.
    - `payment.refunded` carries the full `amount`.
-   - Only a client calling the endpoint starts a refund. No service calls it, and no frontend page uses the `useRefundPayment()` hook that is defined in `hooks/usePayments.ts`. Cancelling an order in order-service (`OrderService.cancelOrder()`) does not refund either.
+   - Only an admin calling the endpoint starts a refund. No service calls it, and no frontend page uses the `useRefundPayment()` hook that is defined in `hooks/usePayments.ts`. Cancelling an order in order-service (`OrderService.cancelOrder()`) does not refund either.
 8. **Events are sent from inside the transaction.** The service publishes after it changes the entity but before the transaction commits. The send is fire-and-forget (see [Events](#events)).
-9. **No endpoint checks the caller's identity.** See [Security and identity](#security-and-identity).
+9. **Authorization.** Owner-or-admin reads and process, admin-only refund. See [Security and identity](#security-and-identity).
 
 ## API
 
 | Method | Path | Gateway auth | Purpose |
 |---|---|---|---|
-| POST | `/api/v1/payments` | Bearer JWT | Create a `PENDING` payment |
+| POST | `/api/v1/payments` | Bearer JWT | Create a `PENDING` payment (caller's own `customerId`, order verified) |
 | GET | `/api/v1/payments/{id}` | Bearer JWT | Get a payment by id |
 | GET | `/api/v1/payments/order/{orderId}` | Bearer JWT | Get the payment of an order |
 | GET | `/api/v1/payments/customer/{customerId}` | Bearer JWT | List a customer's payments |
 | POST | `/api/v1/payments/{id}/process` | Bearer JWT | Run the simulated gateway |
-| POST | `/api/v1/payments/{id}/refund` | Bearer JWT | Refund a `COMPLETED` payment in full |
+| POST | `/api/v1/payments/{id}/refund` | `ADMIN` | Refund a `COMPLETED` payment in full |
 
 Full reference: [API reference](../api/payment-service.md).
 
@@ -174,7 +172,7 @@ Full reference: [API reference](../api/payment-service.md).
 | Class | `event/PaymentCompletedEvent.java` |
 | Trigger | `PaymentService.processPayment()`, success branch |
 | Key | `orderId` |
-| Consumers | **order-service** (group `order-service`, `messaging/PaymentEventConsumer.handlePaymentCompleted()`): sets the order to `PAID` whatever its current status, without checking the amount. **shipping-service** (group `shipping-service`): creates the shipment and publishes `shipment.created`. **notification-service** (group `notification-service`): sends a payment confirmation, which today is only a log line |
+| Consumers | **order-service** (group `order-service`, `messaging/PaymentEventConsumer.handlePaymentCompleted()`): sets a `CONFIRMED` order with a matching amount to `PAID`; otherwise it ignores the event. **shipping-service** (group `shipping-service`): creates the shipment and publishes `shipment.created`. **notification-service** (group `notification-service`): sends a payment confirmation, which today is only a log line |
 
 | Field | Java type | JSON | Value |
 |---|---|---|---|
@@ -196,7 +194,7 @@ Full reference: [API reference](../api/payment-service.md).
 | Class | `event/PaymentFailedEvent.java` |
 | Trigger | `PaymentService.processPayment()`, decline branch |
 | Key | `orderId` |
-| Consumers | **order-service** (group `order-service`, `handlePaymentFailed()`): sets the order to `CANCELLED`. **notification-service** (group `notification-service`) |
+| Consumers | **order-service** (group `order-service`, `handlePaymentFailed()`): cancels a `PENDING` or `CONFIRMED` order. **notification-service** (group `notification-service`) |
 
 | Field | Java type | JSON | Value |
 |---|---|---|---|
@@ -241,7 +239,7 @@ In particular, this service does not consume `order.placed`.
 
 ## Outbound calls
 
-None. The service has no Feign or HTTP client and no `spring-cloud-starter-openfeign` dependency. Because it never talks to order-service, it cannot verify the amount or the order.
+`OrderServiceClient` (Feign, `spring-cloud-starter-openfeign`) calls order-service's `GET /internal/v1/orders/{id}` through Eureka, with connect timeout 2 s and read timeout 5 s. `OrderVerifier` maps a 404 to `Order not found` and any other failure (connect, timeout, no instance, 5xx, undecodable body) to 503. The gateway does not route `/internal/`; the call goes directly.
 
 ## Persistence
 
@@ -250,7 +248,7 @@ The only table comes from the Flyway migration `src/main/resources/db/migration/
 | Column | Type | Constraints and default |
 |---|---|---|
 | `id` | `BIGSERIAL` | Primary key |
-| `order_id` | `BIGINT` | `NOT NULL`, indexed (`idx_payments_order_id`), **not unique** |
+| `order_id` | `BIGINT` | `NOT NULL`, indexed (`idx_payments_order_id`), unique (`uq_payments_order_id`, `V2`) |
 | `customer_id` | `VARCHAR(255)` | `NOT NULL`, indexed (`idx_payments_customer_id`) |
 | `amount` | `NUMERIC(19,4)` | `NOT NULL` |
 | `currency` | `VARCHAR(3)` | `NOT NULL DEFAULT 'USD'` |
@@ -266,7 +264,7 @@ The only table comes from the Flyway migration `src/main/resources/db/migration/
 erDiagram
     payments {
         bigint id PK "BIGSERIAL"
-        bigint order_id "NOT NULL, indexed, not unique"
+        bigint order_id "NOT NULL, unique"
         varchar customer_id "VARCHAR(255) NOT NULL, indexed"
         numeric amount "NUMERIC(19,4) NOT NULL"
         varchar currency "VARCHAR(3) NOT NULL DEFAULT USD"
@@ -282,29 +280,30 @@ erDiagram
 
 The entity and the migration differ in these places:
 
-- `order_id` has an index but no unique constraint. Nothing in the schema limits an order to one payment.
+- `order_id` is unique (`V2__unique_payment_order_id.sql`); `V3__payment_version.sql` adds the optimistic-locking `version` column (default 0).
 - `currency` is `NOT NULL DEFAULT 'USD'` in SQL but nullable in the entity. This does no harm because the service always sets it.
 - The SQL defaults for `status`, `created_at` and `updated_at` never apply, because Hibernate inserts every mapped column. `status` and `created_at` come from the entity's builder defaults, and `updated_at` is inserted as NULL.
 - `transaction_id` is `UNIQUE` but nullable. PostgreSQL allows any number of NULLs, so only completed payments compete for uniqueness.
 
 ## Security and identity
 
-The gateway requires a valid JWT on every `/api/v1/payments/**` path and then sets `X-Username`, `X-User-Id` and `X-User-Role`. This service reads none of those headers and has no Spring Security. No endpoint checks the caller's role or ownership:
+The gateway requires a valid JWT on every `/api/v1/payments/**` path (and role `ADMIN` for `POST /{id}/refund`) and then sets `X-Username`, `X-User-Id` and `X-User-Role`. `security/PaymentAccess` checks them before any work: no `X-Username` is 401 `Authentication required`, someone else's payment is 403 `Access denied`; the role is compared exactly with `ADMIN`.
 
-| Endpoint | What any authenticated user can do |
+| Endpoint | Rule |
 |---|---|
-| `POST /api/v1/payments` | Create a payment for any order id, under any `customerId`, for any amount of at least 0.01 |
-| `GET /api/v1/payments/{id}` | Read any payment. Ids are sequential |
-| `GET /api/v1/payments/order/{orderId}` | Read the payment of any order |
-| `GET /api/v1/payments/customer/{customerId}` | List any customer's payments, including amounts and card last-four digits |
-| `POST /api/v1/payments/{id}/process` | Settle someone else's pending payment |
-| `POST /api/v1/payments/{id}/refund` | Refund someone else's completed payment |
+| `POST /api/v1/payments` | `customerId` must equal `X-Username` (or `ADMIN`); the order must be the payer's |
+| `GET /api/v1/payments/{id}` | owner or `ADMIN` |
+| `GET /api/v1/payments/order/{orderId}` | owner of the order's payment, or `ADMIN` |
+| `GET /api/v1/payments/customer/{customerId}` | that customer or `ADMIN` |
+| `POST /api/v1/payments/{id}/process` | owner or `ADMIN` |
+| `POST /api/v1/payments/{id}/refund` | `ADMIN` only |
 
 Other points:
 
-- `customerId` is whatever the client sends. The frontend sends the username, both when creating a payment (`CheckoutPage.tsx`) and when listing them (`useCustomerPayments()` in `hooks/usePayments.ts`).
-- docker-compose publishes port 8085 on the host, so the whole API is also reachable without a token at `http://localhost:8085`.
-- The OpenAPI document declares a global `bearerAuth` scheme (`config/OpenApiConfig.java`). It is documentation only and the service does not enforce it.
+- The frontend sends the username as `customerId`, both when creating a payment (`CheckoutPage.tsx`) and when listing them (`useCustomerPayments()` in `hooks/usePayments.ts`).
+- docker-compose publishes port 8085 on the host, so a direct call can forge the identity headers.
+- Errors use fixed messages; responses carry `nosniff` and `no-store`; `X-Correlation-Id` is kept only if it matches `^[A-Za-z0-9._-]{1,64}$`; `/actuator/serviceregistry` answers 403 to non-loopback callers.
+- The OpenAPI document declares a global `bearerAuth` scheme (`config/OpenApiConfig.java`) for Swagger UI.
 
 ## Configuration
 
@@ -325,7 +324,7 @@ Other points:
 | `eureka.instance.prefer-ip-address` | | `true` | |
 | `eureka.instance.lease-renewal-interval-in-seconds` / `lease-expiration-duration-in-seconds` | | `5` / `15` | A crashed instance leaves the registry in about 20 s |
 | `management.endpoints.web.exposure.include` | | `health,info,metrics,prometheus,circuitbreakers,serviceregistry` | `circuitbreakers` has no effect because resilience4j is not on the classpath |
-| `management.endpoint.health.show-details` | | `always` | |
+| `management.endpoint.health.show-details` | | `never` | |
 | `management.endpoint.prometheus.access` | | `unrestricted` | |
 | `management.metrics.tags.application` / `environment` | `ENVIRONMENT` (environment only) | `payment-service` / `development` | Common metric tags |
 | `management.metrics.distribution.percentiles-histogram.http.server.requests` | | `true` | |
@@ -404,11 +403,7 @@ The pacts check types only, so the provider may add fields. Run only the contrac
 
 Because the file sits under `src/main`, it is packaged into the production jar. H2 is a test-scoped dependency and is not, so starting a deployed container with the `test` profile would fail.
 
-**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
-
-- `PaymentFlowIT.initiateTwiceForSameOrder_keepsOrderLookupWorking`: `payments.order_id` is not unique, so a retry after a failed payment adds a second row, and then `GET /payments/order/{id}` and further initiates return 500 (I-6).
-- `GlobalExceptionHandlerTest`: a non-JSON body returns 500 instead of 415, and an unknown URL 500 instead of 404 (A-4).
-- `PaymentFlowIT.initiate_unknownMethod_returns400`: an unknown `method` makes `PaymentMethod.valueOf` throw, returned as 500 (A-4).
+No tests are disabled for bugs any more; the `@Tag("security")` suite covers ownership, order verification, validation, takeover and races.
 
 **Gaps:** the unit and pact tests run on H2 with Flyway disabled, but the `*IT` classes run the migration on Postgres. Concurrent payments for one order are not tested.
 
@@ -428,6 +423,7 @@ Paths are relative to `src/main/java/com/ecommerce/payment/`.
 | `repository/PaymentRepository` | Spring Data JPA: `findByOrderId`, `findByCustomerId`, `findByTransactionId` (unused) |
 | `exception/*` | Domain exceptions, `ErrorResponse`, `GlobalExceptionHandler` |
 | `filter/CorrelationIdFilter` | `X-Correlation-Id` handling and MDC |
+| `security/PaymentAccess`, `service/OrderVerifier`, `client/OrderServiceClient` | ownership checks; order verification over Feign |
 | `config/KafkaProducerConfig` | Producer factory and template. The consumer factory and listener factory here are unused |
 | `config/OpenApiConfig` | OpenAPI title and the `bearerAuth` scheme |
 | `src/main/resources/db/migration/V1__create_payments.sql` | Schema |
@@ -436,16 +432,16 @@ Paths are relative to `src/main/java/com/ecommerce/payment/`.
 
 | Issue | Where | Impact | Severity |
 |---|---|---|---|
-| The amount, currency and customer come from the client and are never checked against the order. order-service then marks the order `PAID` on any `payment.completed` without comparing the amount or looking at its current status | `PaymentService.initiatePayment()`. order-service `messaging/PaymentEventConsumer.handlePaymentCompleted()` | A user can pay 0.01 for any order, and the order becomes `PAID` and is shipped. A payment on an order that is already `CANCELLED` (for example after a declined payment) turns it back into `PAID` | High |
-| No authorization or ownership checks, and no `X-User-*` headers are read | `controller/PaymentController.java` (all endpoints) | Any logged-in user can refund or process any payment and read every payment, including other customers' card last-four digits. Port 8085 is also open on the host without any auth | High |
-| Duplicate protection only rejects when a `COMPLETED` payment exists, and `order_id` is not unique | `PaymentService.initiatePayment()`, `V1__create_payments.sql` | Two `PENDING` payments for one order (or two concurrent creates) can both complete. That is a double charge, and order-service and notification-service each process `payment.completed` twice. shipping-service drops the duplicate | Medium |
-| A second payment row for an order breaks `findByOrderId()`, which returns an `Optional` | `PaymentRepository.findByOrderId()` | `GET /api/v1/payments/order/{orderId}`, which `OrderDetailPage` uses, and any further `POST /api/v1/payments` for that order return 500 | Medium |
-| `processPayment()` has no lock and no `@Version` | `PaymentService.processPayment()` | Concurrent calls on the same `PENDING` payment both run the draw and both publish. One payment can emit both `payment.completed` and `payment.failed`, and the last commit decides the stored status | Medium |
+| ~~Amount, currency and customer never checked against the order~~ | fixed | see the security fix spec | — |
+| ~~No authorization or ownership checks~~ | fixed | see the security fix spec | — |
+| ~~Duplicate protection only rejects when a `COMPLETED` payment exists~~ | fixed | see the security fix spec | — |
+| ~~A second payment row for an order breaks `findByOrderId()`~~ | fixed | see the security fix spec | — |
+| ~~`processPayment()` has no lock and no `@Version`~~ | fixed | see the security fix spec | — |
 | Events are sent inside the DB transaction, fire-and-forget, with no outbox | `PaymentService` (all three publishes), `PaymentEventProducer` | If the commit fails after the send, consumers receive an event for a change that never happened. If the send fails after the commit, the event is lost and only logged | Medium |
 | A declined payment returns 200, and the checkout never reads `status` | `PaymentController.processPayment()`. Frontend `pages/checkout/CheckoutPage.tsx` `handlePlaceOrder` | The user sees "Order placed successfully!" while order-service cancels the order | Medium |
 | Nothing acts on refunds. Only notification-service consumes `payment.refunded`, and cancelling an order does not refund | `PaymentEventProducer.publishRefunded()`. order-service `OrderService.cancelOrder()` | A refunded order stays `PAID` and its shipment continues. A cancelled `PAID` order keeps its money | Medium |
-| An invalid `method` returns 500 instead of 400. Unmapped framework exceptions (unknown path, `NoResourceFoundException`; wrong `Content-Type`, `HttpMediaTypeNotSupportedException`) also end in the catch-all as 500 | `PaymentService.initiatePayment()` (`PaymentMethod.valueOf`), `GlobalExceptionHandler.general()` | Client errors look like server faults and are logged at ERROR with a stack trace | Low |
-| Weak input validation: `currency` accepts any string of 3 characters or fewer, including an empty one. `cardLastFour` is not checked to be digits. `customerId` longer than 255 characters or `amount` beyond `NUMERIC(19,4)` fail in the database | `dto/InitiatePaymentRequest.java` | Bad data is stored, and some inputs return 500 | Low |
+| ~~Invalid `method` and unmapped client errors return 500~~ | fixed | see the security fix spec | — |
+| ~~Weak input validation~~ | fixed | see the security fix spec | — |
 | `transactionId` has only 32 random bits, and its `UNIQUE` violation would surface at commit, after `payment.completed` has been sent | `PaymentService.processPayment()` | A rare 500 together with an event for a payment that the database rolled back | Low |
 | `PROCESSING` is never persisted | `PaymentService.processPayment()` | This enum value can never be observed | Low |
 | Dead code and configuration: the consumer factory and the listener container factory (no listener exists); `PaymentRepository.findByTransactionId()`; `circuitbreakers` exposure without resilience4j | `config/KafkaProducerConfig.java`, `application.yaml` | Misleading to readers | Low |

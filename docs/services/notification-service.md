@@ -12,7 +12,7 @@ gateway route.
 | | |
 |---|---|
 | Repository | `ecommerce-notification-service` |
-| Stack | Java 25 · Spring Boot 4.0.1 · spring-kafka 4.0.1 (kafka-clients 4.1.1, Jackson 3 `JacksonJsonDeserializer`) · Spring MVC (serves only actuator) · Eureka client · Micrometer and OpenTelemetry · Lombok |
+| Stack | Java 25 · Spring Boot 4.0.9 · spring-kafka 4.0.1 (kafka-clients 4.1.1, Jackson 3 `JacksonJsonDeserializer`) · Spring MVC (serves only actuator) · Eureka client · Micrometer and OpenTelemetry · Lombok |
 | Port | 8088 (actuator only) |
 | Eureka service ID | `notification-service`. It registers, but nothing looks it up. |
 | Gateway routes | — |
@@ -214,7 +214,7 @@ order-service always sends it.
 
 #### Log lines
 
-What `NotificationService` writes at INFO, one line per record:
+What `NotificationService` writes at INFO, one line per record. Every event field goes through `logging/LogSanitizer` first: control characters (CR, LF, U+2028/2029) are stripped and each value is capped at 256 characters, so a forged event cannot write fake log lines or flood the log.
 
 | Topic | Method | Message |
 |---|---|---|
@@ -354,7 +354,7 @@ None. The service is stateless. The only state is the committed offsets of group
 
 - There is no application API, so the service reads no `X-User-*` headers and makes no authorization decisions.
 - It trusts whatever is on its topics. The broker's listeners are `PLAINTEXT` with no authentication, and compose publishes port 9092 on the host (advertised as `localhost:9092`). Any local process can publish fake events, or a record that blocks a topic (see [Failure handling](#failure-handling)).
-- The actuator on port 8088, also published by compose, is unauthenticated: full health details, metrics, and `serviceregistry`, which can change the instance's Eureka status (harmless here, since nothing routes to it).
+- The actuator on port 8088, also published by compose, is unauthenticated: status-only health, metrics, and `serviceregistry`, which answers 403 to non-loopback callers (`filter/ActuatorServiceRegistryFilter`; the `preStop` hook calls it on localhost).
 - The log lines contain customer IDs, order IDs, amounts and tracking numbers.
 
 ## Configuration
@@ -374,7 +374,7 @@ and the shared `x-java-env` variables; Kubernetes gets the same from the
 | `eureka.instance.prefer-ip-address` | `EUREKA_INSTANCE_PREFER_IP_ADDRESS` (k8s) | `true` | |
 | `eureka.instance.lease-renewal-interval-in-seconds` / `lease-expiration-duration-in-seconds` | — | `5` / `15` | |
 | `management.endpoints.web.exposure.include` | — | `health,info,metrics,prometheus,circuitbreakers,serviceregistry` | `circuitbreakers` does nothing here (no resilience4j); `serviceregistry` is used by the Kubernetes `preStop` hook |
-| `management.endpoint.health.show-details` | — | `always` | |
+| `management.endpoint.health.show-details` | — | `never` | |
 | `management.endpoint.health.probes.enabled` | `MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED` | Boot default; k8s sets `true` | liveness and readiness groups for the probes |
 | `management.metrics.tags.application` / `environment` | `ENVIRONMENT` | `notification-service` / `development` | |
 | `management.metrics.distribution.*` (`http.server.requests`) | — | percentile histogram; SLO 50 ms to 2 s | only actuator traffic reaches this server |
@@ -390,7 +390,7 @@ accept connections.
 
 ## Observability
 
-- **Actuator**: `health` (with details), `info`, `metrics`, `prometheus`, `serviceregistry`. There is no Kafka health indicator, so health stays `UP` while a consumer is stuck in a poison-pill loop or the broker is down. Liveness and readiness probes would not restart it, and a restart would not help anyway.
+- **Actuator**: `health` (status only), `info`, `metrics`, `prometheus`, `serviceregistry` (403 for non-loopback callers). There is no Kafka health indicator, so health stays `UP` while a consumer is stuck in a poison-pill loop or the broker is down. Liveness and readiness probes would not restart it, and a restart would not help anyway.
 - **Metrics**: Prometheus scrapes `notification-service:8088/actuator/prometheus`. Besides JVM and HTTP metrics, spring-kafka times each listener invocation as `spring.kafka.listener` (tagged with the container name and `result`). A record that fails deserialization never reaches the listener, so it does not show up there. The Kafka client's own metrics are not bound to Micrometer.
 - **Consumer lag**: `kafka-exporter` exports `kafka_consumergroup_lag{consumergroup="notification-service", topic=...}`. Grafana's Kafka dashboard (`05-kafka.json`) shows it, and `kafka-alerts.yml` alerts at a lag above 1000 (warning) or 10000 (critical) for 5 minutes. At development traffic a blocked partition stays far below those thresholds, so a poison pill does not alert. Its symptom is the log volume.
 - **Logs**: one `[NOTIFICATION]` line per event (see [Log lines](#log-lines)). `%X{correlationId}` is always empty: nothing sets it, and Kafka listener threads have no request context.

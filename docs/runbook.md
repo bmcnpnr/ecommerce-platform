@@ -160,10 +160,17 @@ Kubernetes: `kubectl -n ecommerce exec -it userdb-0 -- psql -U useruser userdb`.
 The gateway and user-service must change **together**. Every issued token
 becomes invalid, so users have to log in again.
 
-- Compose: put `JWT_SECRET=<at least 32 random characters>` in `ecommerce-platform/.env`, then run `docker compose up -d user-service api-gateway`.
-- Kubernetes: change `JWT_SECRET` in the `platform-secrets` Secret (`k8s/01-secrets.yaml`), run `kubectl apply -k k8s/`, then `kubectl -n ecommerce rollout restart deployment/user-service deployment/api-gateway`.
+The secret lives only in the git-ignored `ecommerce-platform/.env` and must be at
+least 64 bytes; both services refuse to start otherwise.
 
-Generate one with `openssl rand -base64 48`.
+1. Delete the `JWT_SECRET=` line from `.env` and run `./init-secrets.sh`, which generates a new one and leaves every other value alone.
+2. Compose: `docker compose up -d user-service api-gateway`.
+3. Kubernetes: `k8s/deploy.sh` (recreates `platform-secrets` from `.env`), then `kubectl -n ecommerce rollout restart deployment/user-service deployment/api-gateway`.
+
+The same steps rotate `ADMIN_PASSWORD`, `EUREKA_PASSWORD` (restart every Java
+service) and `GRAFANA_ADMIN_PASSWORD` (`deploy.sh` resets Grafana's stored one).
+An existing admin account keeps its password when `ADMIN_PASSWORD` changes;
+change it through the API or delete the account first.
 
 ### Scale a service
 

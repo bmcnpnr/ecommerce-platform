@@ -8,7 +8,7 @@ Service overview: [catalog-service](../services/catalog-service.md).
 
 **Content type.** The only request body (`PATCH`) is `application/json`. Every response is `application/json`.
 
-**Authentication.** Enforced only by the gateway. `GET` requests under `/api/v1/catalog` are public. `POST /api/v1/catalog/sync/{productId}` and `PATCH /api/v1/catalog/product/{productId}` need `Authorization: Bearer <JWT>`; without a valid token the gateway answers `401` with an empty body. A token of any role is accepted: the service performs no role or ownership check, and requests sent directly to port 8083 need no token. See the [product-service API reference](product-service.md#conventions) for obtaining a token.
+**Authentication.** `GET` requests under `/api/v1/catalog` are public. `POST /api/v1/catalog/sync/{productId}` and `PATCH /api/v1/catalog/product/{productId}` are admin-only: the gateway answers `401` with an empty body without a valid token and `403` unless the role is exactly `ADMIN`; the service checks again (`401` `Authentication required` without `X-Username`, `403` `Access denied` unless `X-User-Role` is `ADMIN`). Requests sent directly to port 8083 skip the gateway. Responses carry `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`; an incoming `X-Correlation-Id` is kept only if it matches `^[A-Za-z0-9._-]{1,64}$`. See the [product-service API reference](product-service.md#conventions) for obtaining a token.
 
 **Error body.** Every error produced by the service has this shape (`exception/ErrorResponse.kt`). `fieldErrors` is always present and, in practice, always empty:
 
@@ -30,14 +30,18 @@ Service overview: [catalog-service](../services/catalog-service.md).
 |---|---|---|---|
 | `CatalogEntryNotFoundException` | 404 | `Not Found` | `Catalog entry not found for product <productId>` |
 | `OptimisticLockingFailureException`, `DuplicateKeyException` | 409 | `Conflict` | `The catalog entry was modified concurrently; re-read it and retry` |
-| `MethodArgumentNotValidException` | 400 | `Validation Failed` | `Request validation failed` (unreachable: no endpoint uses `@Valid`) |
+| `MethodArgumentNotValidException` | 400 | `Validation Failed` | `Request validation failed`, with `fieldErrors` (the `PATCH` body) |
+| `UnauthorizedException` | 401 | `Unauthorized` | `Authentication required` |
+| `ForbiddenException` | 403 | `Forbidden` | `Access denied` |
+| invalid request | 400 | `Bad Request` | `Page size must be between 1 and 100`, `Invalid value for parameter '<name>'`, `Missing required parameter '<name>'`, `Malformed request body` |
+| wrong method / content type / `Accept` / unmapped path | 405 / 415 / 406 / 404 | | `Method not allowed` / `Unsupported media type` / `Not acceptable` / `Resource not found` |
+| `FeignException.NotFound` (sync of an unknown product) | 404 | `Not Found` | `Product not found in product-service` |
 | anything else | 500 | `Internal Server Error` | `An unexpected error occurred` (logged at ERROR) |
 
 "Anything else" covers:
 
-- failures of the Feign calls during a sync: product-service answering 404 for an unknown product, any other 4xx or 5xx, no registered instance (503 from the load balancer), connection failures after three attempts, read timeouts after 10 s;
-- malformed requests: `search` without `q` (`MissingServletRequestParameterException`), a non-numeric path variable, `page` or `size` (`MethodArgumentTypeMismatchException`), a missing or malformed `PATCH` body (`HttpMessageNotReadableException`), a wrong HTTP method (`HttpRequestMethodNotSupportedException`), an unsupported `Content-Type`, and paths that match no endpoint;
-- `page < 0` or `size < 1` on the paged endpoints (`PageRequest.of` throws `IllegalArgumentException`).
+- failures of the Feign calls during a sync: product-service answering any other 4xx or 5xx, no registered instance (503 from the load balancer), connection failures after three attempts, read timeouts after 10 s;
+- nothing client-caused: malformed requests, `page < 0`, `size` outside 1 to 100 and a NUL byte in `q` are `400`.
 
 **Pagination.** `GET /api/v1/catalog` and `GET /api/v1/catalog/search` take two plain integer parameters, `page` (default `0`, zero-based, must be at least 0) and `size` (default `20`, must be at least 1, no upper limit). There is no `sort` parameter: search results come ranked by text score or, in the fallback, in natural order; browse is in natural order. The response is a Spring Data `Page` serialized directly, the same shape as product-service's ([Page](product-service.md#page)):
 
@@ -83,8 +87,8 @@ Service overview: [catalog-service](../services/catalog-service.md).
 | GET | `/api/v1/catalog/category/{categoryId}` | Public | none | Entries of one category |
 | GET | `/api/v1/catalog/featured` | Public | none | Featured entries |
 | GET | `/api/v1/catalog/product/{productId}` | Public | none | Entry by product id |
-| POST | `/api/v1/catalog/sync/{productId}` | Bearer JWT | none | Pull a product from product-service and create or refresh its entry |
-| PATCH | `/api/v1/catalog/product/{productId}` | Bearer JWT | none | Set `featured`, `imageUrl`, `price` |
+| POST | `/api/v1/catalog/sync/{productId}` | `ADMIN` | `ADMIN` | Pull a product from product-service and create or refresh its entry |
+| PATCH | `/api/v1/catalog/product/{productId}` | `ADMIN` | `ADMIN`; validated body | Set `featured`, `imageUrl`, `price` |
 
 ## GET /api/v1/catalog/search
 
@@ -96,14 +100,14 @@ Searches the catalog. When `q` is not blank, MongoDB `$text` runs over `productN
 
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
-| `q` | query | string | yes | — | Passed to `$search` unchanged, so `"a phrase"` and `-excluded` work. Missing: 500. Empty matches every entry. |
-| `page` | query | integer | no | `0` | At least 0, otherwise 500. |
-| `size` | query | integer | no | `20` | At least 1, otherwise 500. No maximum. |
+| `q` | query | string | yes | — | Passed to `$search` unchanged, so `"a phrase"` and `-excluded` work. Missing: 400. Empty matches every entry. A NUL byte is 400. |
+| `page` | query | integer | no | `0` | At least 0, otherwise 400. |
+| `size` | query | integer | no | `20` | 1 to 100, otherwise 400. |
 
 **Responses**
 
 - `200 OK` with a [`Page`](#page) of [`CatalogEntryDTO`](#catalogentrydto).
-- `500` when `q` is missing, or `page`/`size` are out of range or not numbers.
+- `400` when `q` is missing, or `page`/`size` are out of range or not numbers.
 
 **Side effects:** none. Reads only MongoDB.
 
@@ -127,12 +131,12 @@ Returns a page of all catalog entries, in MongoDB's natural order (no sort).
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
 | `page` | query | integer | no | `0` | At least 0. |
-| `size` | query | integer | no | `20` | At least 1; no maximum. |
+| `size` | query | integer | no | `20` | 1 to 100. |
 
 **Responses**
 
 - `200 OK` with a [`Page`](#page) of [`CatalogEntryDTO`](#catalogentrydto).
-- `500` for `page < 0`, `size < 1` or non-numeric values.
+- `400` for `page < 0`, `size` outside 1 to 100 or non-numeric values.
 
 **Side effects:** none.
 
@@ -152,7 +156,7 @@ Returns every entry whose `categoryId` equals the given id, as a plain list (not
 
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
-| `categoryId` | path | integer (int64) | yes | — | Numeric, otherwise 500. |
+| `categoryId` | path | integer (int64) | yes | — | Numeric, otherwise 400. |
 
 **Responses**
 
@@ -194,7 +198,7 @@ Returns the catalog entry of one product.
 
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
-| `productId` | path | integer (int64) | yes | — | Numeric, otherwise 500. |
+| `productId` | path | integer (int64) | yes | — | Numeric, otherwise 400. |
 
 **Responses**
 
@@ -240,13 +244,13 @@ What it does:
 4. Loads the entry. If it exists, overwrites the fields above and `updatedAt`, keeping `featured`, `imageUrl` and `createdAt`; a price set earlier through `PATCH` is replaced. If not, inserts a new entry with `featured: false` and `imageUrl: null`.
 5. Saves with a version check. If another write won the race, steps 4 and 5 are repeated (up to 5 attempts in total, with a short random back-off); the product is not fetched again.
 
-**Auth:** Bearer JWT at the gateway (any role); no service-side checks. The OpenAPI summary says "Admin", but nothing enforces it.
+**Auth:** `ADMIN`.
 
 **Path parameters**
 
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
-| `productId` | path | integer (int64) | yes | — | Must exist in product-service, otherwise 500. |
+| `productId` | path | integer (int64) | yes | — | Must exist in product-service, otherwise 404. |
 
 **Request body:** none.
 
@@ -254,7 +258,8 @@ What it does:
 
 - `200 OK` with the saved [`CatalogEntryDTO`](#catalogentrydto), for a first sync as well as a refresh.
 - `409` `The catalog entry was modified concurrently; re-read it and retry` after five lost races.
-- `500` `An unexpected error occurred` when the product does not exist in product-service (its 404 is not mapped), when product-service is unreachable or has no registered instance, when it does not answer within 10 s, or when it answers with an error.
+- `404` `Product not found in product-service`.
+- `500` `An unexpected error occurred` when product-service is unreachable or has no registered instance, when it does not answer within 10 s, or when it answers with an error.
 
 **Side effects:** two Feign calls to product-service; one insert or one versioned update in `catalog_entries`; log line `Synced catalog entry for product <productId>`. No events.
 
@@ -266,13 +271,13 @@ curl -s -X POST http://localhost:8080/api/v1/catalog/sync/1 -H "Authorization: B
 
 ## PATCH /api/v1/catalog/product/{productId}
 
-Updates the catalog-owned fields of an existing entry. Each non-null field is applied; a `null` or absent field is left unchanged (so `imageUrl` cannot be cleared). `featured: false` is applied, because `false` is not `null`. An empty object only updates `updatedAt`. The body is not validated.
+Updates the catalog-owned fields of an existing entry. Each non-null field is applied; a `null` or absent field is left unchanged (an empty `imageUrl` clears it). `featured: false` is applied, because `false` is not `null`. An empty object only updates `updatedAt`. The body is validated (below).
 
 The write is version-checked. If another write changed the entry between this request's read and its write, the request fails with 409 and nothing is written; it is not retried. The version is not exposed, so the check cannot detect changes made since the client's own earlier read.
 
 A price set here lasts only until the next sync of the product, which replaces it with product-service's price.
 
-**Auth:** Bearer JWT at the gateway (any role); no service-side checks. The OpenAPI summary says "Admin", but nothing enforces it.
+**Auth:** `ADMIN`.
 
 **Path parameters**
 
@@ -285,19 +290,19 @@ A price set here lasts only until the next sync of the product, which replaces i
 | Field | Type | Required | Validation | Notes |
 |---|---|---|---|---|
 | `featured` | boolean | no | none | |
-| `imageUrl` | string | no | none | Any string is stored. |
-| `price` | number | no | none | Rounded half-up to two decimals. Zero and negative values are accepted. |
+| `imageUrl` | string | no | `@Size(max = 2048)`; `@Pattern` absolute `http(s)` URL | `javascript:`, `data:`, `file:` and protocol-relative URLs are 400. An empty string clears the image; `null` leaves it. |
+| `price` | number | no | `@DecimalMin("0", exclusive)` "price must be greater than 0"; `@Digits(15, 2)` | Zero, negative values and more than 2 decimals are 400. |
 
 ```json
-{ "featured": true, "imageUrl": "https://cdn.example.com/img/sku-001.png", "price": 44.995 }
+{ "featured": true, "imageUrl": "https://cdn.example.com/img/sku-001.png", "price": 44.99 }
 ```
 
 **Responses**
 
-- `200 OK` with the updated [`CatalogEntryDTO`](#catalogentrydto) (here `"price": 45.00`).
+- `200 OK` with the updated [`CatalogEntryDTO`](#catalogentrydto) (here `"price": 44.99`).
 - `404` `Catalog entry not found for product <productId>`.
 - `409` `The catalog entry was modified concurrently; re-read it and retry`.
-- `500` for a missing or malformed body or a non-numeric `productId`.
+- `400` for a validation failure (`fieldErrors`), a missing or malformed body or a non-numeric `productId`.
 
 **Side effects:** one versioned update of the entry. No events; product-service is not called.
 

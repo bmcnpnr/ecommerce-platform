@@ -5,10 +5,10 @@ catalog-service is a read model of product-service for catalog browsing. It keep
 | | |
 |---|---|
 | Repository | `ecommerce-catalog-service` |
-| Stack | Kotlin 2.3.0 on Java 25 · Spring Boot 4.0.1 · Spring MVC · Spring Data MongoDB 5.0.1 · Spring Cloud OpenFeign 5.0.1 (Apache HttpClient 5) · Spring Cloud LoadBalancer + Eureka client · Jackson 3 · springdoc-openapi 2.8.5 · Micrometer + OpenTelemetry |
+| Stack | Kotlin 2.3.0 on Java 25 · Spring Boot 4.0.9 · Spring MVC · Spring Data MongoDB 5.0.1 · Spring Cloud OpenFeign 5.0.1 (Apache HttpClient 5) · Spring Cloud LoadBalancer + Eureka client · Jackson 3 · springdoc-openapi 2.8.5 · Micrometer + OpenTelemetry |
 | Port | 8083 |
 | Eureka service ID | `catalog-service` |
-| Gateway routes | `/api/v1/catalog/**` (GET is public, POST and PATCH need a JWT) |
+| Gateway routes | `/api/v1/catalog/**` (GET is public, POST and PATCH need an `ADMIN` JWT) |
 | Data store | MongoDB 8.0 `catalogdb`, collection `catalog_entries`; no migration tool, indexes and backfills run at startup (`CatalogCollectionInitializer`) |
 | Publishes | — |
 | Consumes | — |
@@ -127,8 +127,8 @@ sequenceDiagram
 | GET | `/api/v1/catalog/category/{categoryId}` | Public | Entries of one category (list) |
 | GET | `/api/v1/catalog/featured` | Public | Featured entries (list) |
 | GET | `/api/v1/catalog/product/{productId}` | Public | Entry by product id |
-| POST | `/api/v1/catalog/sync/{productId}` | Bearer JWT | Pull the product from product-service and create or refresh its entry |
-| PATCH | `/api/v1/catalog/product/{productId}` | Bearer JWT | Set `featured`, `imageUrl`, `price` |
+| POST | `/api/v1/catalog/sync/{productId}` | `ADMIN` | Pull the product from product-service and create or refresh its entry |
+| PATCH | `/api/v1/catalog/product/{productId}` | `ADMIN` | Set `featured`, `imageUrl`, `price` |
 
 No endpoint performs a service-side role or ownership check. Full reference: [API reference](../api/catalog-service.md).
 
@@ -161,7 +161,7 @@ Client `client/ProductServiceClient.kt`: `@FeignClient(name = "product-service",
 | Message converters | `ThreadSafeFeignHttpMessageConverters` | `config/FeignConfig.kt`. Spring Cloud OpenFeign 5.0.1's `FeignHttpMessageConverters` builds its converter list lazily without synchronisation: it publishes an empty `ArrayList` and fills it afterwards, so when the first Feign calls of a fresh JVM arrive concurrently a second thread can see the empty list and `SpringDecoder` fails with `DecodeException: 'messageConverters' must not be empty` (a 500 for that caller). The subclass makes the first initialisation mutually exclusive (double-checked on a `@Volatile` flag) and reads stay lock-free afterwards. The bean replaces the library's `@ConditionalOnMissingBean` bean; the per-client child contexts see the parent bean and skip their own. |
 | Circuit breaker | none active | See below. |
 | Fallback | `ProductServiceClientFallback`, never invoked | See below. |
-| Error mapping | none | Every `FeignException` and every exhausted retry reaches the catch-all handler: 500. |
+| Error mapping | `FeignException.NotFound` only | A product-service 404 becomes 404 `Product not found in product-service`; every other `FeignException` and exhausted retry reaches the catch-all handler: 500. |
 | Correlation id | not forwarded | There is no Feign `RequestInterceptor`; product-service logs the call under its own id. |
 | Tracing | Feign calls are not observed | `feign-micrometer` is not on the classpath, so Spring Cloud OpenFeign's Micrometer capability is inactive. |
 
@@ -174,7 +174,7 @@ Client `client/ProductServiceClient.kt`: `@FeignClient(name = "product-service",
 | No registered instance | The load balancer answers 503 itself; Feign throws `FeignException.ServiceUnavailable` | 500 |
 | Instance registered but refusing connections, or connect timeout | Up to 3 attempts, each choosing an instance again | 200 if a later attempt connects, otherwise 500 |
 | Slow response (over 10 s) | `SocketTimeoutException`, not retried | 500 after about 10 s |
-| `404` for the product | `FeignException.NotFound`, not caught (the consumer pact test asserts this) | 500 |
+| `404` for the product | `FeignException.NotFound`, mapped by `GlobalExceptionHandler` | 404 |
 | Any other 4xx or 5xx | the matching `FeignException` | 500 |
 | Categories call fails | caught, treated as an empty list | 200, `categoryName` is `null` |
 | Any read endpoint | never calls product-service | unaffected |
@@ -271,9 +271,9 @@ Index creation is explicit instead of `spring.data.mongodb.auto-index-creation` 
 
 ## Security and identity
 
-- **Gateway.** `GET` under `/api/v1/catalog` is public. `POST /api/v1/catalog/sync/{productId}` and `PATCH /api/v1/catalog/product/{productId}` need a valid JWT of any role.
-- **Service.** No Spring Security, no `X-User-*` header read, no role or ownership check. "(Admin)" in the `@Operation` summaries is a label only. Any registered user can sync any product id and set any entry's `featured`, `imageUrl` and catalog price. `imageUrl` is stored without validation, so any string (any URL) is served to whoever renders the catalog.
-- **Bypassing the gateway.** docker-compose publishes port 8083 on the host, so both write endpoints can be called at `http://localhost:8083` without a token.
+- **Gateway.** `GET` under `/api/v1/catalog` is public. `POST /api/v1/catalog/sync/{productId}` and `PATCH /api/v1/catalog/product/{productId}` need a JWT whose role is exactly `ADMIN` (403 at the edge otherwise).
+- **Service.** No Spring Security. `security/Authorization.requireAdmin` runs before the service layer on both writes: 401 `Authentication required` without `X-Username`, 403 `Access denied` unless `X-User-Role` is exactly `ADMIN`. The `PATCH` body is validated: `price` > 0 with at most 15 integer digits and 2 decimals; `imageUrl` an absolute `http(s)` URL of at most 2048 characters, or empty to clear. Page size is 1 to 100. `SecurityHeadersFilter` adds `nosniff` and `no-store`; `ActuatorRegistryFilter` limits `/actuator/serviceregistry` to loopback.
+- **Bypassing the gateway.** docker-compose publishes port 8083 on the host, so both write endpoints can be called at `http://localhost:8083` with forged identity headers.
 - **Database account.** The service authenticates as the MongoDB root user created by the container (`MONGO_INITDB_ROOT_USERNAME=cataloguser`, `authentication-database: admin`), which has full rights on the whole server; compose also publishes MongoDB on host port 27017.
 
 ## Configuration
@@ -302,7 +302,7 @@ From `src/main/resources/application.yaml`, plus what docker-compose and Kuberne
 | `eureka.instance.lease-renewal-interval-in-seconds` / `lease-expiration-duration-in-seconds` | — | `5` / `15` | |
 | `resilience4j.circuitbreaker.instances.product-service.*` | — | window 10, minimum 5 calls, 50 %, 10 s open | Applies to no call (see Outbound calls). |
 | `management.endpoints.web.exposure.include` | — | `health,info,metrics,prometheus,circuitbreakers,serviceregistry` | |
-| `management.endpoint.health.show-details` | — | `always` | |
+| `management.endpoint.health.show-details` | — | `never` | |
 | `management.endpoint.health.probes.enabled` | `MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED` (k8s) | unset | k8s sets `true`. |
 | `management.metrics.tags.environment` | `ENVIRONMENT` | `development` | |
 | `management.tracing.sampling.probability` | `TRACING_SAMPLING_PROBABILITY` | `1.0` | |
@@ -338,7 +338,7 @@ Paths are relative to `src/test/kotlin/com/ecommerce/`.
 | `catalogservice/config/ConnectionFailureRetryerTest` | unit test | Connection refused and connect timeouts are retried then propagated; read timeouts are not retried; `clone()` resets the counter. |
 | `catalogservice/config/FeignHttpMessageConvertersRaceTest` | concurrency test | 200 rounds of 48 threads hitting a cold converter instance never observe an empty list. |
 | `catalogservice/contract/ProductServiceConsumerPactTest` | Pact consumer | Runs the real Feign client, the production `FeignConfig` and Boot's Jackson against a Pact mock server on fixed port 18083, driven through `CatalogService.syncFromProductService()`; writes `target/pacts/catalog-service-product-service.json`. |
-| `catalogservice/exception/GlobalExceptionHandlerTest`, `catalogservice/filter/CorrelationIdFilterTest` | unit | exception mappings, including the catch-all that turns Spring MVC's own 400s into 500; the correlation ID |
+| `catalogservice/exception/GlobalExceptionHandlerTest`, `catalogservice/filter/CorrelationIdFilterTest` | unit | exception mappings, including the client-error mappings and the catch-all; the correlation ID |
 | `catalogservice/client/ProductServiceClientFallbackTest`, `catalogservice/config/CatalogCollectionInitializerTest` | unit | the inactive fallback; the startup backfill and index creation logic |
 | `catalogservice/integration/CatalogApiIT` | full app, `mongo:8.0`, WireMock for product-service | sync stores the projection and a second sync updates in place, keeping the catalog-owned fields; get by id and the 404 envelope with the caller's correlation ID; browse paging; by category; featured; PATCH; search ranking and the substring fallback |
 | `catalogservice/integration/ProductServiceFailureIT` | full app, `mongo:8.0`, WireMock | product-service answering 500, being down (after the connection retries) or returning an undecodable body fails the sync and writes nothing; the sync works again on recovery; a failing categories call only costs the category name |
@@ -347,10 +347,7 @@ Paths are relative to `src/test/kotlin/com/ecommerce/`.
 
 69 unit, slice and pact tests and 20 integration tests. The repository test skips without Docker; the ITs fail.
 
-**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
-
-- `CatalogApiIT` "malformed requests are client errors, not server errors": a non-numeric id, a missing `q`, `size=0` and an unreadable PATCH body answer 500 instead of 400, because the catch-all swallows Spring MVC's exceptions (A-4).
-- `ProductServiceFailureIT` "syncing a product that does not exist upstream is a 404": product-service's 404 surfaces as 500 (R-4).
+No tests are disabled for bugs any more.
 
 Pinned by the consumer pact (verified by `ProductServiceProviderPactTest` in product-service after `ecommerce-platform/sync-pacts.sh` copies it there):
 
@@ -394,14 +391,14 @@ Paths are relative to `src/main/kotlin/com/ecommerce/catalogservice/` unless sta
 | Nothing keeps entries in sync: no event consumer, no schedule, no bulk sync; product-service publishes no events. | whole service; `CatalogService.syncFromProductService()` is the only writer of product fields | Prices, stock bands, names, categories and soft deletions are stale until someone re-syncs each product by hand. | Medium |
 | A price set through `PATCH` is overwritten by the next sync, although the README calls the price overridable. | `CatalogService.syncFromProductService()` (existing-entry branch) | Merchandising price changes are silently lost. | Medium |
 | The product `status` is ignored and entries are never removed. | `CatalogService.syncFromProductService()`; no delete endpoint | Soft-deleted products stay in the catalog and are shown with a stock band computed from their quantity. | Medium |
-| Write endpoints need only any JWT; no role check, and port 8083 needs none. | `controller/CatalogController.kt` | Any user can sync any product and change `featured`, `imageUrl` and the catalog price. The storefront does not read the catalog today, which limits the effect. | Medium |
-| Feign failures are not mapped: an unknown product id, product-service down and product-service slow all return the same 500. | `CatalogService.syncFromProductService()`, `exception/GlobalExceptionHandler.kt` | Callers cannot tell a bad id from an outage; every case is logged at ERROR. | Medium |
+| ~~Write endpoints need only any JWT~~ (fixed: admin-only, validated); port 8083 still skips the gateway in compose. | `controller/CatalogController.kt` | Any user can sync any product and change `featured`, `imageUrl` and the catalog price. The storefront does not read the catalog today, which limits the effect. | Medium |
+| ~~Feign failures are not mapped~~ | fixed for an unknown product (404); other upstream failures are still 500. | | — |
 | The configured circuit breaker and the fallback are dead: `spring.cloud.openfeign.circuitbreaker.enabled` is never set. | `client/ProductServiceClient.kt`, `client/ProductServiceClientFallback.kt`, `application.yaml` (`resilience4j`) | No protection when product-service is slow: each sync can hold a request thread for up to 10 s per call. The configuration suggests otherwise. | Low |
 | A failed categories call writes `categoryName = null` over a previously stored name. | `CatalogService.syncFromProductService()` | A transient failure blanks category names. | Low |
-| No client-error handlers: missing `q`, non-numeric path or paging values, malformed JSON, wrong method, `page < 0` or `size < 1` all return 500. The `MethodArgumentNotValidException` handler is unreachable because nothing uses `@Valid`. | `exception/GlobalExceptionHandler.kt`, `controller/CatalogController.kt` | Client mistakes look like server faults and are logged at ERROR. | Low |
-| The PATCH body is not validated. | `dto/UpdateCatalogEntryRequest.kt`, `CatalogService.updateCatalogEntry()` | Zero or negative prices and arbitrary `imageUrl` strings are stored; `imageUrl` cannot be cleared. | Low |
+| ~~No client-error handlers~~ | fixed | Malformed requests are 400/404/405/406/415. | — |
+| ~~The PATCH body is not validated~~ | fixed | `price` and `imageUrl` are validated (see Security and identity). | — |
 | The 409 only covers the service's own read-to-write window; the version is not exposed and the PATCH takes no expected version. | `CatalogService.updateCatalogEntry()`, `dto/CatalogEntryDTO.kt` | A client editing from an older read overwrites newer changes without a conflict. | Low |
-| Browse and the substring fallback are unsorted; `size` has no upper bound. | `CatalogService.getAllEntries()`, `findByProductNameContainingIgnoreCase()`, `CatalogController` | Page boundaries are not guaranteed stable; a client can request any page size. | Low |
+| Browse and the substring fallback are unsorted; `size` is capped at 100. | `CatalogService.getAllEntries()`, `findByProductNameContainingIgnoreCase()`, `CatalogController` | Page boundaries are not guaranteed stable; a client can request any page size. | Low |
 | Every sync downloads the full category list instead of `GET /api/v1/categories/{id}`. | `CatalogService.syncFromProductService()` | Cost grows with the number of categories. | Low |
 | Changing an index definition under an existing name, or the text index fields, makes `createIndex` fail and stops startup until the old index is dropped by hand. | `config/CatalogCollectionInitializer.kt` | Operational step on index changes. | Low |
 | Dead code and configuration: `findByStockStatus` and its index (no endpoint), `ProductServiceClientFallback`, the `resilience4j` instance, the unused `spring-boot-starter-validation`, and two placeholder test files under `com/ecommerce/catalog`. | `repository/CatalogEntryRepository.kt`, `pom.xml`, `src/test/kotlin/com/ecommerce/catalog/` | Noise; one index maintained for nothing. | Low |

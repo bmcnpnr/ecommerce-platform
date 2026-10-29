@@ -10,28 +10,28 @@ in PostgreSQL `orderdb`.
 | | |
 |---|---|
 | Repository | `ecommerce-order-service` |
-| Stack | Java 25 · Spring Boot 4.0.1 · Spring MVC · Spring Data JPA (Hibernate) · Flyway · Spring Cloud 2025.1.1 (OpenFeign 5.0.1 on Apache HttpClient 5, LoadBalancer, Eureka client, CircuitBreaker) · resilience4j 2.3.0 · spring-kafka 4.0.1 · springdoc 2.8.5 · Micrometer/Prometheus · OpenTelemetry tracing · Lombok |
+| Stack | Java 25 · Spring Boot 4.0.9 · Spring MVC · Spring Data JPA (Hibernate) · Flyway · Spring Cloud 2025.1.4 (OpenFeign 5.0.1 on Apache HttpClient 5, LoadBalancer, Eureka client, CircuitBreaker) · resilience4j 2.3.0 · spring-kafka 4.0.1 · springdoc 2.8.5 · Micrometer/Prometheus · OpenTelemetry tracing · Lombok |
 | Port | 8084 |
 | Eureka service ID | `order-service` |
 | Gateway routes | `/api/v1/orders/**` (Bearer JWT required for every method) |
 | Data store | PostgreSQL 16 `orderdb` (Flyway `V1`, `V2`); compose publishes it on host port 5434 |
 | Publishes | `order.placed`, `order.cancelled` |
 | Consumes | `payment.completed`, `payment.failed` (group `order-service`) |
-| Calls | `product-service` (Feign): `GET /api/v1/products/{id}`, `PATCH /api/v1/products/{id}/stock` |
+| Calls | `product-service` (Feign): `GET /api/v1/products/{id}`, `PATCH /internal/v1/products/{id}/stock` |
 | Called by | The frontend through the gateway (cart, checkout, order pages, admin order page) and `ecommerce-platform/smoke-test.sh`. No backend service calls its REST API; notification-service consumes its events. |
 
 Java paths below are relative to `src/main/java/com/ecommerce/order/`.
 
 ## Responsibilities
 
-- Create orders for a caller-supplied `customerId` and keep them open (PENDING) while the customer fills them. The
+- Create orders for the caller (`customerId` defaults to `X-Username`) and keep them open (PENDING) while the customer fills them. The
   frontend stores the PENDING order's id as `cartOrderId` and uses it as the cart (`ecommerce-frontend/src/hooks/useCart.ts`).
 - Add order lines: verify the product and its stock with product-service, reserve the stock immediately, and snapshot
   the product name and price into the line.
 - Confirm orders (PENDING to CONFIRMED) and announce them on `order.placed`.
 - Cancel orders: give the stock back to product-service and announce the cancellation on `order.cancelled`.
-- Apply payment results: `payment.completed` marks the order PAID, `payment.failed` marks it CANCELLED.
-- Let a caller set any status directly (`PATCH /status`). This is the only way to reach SHIPPED and DELIVERED.
+- Apply payment results: `payment.completed` marks a CONFIRMED order with a matching amount PAID, `payment.failed` cancels a PENDING or CONFIRMED order.
+- Let an admin move the status along the transition table (`PATCH /status`). This is the only way to reach SHIPPED and DELIVERED.
 
 Out of scope here:
 - **Payment:** taking payment is not done here. After confirming, the frontend calls payment-service itself
@@ -82,7 +82,7 @@ the addition if either value is null. Nothing ever recomputes or decreases the t
 
 ### Lifecycle
 
-The diagram shows the intended path, which the guards in `OrderService` support. Every edge is allowed by the code.
+The diagram shows the allowed transitions (`OrderStatus.allowedNext()`); anything else via `PATCH /status` is 409.
 
 ```mermaid
 stateDiagram-v2
@@ -96,33 +96,30 @@ stateDiagram-v2
     SHIPPED --> DELIVERED : PATCH status DELIVERED
 ```
 
-The code also allows much more than the diagram, because three triggers have no guard:
-- `PATCH /status` sets any status from any status.
-- `payment.completed` sets PAID from any status.
-- `payment.failed` sets CANCELLED from any status.
-- `DELETE` is also accepted on an order that is already CANCELLED.
+Guards: `PATCH /status` follows the transition table (admin only); `payment.completed` moves only a CONFIRMED order whose amount matches the total to PAID; `payment.failed` cancels only PENDING or CONFIRMED orders; `DELETE` is refused on CANCELLED, SHIPPED and DELIVERED. Ignored events are logged at WARN and never retried.
 
 The complete behaviour, by current status:
 
 | Trigger | PENDING | CONFIRMED | PAID | SHIPPED | DELIVERED | CANCELLED |
 |---|---|---|---|---|---|---|
-| `POST /{orderId}/items`, `POST /{orderId}/products` | accepted, stays PENDING | accepted, stays CONFIRMED | 400 | accepted | accepted | 400 |
+| `POST /{orderId}/items`, `POST /{orderId}/products` | accepted, stays PENDING | 400 | 400 | 400 | 400 | 400 |
 | `POST /{orderId}/confirm` | to CONFIRMED (400 if the order has no items) | 400 | 400 | 400 | 400 | 400 |
-| `DELETE /{orderId}` | to CANCELLED | to CANCELLED | to CANCELLED | 400 | 400 | accepted again: stock restored again, event published again |
-| `PATCH /{orderId}/status?status=X` | to X | to X | to X | to X | to X | to X |
-| `payment.completed` | to PAID | to PAID | to PAID | to PAID | to PAID | to PAID |
-| `payment.failed` | to CANCELLED | to CANCELLED | to CANCELLED | to CANCELLED | to CANCELLED | to CANCELLED |
+| `DELETE /{orderId}` | to CANCELLED | to CANCELLED | to CANCELLED | 400 | 400 | 400 |
+| `PATCH /{orderId}/status?status=X` (admin) | CONFIRMED, CANCELLED | PAID, CANCELLED | SHIPPED, CANCELLED | DELIVERED | 409 | 409 |
+| `payment.completed` | ignored | to PAID (amount must match) | ignored | ignored | ignored | ignored |
+| `payment.failed` | to CANCELLED | to CANCELLED | ignored | ignored | ignored | ignored |
 
-Every rejection is an `InvalidOrderStateException`, which `GlobalExceptionHandler.handleInvalidState()` turns into **400
-Bad Request** (never 409):
+Every state rejection is an `InvalidOrderStateException`, which `GlobalExceptionHandler.handleInvalidState()` turns into **400
+Bad Request**; an illegal `PATCH /status` move is `IllegalStatusTransitionException`, **409**:
 
 | Operation | Rejected when | `message` |
 |---|---|---|
-| add item | status is CANCELLED or PAID | `Cannot add items to order in status: <STATUS>` |
+| add item | status is not PENDING | `Cannot add items to order in status: <STATUS>` |
 | add item | product-service reports `stockQuantity` below the requested quantity | `Insufficient stock for product <sku>. Available: <n>` |
 | confirm | status is not PENDING | `Can only confirm PENDING orders. Current status: <STATUS>` |
 | confirm | order has no items | `Cannot confirm an order with no items` |
-| cancel | status is SHIPPED or DELIVERED | `Cannot cancel order in status: <STATUS>` |
+| cancel | status is CANCELLED, SHIPPED or DELIVERED | `Cannot cancel order in status: <STATUS>` |
+| `PATCH /status` | move not in the table (409) | `Cannot change order status from <A> to <B>` |
 
 An unknown `orderId` on any REST operation is **404** (`Order not found: <id>`). Kafka events never reject. An event
 for an unknown order is logged at WARN and skipped.
@@ -141,12 +138,12 @@ sequenceDiagram
     participant SH as shipping-service
     participant NS as notification-service
     FE->>GW: POST /api/v1/orders?customerId=username
-    GW->>OS: forwarded, plus X-User-* headers (ignored)
+    GW->>OS: forwarded, plus X-Username / X-User-Role (ownership check)
     OS-->>FE: 201 OrderDTO, status PENDING
     FE->>GW: POST /api/v1/orders/{orderId}/items
     GW->>OS: forwarded
     OS->>PS: GET /api/v1/products/{productId}
-    OS->>PS: PATCH /api/v1/products/{productId}/stock, delta = -quantity
+    OS->>PS: PATCH /internal/v1/products/{productId}/stock, delta = -quantity
     OS-->>FE: 200 OrderDTO with the new line and total
     FE->>GW: POST /api/v1/orders/{orderId}/confirm
     GW->>OS: forwarded
@@ -166,18 +163,17 @@ the order total.
 
 ## Business rules
 
-1. A new order starts as PENDING. It gets `totalAmount = 0`, `orderDate = now` and the `customerId` query parameter
-   exactly as sent: no validation, no link to the authenticated user. Enforced in `OrderService.createOrder()`.
-2. Items can be added unless the order is CANCELLED or PAID. CONFIRMED, SHIPPED and DELIVERED orders accept items.
-   Enforced in `OrderService.addItemToOrder()`.
+1. A new order starts as PENDING. It gets `totalAmount = 0`, `orderDate = now` and a `customerId` that defaults to `X-Username`; a non-admin may only use their own. It must be non-blank, at most 255 characters, without control characters. Enforced in `OrderAccess` and `OrderService.createOrder()`.
+2. Items can be added only while the order is PENDING, with an integer `quantity` from 1 to 1000 (both add endpoints).
+   Enforced in `OrderService.addItemToOrder()` and `OrderController`.
 3. The product must exist in product-service. Its 404 surfaces as 404 here (`ProductServiceClient.getProductById()`,
    `GlobalExceptionHandler.handleFeign()`). The product's `status` is not checked, so INACTIVE (soft-deleted) products
-   can be ordered.
+   can be ordered. A missing or non-positive product price is 502 before any stock moves.
 4. If product-service reports a non-null `stockQuantity` lower than the requested quantity, the add is rejected with
    400 before any stock is touched. Enforced in `OrderService.addItemToOrder()`. The check is advisory, because the
    real guard is product-service refusing a stock change that would go below zero (400, passed through).
 5. Stock is reserved when the item is added, not at confirmation or payment. `addItemToOrder()` calls
-   `PATCH /api/v1/products/{id}/stock` with `{"delta": -quantity}` before the line is saved.
+   `PATCH /internal/v1/products/{id}/stock` with `{"delta": -quantity}` before the line is saved.
 6. Name and price are copied from the product-service response into the line (price snapshot). Later price or name
    changes in product-service do not affect existing lines. The SKU is not stored. Enforced in `addItemToOrder()`.
 7. Every add creates a new line, even for a product already in the order; quantities are never merged. There is no
@@ -186,13 +182,11 @@ the order total.
 8. `totalAmount` is the running sum of `productPrice × quantity`, updated by `Order.addItem()` and never recalculated.
 9. Confirmation requires status PENDING and at least one item. It sets CONFIRMED and publishes `order.placed`.
    Enforced in `OrderService.confirmOrder()`.
-10. Cancellation is refused only for SHIPPED and DELIVERED. It sets CANCELLED, then sends `{"delta": +quantity}` to
+10. Cancellation is refused for CANCELLED, SHIPPED and DELIVERED. It sets CANCELLED, then sends `{"delta": +quantity}` to
     product-service for every line, then publishes `order.cancelled`. Each failed stock restore is logged at ERROR and
     otherwise ignored. Enforced in `OrderService.cancelOrder()`. The row is not deleted.
-11. `payment.completed` sets PAID and `payment.failed` sets CANCELLED, whatever the current status. Neither checks the
-    amount or customer, restores stock, or publishes an event. Enforced in `PaymentEventConsumer`.
-12. `PATCH /status` writes the requested status with no transition check and no side effects. Enforced in
-    `OrderService.updateOrderStatus()`.
+11. `payment.completed` sets PAID only on a CONFIRMED order whose total equals the event amount; `payment.failed` sets CANCELLED only on a PENDING or CONFIRMED order. Anything else is logged and ignored. Neither restores stock or publishes an event. Enforced in `PaymentEventConsumer`.
+12. `PATCH /status` is admin-only and checks the transition table (409 otherwise); CANCELLED and CONFIRMED run the same code as the customer endpoints, including stock restore and events. Enforced in `OrderService.updateOrderStatus()`.
 13. Orders are never deleted; `DELETE` is a status change.
 
 ## API
@@ -201,15 +195,16 @@ the order total.
 |---|---|---|---|
 | GET | `/api/v1/orders/hello` | Bearer JWT | Liveness greeting (text) |
 | POST | `/api/v1/orders?customerId=` | Bearer JWT | Create a PENDING order |
-| GET | `/api/v1/orders/{orderId}` | Bearer JWT | Get one order |
+| GET | `/api/v1/orders/{orderId}` | Bearer JWT | Get one order (owner or `ADMIN`) |
 | GET | `/api/v1/orders/customer/{customerId}` | Bearer JWT | List a customer's orders (unpaginated) |
 | POST | `/api/v1/orders/{orderId}/items` | Bearer JWT | Add a line (JSON body) |
-| POST | `/api/v1/orders/{orderId}/products?productId=&quantity=` | Bearer JWT | Legacy add-line (query params, no validation) |
+| POST | `/api/v1/orders/{orderId}/products?productId=&quantity=` | Bearer JWT | Legacy add-line (query params, same quantity rule) |
 | POST | `/api/v1/orders/{orderId}/confirm` | Bearer JWT | PENDING to CONFIRMED, publishes `order.placed` |
-| PATCH | `/api/v1/orders/{orderId}/status?status=` | Bearer JWT | Set any status ("admin/internal", unchecked) |
+| PATCH | `/api/v1/orders/{orderId}/status?status=` | `ADMIN` | Move the status along the transition table |
 | DELETE | `/api/v1/orders/{orderId}` | Bearer JWT | Cancel, restore stock, publish `order.cancelled` |
+| GET | `/internal/v1/orders/{orderId}` | not routed | The `OrderDTO`, for payment-service |
 
-No endpoint performs a service-side authorization check. Details, schemas and error bodies:
+Customer endpoints are owner-or-admin (`customerId` against `X-Username`, role exactly `ADMIN`). Details, schemas and error bodies:
 [API reference](../api/order-service.md).
 
 ## Events
@@ -301,8 +296,8 @@ Consequences:
 
 | Topic | Group id | Listener | Effect |
 |---|---|---|---|
-| `payment.completed` | `order-service` | `PaymentEventConsumer.handlePaymentCompleted(PaymentCompletedEvent)` | `status = PAID` |
-| `payment.failed` | `order-service` | `PaymentEventConsumer.handlePaymentFailed(PaymentFailedEvent)` | `status = CANCELLED` |
+| `payment.completed` | `order-service` | `PaymentEventConsumer.handlePaymentCompleted(PaymentCompletedEvent)` | `status = PAID` if CONFIRMED and the amount matches |
+| `payment.failed` | `order-service` | `PaymentEventConsumer.handlePaymentFailed(PaymentFailedEvent)` | `status = CANCELLED` if PENDING or CONFIRMED |
 
 Producer: payment-service `PaymentService.processPayment()`, key `orderId.toString()`. It publishes these after
 `POST /api/v1/payments/{id}/process`; the simulated gateway succeeds 80% of the time.
@@ -325,13 +320,9 @@ classes field for field. Every field is pinned by type in this service's consume
 | `transactionId` | `String` | | `failedAt` | `LocalDateTime` |
 | `completedAt` | `LocalDateTime` | | | |
 
-**Behaviour:** each listener method is `@Transactional`. It loads the order by `orderId`, sets the status and saves;
-nothing else on the event is read. An unknown `orderId` is logged at WARN and the record is acknowledged.
+**Behaviour:** each listener method is `@Transactional`. It loads the order by `orderId`, checks the status guard (and, for `payment.completed`, `amount` against `totalAmount`), sets the status and saves. An unknown `orderId`, a missing `orderId` or `amount`, or a guard failure is logged at WARN and the record is acknowledged.
 
-**Idempotency:** a redelivered event writes the same status again, which is harmless. But there is no state guard,
-no record of processed `paymentId`s and no ordering across the two topics. So:
-- a late or duplicate `payment.completed` turns a CANCELLED order back into PAID;
-- a `payment.failed` cancels a PAID, SHIPPED or DELIVERED order.
+**Idempotency:** a redelivered event is ignored once the status has moved on. There is no record of processed `paymentId`s and no ordering across the two topics, but the state guard means a late `payment.completed` cannot revive a CANCELLED order and a `payment.failed` cannot cancel a PAID, SHIPPED or DELIVERED one.
 
 With `auto.offset.reset=earliest`, a consumer group that has lost its offsets replays every retained payment event.
 
@@ -351,13 +342,12 @@ With `auto.offset.reset=earliest`, a consumer group that has lost its offsets re
 `client/ProductServiceClient.java`, `@FeignClient(name = "product-service", fallback = ProductServiceClientFallback.class)`.
 The client resolves the target through Eureka and Spring Cloud LoadBalancer. Transport is Apache HttpClient 5
 (`feign-hc5`). No `Authorization`, `X-User-*` or `X-Correlation-Id` header is forwarded, because there is no
-`RequestInterceptor`. The call goes straight to product-service, bypassing the gateway, and product-service performs
-no authorization on either endpoint.
+`RequestInterceptor`. The call goes straight to product-service, bypassing the gateway: stock changes use the internal `/internal/v1/products/{id}/stock` endpoint, which needs no identity.
 
 | Method | Request | Response fields read | Called from |
 |---|---|---|---|
 | `getProductById(Long)` | `GET /api/v1/products/{id}` | `name`, `price`, `stockQuantity`, `sku` (only in the error message). `id`, `brand`, `status` are mapped but unused. | `OrderService.addItemToOrder()` |
-| `updateStock(Long, StockUpdateRequest)` | `PATCH /api/v1/products/{id}/stock`, body `{"delta": <int>}` | none (the returned `ProductDTO` is discarded) | `addItemToOrder()` with `-quantity`; `cancelOrder()` with `+quantity` per line |
+| `updateStock(Long, StockUpdateRequest)` | `PATCH /internal/v1/products/{id}/stock`, body `{"delta": <int>}` | none (the returned `ProductDTO` is discarded) | `addItemToOrder()` with `-quantity`; `cancelOrder()` with `+quantity` per line |
 
 **Timeouts:** `spring.cloud.openfeign.client.config.default`: connect 2000 ms, read 10000 ms. The short connect
 timeout exists so a peer that vanished mid-rollout fails fast and the retry below can move on.
@@ -479,36 +469,28 @@ Entities versus migrations:
 ## Security and identity
 
 - **Gateway:** every `/api/v1/orders/**` request needs a valid Bearer JWT; otherwise the gateway returns 401 with an
-  empty body. On authenticated requests the gateway sets `X-Username`, `X-User-Id` and `X-User-Role`.
-- **This service reads none of them.** The only request header it reads is `X-Correlation-Id`
-  (`filter/CorrelationIdFilter.java`). There is no Spring Security dependency, no role check and no ownership check on
-  any endpoint.
+  empty body. `PATCH /orders/*/status` also needs role `ADMIN` there (403). The gateway sets `X-Username`, `X-User-Id`
+  and `X-User-Role`; `/internal/**` is never routed.
+- **This service** checks ownership in `security/OrderAccess` before any work: no `X-Username` is 401 `Authentication required`;
+  an order or customer id that is not the caller's is 403 `Access denied`; role is compared exactly with `ADMIN`.
 
 | Endpoint | Identity used | Ownership / role check |
 |---|---|---|
-| `POST /api/v1/orders` | `customerId` query parameter, any string | none |
-| `GET /api/v1/orders/{orderId}` | none | none: any order by id |
-| `GET /api/v1/orders/customer/{customerId}` | `customerId` path variable | none: any customer's orders |
-| `POST /{orderId}/items`, `POST /{orderId}/products` | none | none |
-| `POST /{orderId}/confirm` | none | none |
-| `PATCH /{orderId}/status` | none | none, although the OpenAPI summary says "admin/internal" |
-| `DELETE /{orderId}` | none | none |
-| `GET /hello` | none | none |
+| `POST /api/v1/orders` | `X-Username`, optional `customerId` | `customerId` defaults to the caller; others 403 unless `ADMIN` |
+| `GET /api/v1/orders/{orderId}` | `X-Username` | owner or `ADMIN` |
+| `GET /api/v1/orders/customer/{customerId}` | `X-Username` | that customer or `ADMIN` |
+| `POST /{orderId}/items`, `POST /{orderId}/products` | `X-Username` | owner or `ADMIN` |
+| `POST /{orderId}/confirm` | `X-Username` | owner or `ADMIN` |
+| `PATCH /{orderId}/status` | `X-User-Role` | `ADMIN` only |
+| `DELETE /{orderId}` | `X-Username` | owner or `ADMIN` |
+| `GET /hello` | `X-Username` | authenticated |
+| `GET /internal/v1/orders/{orderId}` | none | not routed by the gateway |
 
-Consequences:
-- **Any caller can act on any order.** Any authenticated user can create orders under any customer id, read or list
-  anyone's orders, and add to, confirm, cancel or re-status any order, for example mark their own order PAID or
-  SHIPPED.
-- **Inconsistent identity values.** `customerId` is not tied to the token, and clients disagree on its content: the
-  frontend sends the username (`useOrders.ts`), the smoke test sends `1`. The value then flows unchanged into
-  payment-service, shipping-service and notification-service through the events.
-- **Direct port access.** compose publishes port 8084 on the host, and there it needs no token at all. The actuator,
-  including the writable `serviceregistry` endpoint, is also unauthenticated on that port; a POST of
-  `{"status":"OUT_OF_SERVICE"}` takes the instance out of Eureka.
-- **Unauthenticated events.** Kafka has no authentication. Any `payment.completed` record for an order id marks that
-  order PAID.
-- **Documentation only.** `OpenApiConfig` declares a global `bearerAuth` scheme for Swagger UI; nothing in the service
-  enforces it.
+Notes:
+- **Direct port access.** compose publishes port 8084 on the host, and there identity headers can be forged. `serviceregistry` answers 403 to non-loopback callers (`ActuatorLoopbackFilter`).
+- **Responses and logs.** Fixed error messages (no type names, no Feign details), `nosniff` and `no-store` headers, correlation ids validated against `^[A-Za-z0-9._-]{1,64}$`.
+- **Unauthenticated events.** Kafka has no authentication, but a forged `payment.completed` only moves a CONFIRMED order with a matching amount.
+- **`customerId` values.** The frontend sends the username, which now equals `X-Username`; the value flows unchanged into payment-service, shipping-service and notification-service.
 
 ## Configuration
 
@@ -530,7 +512,7 @@ Consequences:
 | `spring.cloud.openfeign.client.config.default.connect-timeout` / `read-timeout` | — | `2000` / `10000` (ms) | Feign timeouts |
 | `resilience4j.circuitbreaker.instances.product-service.*` | — | see [Outbound calls](#outbound-calls) | Breaker |
 | `management.endpoints.web.exposure.include` | — | `health,info,metrics,prometheus,circuitbreakers,serviceregistry` | Actuator over HTTP |
-| `management.endpoint.health.show-details` | — | `always` | |
+| `management.endpoint.health.show-details` | — | `never` | |
 | `management.endpoint.health.probes.enabled` | `MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED` | not set (k8s sets `true`) | `/actuator/health/liveness` and `/readiness` for the k8s probes |
 | `management.endpoint.prometheus.access` | — | `unrestricted` | |
 | `management.metrics.tags.application` / `environment` | `ENVIRONMENT` | `order-service` / `development` | Common metric tags |
@@ -572,7 +554,7 @@ a test-scoped dependency and not in the jar. catalog-service and review-service 
 
 ## Observability
 
-- **Actuator** (`/actuator/*`, no authentication on port 8084): `health` (details always), `info`, `metrics`,
+- **Actuator** (`/actuator/*`, no authentication on port 8084): `health` (status only), `info`, `metrics`,
   `prometheus`, `circuitbreakers` (resilience4j's endpoint; its only condition is the actuator `Endpoint` class, which
   Boot 4 still has), `serviceregistry`. Health has no circuit-breaker component (see `registerHealthIndicator` above).
 - **Metrics:**
@@ -621,9 +603,7 @@ tags publishes it to Docker Hub.
 | `integration/OrderFlowIT` | full app, Postgres, Kafka, WireMock for product-service | create, add item, place: the rows persist and `order.placed` is published; cancel restores stock and publishes `order.cancelled`; unknown product 404 and insufficient stock 400 leave the order untouched |
 | `integration/PaymentEventsIT` | full app, Postgres, Kafka | `payment.completed` marks the order `PAID`; `payment.failed` cancels it; an event for an unknown order is skipped and the listener keeps consuming |
 
-**Disabled test that pins a bug** (see [Findings](../findings.md#bugs-pinned-by-tests)): `OrderServiceTest.cancelOrder_alreadyCancelled_isRejectedWithoutRestoringStockAgain`. Cancelling a `CANCELLED` order restores stock a second time and publishes a duplicate `order.cancelled` (I-3).
-
-Open design questions with no test yet, because the intended rules are undecided: items can be added after `CONFIRMED` (I-8), `PaymentEventConsumer` overwrites the status whatever it is, so a late `payment.completed` flips `CANCELLED` to `PAID` (R-3), and `PATCH /status` accepts any transition (I-9). Not covered: the legacy `/products` endpoint and the circuit breaker.
+No tests are disabled for bugs any more; the `@Tag("security")` suite covers ownership, transitions, quantity bounds and forged payment events. Not covered: the circuit breaker.
 
 **Pacts** (pact-jvm 4.7.5, spec V4, no broker). Pact files are handed over by `ecommerce-platform/sync-pacts.sh`.
 The copies in the provider repositories match the files last generated here.
@@ -634,7 +614,7 @@ The copies in the provider repositories match the files last generated here.
   - **Pins:**
     - state `product 1 exists`: `GET /api/v1/products/1` returns 200 with `id` (integer), `sku`, `name` (strings),
       `price` (number), `stockQuantity` (integer);
-    - `PATCH /api/v1/products/1/stock` with exact body `{"delta":-2}` and `Content-Type: application/json` returns
+    - `PATCH /internal/v1/products/1/stock` with exact body `{"delta":-2}` and `Content-Type: application/json` returns
       200;
     - the restore `PATCH` with `{"delta":2}`;
     - state `product 999 does not exist`: `GET /api/v1/products/999` returns 404 with `status`, `error`, `message`;
@@ -699,13 +679,13 @@ Run only the pacts with `mvn test -Dtest='*PactTest'`.
 
 | Issue | Where | Impact | Severity |
 |---|---|---|---|
-| No authentication, ownership or role checks. `customerId` comes from the caller and `X-User-*` is ignored. | `OrderController` (all endpoints), `OrderService` | Any authenticated user can create orders for anyone, read or list anyone's orders, and modify, cancel or re-status any order (for example mark it PAID). Port 8084 needs no token at all. The frontend (username) and smoke test (`1`) disagree on what `customerId` is. | High |
-| Legacy add-item endpoint does not validate `quantity`; zero and negative values are accepted. | `OrderController.addProductToOrder()`, `OrderService.addItemToOrder()` | A negative quantity sends a positive `delta`, raising product stock, and adds a negative line that lowers the order total. This allows price manipulation and stock inflation. | High |
-| Cancelling an already-CANCELLED order is accepted. | `OrderService.cancelOrder()` | Each repeat returns every line's stock to product-service again and publishes another `order.cancelled`; stock can be inflated without limit. | High |
+| ~~No authentication, ownership or role checks~~ | fixed | see the security fix spec | — |
+| ~~Legacy add-item endpoint does not validate `quantity`~~ | fixed | see the security fix spec | — |
+| ~~Cancelling an already-CANCELLED order is accepted~~ | fixed | see the security fix spec | — |
 | `payment.failed` cancels without returning stock and without `order.cancelled`. | `PaymentEventConsumer.handlePaymentFailed()` | Every failed payment permanently removes the order's quantities from stock; payment-service simulates a 20 % failure rate. | High |
-| Payment events are applied unconditionally: no status guard, no check of `amount` against `totalAmount` or of `customerId`. | `PaymentEventConsumer` | CANCELLED becomes PAID (stock already returned, so overselling); PAID, SHIPPED and DELIVERED orders can be cancelled; an order is PAID for any amount. Cross-topic ordering is not guaranteed. | High |
-| Items can be added to CONFIRMED, SHIPPED and DELIVERED orders. | `OrderService.addItemToOrder()` | The total and lines change after `order.placed` and after the payment amount was fixed. | Medium |
-| `PATCH /status` accepts any transition and has no side effects. | `OrderService.updateOrderStatus()` | CANCELLED via PATCH returns no stock and publishes nothing; a CANCELLED order whose stock was returned can be revived. | Medium |
+| ~~Payment events applied unconditionally~~ | fixed | see the security fix spec | — |
+| ~~Items can be added to CONFIRMED, SHIPPED and DELIVERED orders~~ | fixed | see the security fix spec | — |
+| ~~`PATCH /status` accepts any transition~~ | fixed | see the security fix spec | — |
 | Dual write: Kafka send inside the DB transaction, no outbox. | `OrderService.confirmOrder()`, `cancelOrder()`, `OrderEventProducer` | Events can precede the commit or describe rolled-back changes. Asynchronous send failures lose the event. An immediate failure blocks up to `max.block.ms` (60 s) then returns 500; for cancel this happens after the stock was already returned. | Medium |
 | Stock reservations and releases are not compensated or retried. | `OrderService.addItemToOrder()`, `cancelOrder()` | A DB failure or read timeout after the PATCH leaks reserved stock; failed restores on cancel are only logged. | Medium |
 | Reserved stock never expires. | `OrderService.addItemToOrder()` (no scheduler anywhere) | Abandoned carts (PENDING orders) hold stock indefinitely. | Medium |
@@ -715,11 +695,11 @@ Run only the pacts with `mvn test -Dtest='*PactTest'`.
 | No line removal or quantity change. | `OrderController` | The frontend cancels and re-creates the order to remove an item. Each removal publishes `order.cancelled`, leaves a CANCELLED order behind, re-reserves stock (which can fail) and re-snapshots prices. | Medium |
 | Open circuit breaker returns 500; the Feign fallback is not wired. | `ProductServiceClient`, `ProductServiceClientFallback`, `GlobalExceptionHandler.handleRuntime()` | A product-service outage shows as 500 "An unexpected error occurred" instead of 503 once the breaker opens; the 503 "unavailable" branch is dead code. | Low |
 | Product `status` is not checked. | `OrderService.addItemToOrder()` | INACTIVE (soft-deleted) products can still be ordered. | Low |
-| Error messages expose internals. | `GlobalExceptionHandler.handleFeign()` | Clients see internal URLs (`http://product-service/...`), Feign method keys and product-service error bodies. | Low |
-| Some client errors become 500. | `GlobalExceptionHandler.handleGeneral()` | For example a non-JSON `Content-Type` on `POST /items` (`HttpMediaTypeNotSupportedException`) is 500 instead of 415. | Low |
-| `customerId` is unvalidated. | `OrderController.createOrder()` | Blank ids are accepted; more than 255 characters fails at the database with 500. | Low |
+| ~~Error messages expose internals~~ | fixed | see the security fix spec | — |
+| ~~Some client errors become 500~~ | fixed | see the security fix spec | — |
+| ~~`customerId` is unvalidated~~ | fixed | see the security fix spec | — |
 | `GET /customer/{customerId}` is unpaginated, unordered and loads lines eagerly. | `OrderService.getOrdersByCustomer()`, `Order.orderItems` | Unbounded response and one extra query per order. | Low |
 | Dead code and config. | `ProductServiceClientFallback`, the `ObjectMapper` bean in `AppConfig`, `registerHealthIndicator`, `idx_orders_status`, `GET /hello` | Misleading: these look active but do nothing. | Low |
 | `application-test.yaml` lives in `src/main/resources`. | `src/main/resources/application-test.yaml` | The test profile ships in the production jar. | Low |
 | Tracing and correlation gaps. | `pom.xml` (no `feign-micrometer`), `KafkaProducerConfig`, `CorrelationIdFilter`, log pattern | No client span or trace propagation to product-service; traces stop at Kafka; the correlation id is not propagated; logs carry no trace id. | Low |
-| Actuator is open on the published port. | `application.yaml` `management.endpoints.web.exposure.include`; compose `8084:8084` | Anyone who can reach port 8084 can POST to `/actuator/serviceregistry` and take the instance out of Eureka. | Low |
+| ~~Actuator open on the published port (serviceregistry is loopback-only now)~~ | fixed | see the security fix spec | — |

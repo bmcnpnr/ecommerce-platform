@@ -40,7 +40,7 @@ sequenceDiagram
 ```
 
 - The SPA takes the role from the login response. It never decodes the token. Admin pages are hidden client-side only (see [Security](security.md)).
-- An `admin`/`admin` account is seeded on every start of user-service, and it is the only way an `ADMIN` exists.
+- The admin account is seeded from `ADMIN_USERNAME` / `ADMIN_PASSWORD` (generated into `.env`), and it is the only way an `ADMIN` exists.
 - Tokens can't be revoked. Deactivating a user (`DELETE /api/v1/users/{id}`) leaves their token valid until it expires.
 
 ## 2. Browsing and product detail

@@ -11,16 +11,19 @@ Service overview, lifecycle and events: [order-service](../services/order-servic
 - Request and response bodies are `application/json`.
 - `GET /hello` is the exception: it returns plain text.
 - Only `POST /{orderId}/items` takes a body. Unknown JSON properties in it are ignored (Jackson 3 default).
-- Sending it with a non-JSON `Content-Type` fails with 500, not 415.
+- Sending it with a non-JSON `Content-Type` fails with 415.
 
 **Authentication.**
 - At the gateway: every `/api/v1/orders/**` path needs `Authorization: Bearer <JWT>`, whatever the method; without
   it the gateway answers 401 with an empty body. The gateway adds `X-Username`, `X-User-Id` and `X-User-Role`.
-- In the service: it reads none of those headers and has no Spring Security, so it performs **no authentication,
-  role or ownership check**. `customerId` is whatever the caller sends.
-- On port 8084 directly: no token is needed at all.
+- In the service: ownership is `customerId` against `X-Username`. Missing identity is 401 `Authentication required`;
+  another customer's order is 403 `Access denied`; the role must be exactly `ADMIN` for the admin exceptions.
+  `PATCH /status` is admin-only (also 403 at the gateway). `customerId` defaults to `X-Username`.
+- On port 8084 directly: no token, so whoever calls chooses the identity headers. `/internal/v1/orders/{id}` is
+  service-to-service and never routed by the gateway.
+- Every response carries `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
 
-**Correlation.** `X-Correlation-Id` is taken from the request, or generated as a UUID. It is returned in the response
+**Correlation.** `X-Correlation-Id` is taken from the request if it matches `^[A-Za-z0-9._-]{1,64}$`, otherwise generated as a UUID. It is returned in the response
 header of the same name and in every error body.
 
 **Error body.** Every error produced by the service has this shape (`exception/ErrorResponse.java`). All seven keys
@@ -43,16 +46,22 @@ are always present, and `fieldErrors` is `null` except on bean-validation failur
 | Cause | Status | `error` | `message` |
 |---|---|---|---|
 | `OrderNotFoundException` | 404 | `Not Found` | `Order not found: <orderId>` |
+| missing identity | 401 | `Unauthorized` | `Authentication required` |
+| not the owner / not `ADMIN` | 403 | `Forbidden` | `Access denied` |
+| `IllegalStatusTransitionException` (`PATCH /status`) | 409 | `Conflict` | `Cannot change order status from <A> to <B>` |
+| `BadRequestException` (`customerId`, `quantity`) | 400 | `Bad Request` | e.g. `quantity must be between 1 and 1000` |
+| `UpstreamDataException` (missing or non-positive product price) | 502 | `Bad Gateway` | `Product price is not available` |
 | `InvalidOrderStateException` (state rules, stock pre-check) | 400 | `Bad Request` | Rule-specific, listed per endpoint |
 | `MethodArgumentNotValidException` (`@Valid` body) | 400 | `Bad Request` | `Validation failed`, plus `fieldErrors` |
-| `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | Spring's message, e.g. `Request method 'GET' is not supported` |
-| `MissingServletRequestParameterException`, other `ServletRequestBindingException`, `HttpMessageNotReadableException` (missing or malformed body), `MethodArgumentTypeMismatchException` (non-numeric id, unknown enum) | 400 | `Bad Request` | Spring's exception message |
-| `FeignException` from product-service with status 404 / 400 / 409 | 404 / 400 / 409 | reason phrase | `Downstream service call failed: ` + Feign's message (method, internal URL, Feign method key, product-service's response body) |
-| `FeignException` with status 503, or -1 (no response: connect failure after retries, read timeout) | 503 | `Service Unavailable` | same prefix |
-| `FeignException` with any other status (500, 401, 422, ...) | 502 | `Bad Gateway` | same prefix |
+| `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | `Request method not supported` |
+| `HttpMediaTypeNotSupportedException` / not acceptable / unmapped path | 415 / 406 / 404 | | `Unsupported content type` / `Requested media type not acceptable` / `Resource not found` |
+| `MissingServletRequestParameterException`, other `ServletRequestBindingException`, `HttpMessageNotReadableException` (missing or malformed body), `MethodArgumentTypeMismatchException` (non-numeric id, unknown enum) | 400 | `Bad Request` | `Malformed request body`, `Invalid value for parameter '<name>'`, `Missing required parameter '<name>'` or `Invalid request` |
+| `FeignException` from product-service with status 404 / 400 / 409 | 404 / 400 / 409 | reason phrase | `Downstream service call failed: resource not found` / `request rejected` |
+| `FeignException` with status 503, or -1 (no response: connect failure after retries, read timeout) | 503 | `Service Unavailable` | `Downstream service call failed: service unavailable` |
+| `FeignException` with any other status (500, 401, 422, ...) | 502 | `Bad Gateway` | `Downstream service call failed` |
 | Other `RuntimeException` whose message contains `unavailable` | 503 | `Service Unavailable` | the exception message. Only the unwired Feign fallback throws such a message, so in practice this branch is not reached. |
 | Any other `RuntimeException`, including an open circuit breaker (`CallNotPermittedException`), `KafkaException` on publish, database errors | 500 | `Internal Server Error` | `An unexpected error occurred` |
-| Any other `Exception`, e.g. `HttpMediaTypeNotSupportedException` | 500 | `Internal Server Error` | `An unexpected error occurred` |
+| Any other `Exception` | 500 | `Internal Server Error` | `An unexpected error occurred` |
 
 **Pagination.** None. The list endpoint returns a plain JSON array.
 
@@ -71,29 +80,31 @@ They assume:
 ```bash
 GW=http://localhost:8080
 TOKEN=$(curl -s -X POST "$GW/api/v1/users/login" -H 'Content-Type: application/json' \
-  -d '{"username":"alice","password":"Passw0rd!123"}' | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+  -d '{"username":"alice","password":"<alice password>"}' | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 AUTH="Authorization: Bearer $TOKEN"
+ADMIN_AUTH="Authorization: Bearer $ADMIN_TOKEN"   # login as admin with ADMIN_PASSWORD from ecommerce-platform/.env
 ```
 
 ## Endpoints
 
 | Method | Path | Gateway auth | Service-side checks | Summary |
 |---|---|---|---|---|
-| GET | `/api/v1/orders/hello` | Bearer JWT | none | Greeting text |
-| POST | `/api/v1/orders` | Bearer JWT | none (`customerId` not validated or tied to the caller) | Create a PENDING order |
-| GET | `/api/v1/orders/{orderId}` | Bearer JWT | none | Get an order |
-| GET | `/api/v1/orders/customer/{customerId}` | Bearer JWT | none | List a customer's orders |
-| POST | `/api/v1/orders/{orderId}/items` | Bearer JWT | status not CANCELLED/PAID; stock pre-check | Add a line, reserve stock |
-| POST | `/api/v1/orders/{orderId}/products` | Bearer JWT | same as `/items`, but no quantity validation | Legacy add-line |
-| POST | `/api/v1/orders/{orderId}/confirm` | Bearer JWT | status PENDING; at least one item | Confirm, publish `order.placed` |
-| PATCH | `/api/v1/orders/{orderId}/status` | Bearer JWT | none (any transition) | Set status |
-| DELETE | `/api/v1/orders/{orderId}` | Bearer JWT | status not SHIPPED/DELIVERED | Cancel, return stock, publish `order.cancelled` |
+| GET | `/api/v1/orders/hello` | Bearer JWT | authenticated | Greeting text |
+| POST | `/api/v1/orders` | Bearer JWT | `customerId` is the caller, or any for `ADMIN`; validated | Create a PENDING order |
+| GET | `/api/v1/orders/{orderId}` | Bearer JWT | owner or `ADMIN` | Get an order |
+| GET | `/api/v1/orders/customer/{customerId}` | Bearer JWT | that customer or `ADMIN` | List a customer's orders |
+| POST | `/api/v1/orders/{orderId}/items` | Bearer JWT | owner or `ADMIN`; status PENDING; quantity 1 to 1000; stock pre-check | Add a line, reserve stock |
+| POST | `/api/v1/orders/{orderId}/products` | Bearer JWT | same as `/items` | Legacy add-line |
+| POST | `/api/v1/orders/{orderId}/confirm` | Bearer JWT | owner or `ADMIN`; status PENDING; at least one item | Confirm, publish `order.placed` |
+| PATCH | `/api/v1/orders/{orderId}/status` | `ADMIN` | `ADMIN`; transition table (409) | Set status |
+| DELETE | `/api/v1/orders/{orderId}` | Bearer JWT | owner or `ADMIN`; status not CANCELLED/SHIPPED/DELIVERED | Cancel, return stock, publish `order.cancelled` |
+| GET | `/internal/v1/orders/{orderId}` | not routed | none | The `OrderDTO`, for payment-service's order check |
 
 ## GET /api/v1/orders/hello
 
 Returns a fixed greeting, left over from the service's scaffolding.
 
-**Auth:** Bearer JWT at the gateway; no service-side checks.
+**Auth:** Bearer JWT at the gateway.
 
 **Responses**
 - `200 OK`, `text/plain`: `Hello from Order Service!`
@@ -111,14 +122,14 @@ curl -s -H "$AUTH" "$GW/api/v1/orders/hello"
 Creates an empty order in status PENDING with `totalAmount` 0 and `orderDate` now. The frontend treats it as the
 shopping cart.
 
-**Auth:** Bearer JWT at the gateway; no service-side checks. The order belongs to whatever `customerId` the caller
-passes. The frontend passes the logged-in username; the smoke test passes `1`.
+**Auth:** Bearer JWT; 401 without identity. `customerId` defaults to `X-Username`; a non-admin who names another
+customer gets 403. The frontend passes the logged-in username.
 
 **Path / query parameters**
 
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
-| `customerId` | query | string | yes | — | None. A blank value is accepted. More than 255 characters fails at the database (500). |
+| `customerId` | query | string | no | `X-Username` | Not blank, at most 255 characters, no control characters or other invalid characters (400). |
 
 **Request body:** none. A body is ignored.
 
@@ -137,8 +148,8 @@ passes. The frontend passes the logged-in username; the smoke test passes `1`.
     "totalAmount": 0
   }
   ```
-- `400`: `customerId` missing (`Required request parameter 'customerId' for method parameter type String is not present`).
-- `500`: database error.
+- `400`: `customerId` blank or invalid.
+- `401` / `403`: no identity / another customer's name.
 
 **Side effects:** INSERT into `orders`. No events, no Feign calls.
 
@@ -152,7 +163,7 @@ curl -s -X POST -H "$AUTH" "$GW/api/v1/orders?customerId=alice"
 
 Returns one order with its lines.
 
-**Auth:** Bearer JWT at the gateway; no service-side checks. Any caller can read any order.
+**Auth:** owner (`customerId` equals `X-Username`) or `ADMIN`; otherwise 403. An unknown order is 404.
 
 **Path / query parameters**
 
@@ -200,7 +211,7 @@ curl -s -H "$AUTH" "$GW/api/v1/orders/42"
 Lists every order stored under `customerId`, in all statuses, including the CANCELLED orders the frontend leaves
 behind when it removes a cart item.
 
-**Auth:** Bearer JWT at the gateway; no service-side checks. Any caller can list any customer's orders.
+**Auth:** `{customerId}` must equal `X-Username`, or the caller is `ADMIN`; otherwise 403.
 
 **Path / query parameters**
 
@@ -223,12 +234,12 @@ curl -s -H "$AUTH" "$GW/api/v1/orders/customer/alice"
 ## POST /api/v1/orders/{orderId}/items
 
 Adds one line to the order. The service reads the product from product-service, rejects the request if the reported
-stock is lower than `quantity`, and reserves the stock by sending `PATCH /api/v1/products/{productId}/stock` with
+stock is lower than `quantity`, and reserves the stock by sending `PATCH /internal/v1/products/{productId}/stock` with
 `{"delta": -quantity}`. It then copies the product's current `name` and `price` into a new line and adds
 `price × quantity` to `totalAmount`. The same product added twice gives two lines. There is no endpoint to remove a
 line or change its quantity.
 
-**Auth:** Bearer JWT at the gateway. Service-side: no identity checks; status rule below.
+**Auth:** owner or `ADMIN`; status rule below.
 
 **Path / query parameters**
 
@@ -241,7 +252,7 @@ line or change its quantity.
 | Field | Type | Required | Validation | Notes |
 |---|---|---|---|---|
 | `productId` | integer (int64) | yes | `@NotNull` "Product ID is required" | product-service product id |
-| `quantity` | integer (int32) | yes | `@NotNull` "Quantity is required", `@Min(1)` "Quantity must be at least 1" | No upper bound |
+| `quantity` | integer (int32) | yes | `@NotNull` "Quantity is required", `@Min(1)` "Quantity must be at least 1", `@Max(1000)` "Quantity must be at most 1000" | Integer only: a fractional or string value is 400 |
 
 ```json
 { "productId": 7, "quantity": 2 }
@@ -286,18 +297,19 @@ line or change its quantity.
   ```
 - `400`: body missing or malformed JSON.
 - `404`: `Order not found: <orderId>`.
-- `400`: `Cannot add items to order in status: CANCELLED` (or `PAID`). CONFIRMED, SHIPPED and DELIVERED orders
-  **accept** items.
+- `400`: `Cannot add items to order in status: <STATUS>`. Only PENDING orders accept items.
+- `502`: product-service returned a missing or non-positive price (`Product price is not available`); no stock moves.
 - `404`: product unknown to product-service (`Downstream service call failed: ...`). The smoke test asserts this.
 - `400`: `Insufficient stock for product <sku>. Available: <n>`, from order-service's own pre-check.
 - `400`: product-service refused the reservation because stock would go below zero
   (`Downstream service call failed: ...Insufficient stock...`).
 - `503`: product-service unreachable after 3 connection attempts, read timeout (10 s), or no instance registered.
 - `502`: product-service answered 5xx or another unexpected status.
-- `500`: product-service circuit breaker OPEN, a database error, or a non-JSON `Content-Type`.
+- `415`: non-JSON `Content-Type`.
+- `500`: product-service circuit breaker OPEN or a database error.
 
 **Side effects**
-- Feign `GET /api/v1/products/{productId}`, then `PATCH /api/v1/products/{productId}/stock` with `{"delta": -quantity}`.
+- Feign `GET /api/v1/products/{productId}`, then `PATCH /internal/v1/products/{productId}/stock` with `{"delta": -quantity}`.
 - The reservation is **not** undone if a later step fails. A read timeout on a PATCH that product-service did apply
   returns 503 with the stock still reserved.
 - INSERT into `order_items` and UPDATE of `orders`. No events.
@@ -313,11 +325,9 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
 
 Legacy form of [add item](#post-apiv1ordersorderiditems) that takes query parameters instead of a body ("use /items
 instead" in its OpenAPI summary). It calls the same `OrderService.addItemToOrder()`, so the responses and side
-effects are the same, but **`quantity` is not validated**. Zero is accepted. A negative quantity passes the stock
-pre-check, sends a positive `delta` (which increases product stock) and adds a line with a negative amount to
-`totalAmount`.
+effects are the same, and `quantity` must be an integer from 1 to 1000 (400 otherwise).
 
-**Auth:** Bearer JWT at the gateway; no service-side identity checks.
+**Auth:** owner or `ADMIN`.
 
 **Path / query parameters**
 
@@ -325,7 +335,7 @@ pre-check, sends a positive `delta` (which increases product stock) and adds a l
 |---|---|---|---|---|---|
 | `orderId` | path | integer (int64) | yes | — | Numeric, else 400 |
 | `productId` | query | integer (int64) | yes | — | Missing or non-numeric: 400 |
-| `quantity` | query | integer (int32) | no | `1` | None |
+| `quantity` | query | integer (int32) | no | `1` | 1 to 1000 |
 
 **Request body:** none.
 
@@ -344,7 +354,7 @@ curl -s -X POST -H "$AUTH" "$GW/api/v1/orders/42/products?productId=7&quantity=1
 Moves a PENDING order with at least one line to CONFIRMED and publishes `order.placed`. The frontend then creates and
 processes the payment in payment-service. The payment result comes back over Kafka and sets PAID or CANCELLED.
 
-**Auth:** Bearer JWT at the gateway; no service-side identity checks.
+**Auth:** owner or `ADMIN`.
 
 **Path / query parameters**
 
@@ -377,11 +387,11 @@ curl -s -X POST -H "$AUTH" "$GW/api/v1/orders/42/confirm"
 
 ## PATCH /api/v1/orders/{orderId}/status
 
-Overwrites the status. The OpenAPI summary calls it "admin/internal", but nothing restricts it. It is the only way to
-reach SHIPPED and DELIVERED, and the frontend's admin order page uses it.
+Moves the order along the allowed transitions. It is the only way to reach SHIPPED and DELIVERED, and the frontend's
+admin order page uses it.
 
-**Auth:** Bearer JWT at the gateway; **no service-side checks**, no role check, no transition validation. Any status
-can be set from any status, including reviving a CANCELLED order or marking an unpaid order PAID.
+**Auth:** `ADMIN` only (403 at the gateway and in the service). Allowed moves: PENDING to CONFIRMED or CANCELLED;
+CONFIRMED to PAID or CANCELLED; PAID to SHIPPED or CANCELLED; SHIPPED to DELIVERED. Anything else is 409.
 
 **Path / query parameters**
 
@@ -396,27 +406,29 @@ can be set from any status, including reviving a CANCELLED order or marking an u
 - `200 OK`: the updated [`OrderDTO`](#orderdto).
 - `404`: `Order not found: <orderId>`.
 - `400`: `status` missing or not an enum name.
+- `409`: `Cannot change order status from <A> to <B>`.
 
-**Side effects:** UPDATE of `orders.status` only. Setting CANCELLED here returns **no** stock and publishes **no**
-`order.cancelled`; setting PAID publishes nothing.
+**Side effects:** UPDATE of `orders.status`. Setting CANCELLED or CONFIRMED runs the same code as the customer endpoints
+(stock restore and `order.cancelled`, or `order.placed`); setting PAID or SHIPPED publishes nothing.
 
 **Example**
 
 ```bash
-curl -s -X PATCH -H "$AUTH" "$GW/api/v1/orders/42/status?status=SHIPPED"
+# needs an admin token (ADMIN_PASSWORD from ecommerce-platform/.env)
+curl -s -X PATCH -H "$ADMIN_AUTH" "$GW/api/v1/orders/42/status?status=SHIPPED"
 ```
 
 ## DELETE /api/v1/orders/{orderId}
 
 Cancels the order; nothing is deleted. The service:
 1. sets CANCELLED;
-2. for every line, sends `PATCH /api/v1/products/{productId}/stock` with `{"delta": +quantity}` to product-service;
+2. for every line, sends `PATCH /internal/v1/products/{productId}/stock` with `{"delta": +quantity}` to product-service;
 3. publishes `order.cancelled`.
 
 The frontend shows the Cancel button only for PENDING and CONFIRMED orders, but the API also cancels PAID orders,
-without refunding them, and orders that are already CANCELLED.
+without refunding them.
 
-**Auth:** Bearer JWT at the gateway; no service-side identity checks.
+**Auth:** owner or `ADMIN`.
 
 **Path / query parameters**
 
@@ -429,7 +441,7 @@ without refunding them, and orders that are already CANCELLED.
 **Responses**
 - `204 No Content`.
 - `404`: `Order not found: <orderId>`.
-- `400`: `Cannot cancel order in status: SHIPPED` (or `DELIVERED`).
+- `400`: `Cannot cancel order in status: CANCELLED` (or `SHIPPED`, `DELIVERED`).
 - `500`: the Kafka publish failed immediately. The transaction rolls back, but the stock restores have already been
   sent.
 
@@ -438,7 +450,7 @@ without refunding them, and orders that are already CANCELLED.
 - One Feign PATCH per line. Failures are logged and ignored, so stock may stay reserved while the cancel still
   returns 204.
 - Publishes `order.cancelled` (key `orderId`) inside the transaction.
-- Calling DELETE again on a CANCELLED order repeats the stock restores and the event.
+- Calling DELETE again on a CANCELLED order is `400`; stock is restored once.
 
 **Example**
 
@@ -483,7 +495,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X DELETE -H "$AUTH" "$GW/api/v1/orders
 | Field | Type | Required | Validation |
 |---|---|---|---|
 | `productId` | integer (int64) | yes | `@NotNull(message = "Product ID is required")` |
-| `quantity` | integer (int32) | yes | `@NotNull(message = "Quantity is required")`, `@Min(value = 1, message = "Quantity must be at least 1")` |
+| `quantity` | integer (int32) | yes | `@NotNull(message = "Quantity is required")`, `@Min(1)`, `@Max(1000)` |
 
 ### ErrorResponse
 

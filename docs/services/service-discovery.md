@@ -9,8 +9,8 @@ heartbeats after every restart.
 | | |
 |---|---|
 | Repository | `ecommerce-service-discovery` |
-| Stack | Java 25 · Spring Boot 4.0.1 · Spring Cloud Netflix Eureka Server (Spring Cloud 2025.1.1) |
-| Port | 8761 (dashboard at `http://localhost:8761`, REST API under `/eureka/`) |
+| Stack | Java 25 · Spring Boot 4.0.9 · Spring Cloud Netflix Eureka Server (Spring Cloud 2025.1.4) |
+| Port | 8761 (dashboard at `http://localhost:8761`, REST API under `/eureka/`; HTTP Basic, user `eureka`, password `EUREKA_PASSWORD`) |
 | Eureka service ID | `service-discovery` (does not register itself) |
 | Gateway routes | — |
 | Data store | in-memory registry |
@@ -75,7 +75,9 @@ See [k8s/README.md, "Rollouts are hitless"](../../k8s/README.md#notes).
 | `eureka.server.enable-self-preservation` | `false` | Instances come and go on every rebuild. Self-preservation would freeze eviction as soon as renewals dip, leaving dead instances routable. |
 | `eureka.server.eviction-interval-timer-in-ms` | 5000 (default 60000) | sweep expired leases every 5 s. With the 15 s lease this bounds a crashed instance's lifetime to about 20 s. |
 | `eureka.server.use-read-only-response-cache` | `false` | The read-only cache refreshes only every 30 s. New registrations, deregistrations and `OUT_OF_SERVICE` changes stayed invisible to clients for up to half a minute, and this was the biggest single cause of failed requests during rollouts. Reads now come from the read-write cache, which is invalidated on every change. |
-| `management.endpoints.web.exposure.include` | `health,info,metrics,prometheus,circuitbreakers` | `circuitbreakers` has nothing to report here |
+| `spring.security.user.name` / `password` | `EUREKA_USERNAME` (default `eureka`) / `EUREKA_PASSWORD` | No default password; at least 16 characters or startup fails. `init-secrets.sh` generates it into `.env`. |
+| `SecurityConfig` | HTTP Basic on everything except `/actuator/health/**`, `/actuator/info`, `/actuator/prometheus` | Clients send the credentials from the user info of their service URL: `http://eureka:<password>@service-discovery:8761/eureka/`. CSRF is disabled for the registry API. |
+| `management.endpoints.web.exposure.include` | `health,info,metrics,prometheus,circuitbreakers` | `circuitbreakers` has nothing to report here. `health` shows no details (`show-details: never`). |
 | `management.tracing.sampling.probability` | `TRACING_SAMPLING_PROBABILITY`, default 1.0 | |
 | OTLP endpoint | `OTEL_EXPORTER_OTLP_ENDPOINT` + `/v1/traces`, default `http://tempo:4318` | |
 | `logging.pattern.console` | `%d [%thread] %-5level %logger{36} - %msg%n` | no correlation ID |
@@ -97,11 +99,12 @@ instance`. This is the "Eureka warm-up" every runbook entry mentions.
 ## Useful REST calls
 
 ```bash
-curl -s -H 'Accept: application/json' localhost:8761/eureka/apps                  # whole registry
-curl -s -H 'Accept: application/json' localhost:8761/eureka/apps/PRODUCT-SERVICE  # one application
+EU="eureka:$EUREKA_PASSWORD"   # EUREKA_PASSWORD from ecommerce-platform/.env
+curl -s -u "$EU" -H 'Accept: application/json' localhost:8761/eureka/apps                  # whole registry
+curl -s -u "$EU" -H 'Accept: application/json' localhost:8761/eureka/apps/PRODUCT-SERVICE  # one application
 # take an instance out of rotation by hand (what the preStop hook does through actuator):
-curl -X PUT "localhost:8761/eureka/apps/PRODUCT-SERVICE/<instanceId>/status?value=OUT_OF_SERVICE"
-curl -X DELETE "localhost:8761/eureka/apps/PRODUCT-SERVICE/<instanceId>/status?value=UP"   # undo the override
+curl -u "$EU" -X PUT "localhost:8761/eureka/apps/PRODUCT-SERVICE/<instanceId>/status?value=OUT_OF_SERVICE"
+curl -u "$EU" -X DELETE "localhost:8761/eureka/apps/PRODUCT-SERVICE/<instanceId>/status?value=UP"   # undo the override
 ```
 
 Application names are upper-cased in the registry. Instance IDs look like
@@ -133,7 +136,7 @@ see [Architecture: CI/CD](../architecture.md#build-and-delivery).
 
 | Issue | Where | Impact | Severity |
 |---|---|---|---|
-| The registry API is unauthenticated, and port 8761 is published on the host in both deployments. | `application.yaml` (no Spring Security) | Anyone who can reach port 8761 can register a fake instance under a real service ID, deregister instances, or force `OUT_OF_SERVICE`. A fake `user-service` instance would receive login requests with plaintext passwords. | Medium (dev setup), High if ever exposed |
+| ~~The registry API is unauthenticated~~ | fixed | HTTP Basic is required (S-10); port 8761 is still published on the host. | — |
 | Single instance. | compose, `30-service-discovery.yaml` | When Eureka is down, clients keep routing with their last cached registry, but new or moved instances are not discovered until it returns. | Low (dev) |
 | Self-preservation is disabled. | `enable-self-preservation: false` | Right for a single-node dev registry. Across a real network partition it would evict healthy instances. | Low |
 | No README in the repository. | repo root | The repo doesn't explain itself; this page fills the gap. | Low |

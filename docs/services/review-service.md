@@ -10,7 +10,7 @@ before it stores a review. It neither publishes nor consumes events.
 | | |
 |---|---|
 | Repository | `ecommerce-review-service` |
-| Stack | Java 25 · Spring Boot 4.0.1 · Spring MVC · Spring Data JPA (Hibernate 7.2) · Flyway 11 · Spring Cloud 2025.1.1 (OpenFeign 5.0.1 on Apache HttpClient 5, LoadBalancer, Eureka client) · springdoc 2.8.5 · Lombok. The resilience4j circuit-breaker starter is on the classpath but not wired to anything (see [Outbound calls](#outbound-calls)). |
+| Stack | Java 25 · Spring Boot 4.0.9 · Spring MVC · Spring Data JPA (Hibernate 7.2) · Flyway 11 · Spring Cloud 2025.1.4 (OpenFeign 5.0.1 on Apache HttpClient 5, LoadBalancer, Eureka client) · springdoc 2.8.5 · Lombok. The resilience4j circuit-breaker starter is on the classpath but not wired to anything (see [Outbound calls](#outbound-calls)). |
 | Port | 8087 |
 | Eureka service ID | `review-service` |
 | Gateway routes | `/api/v1/reviews/**`; `/api-docs/review-service` (rewritten to `/api-docs`) for the gateway's Swagger UI |
@@ -106,10 +106,10 @@ stateDiagram-v2
 4. **Title and body lengths.** On create, `@NotBlank` plus `@Size(min = 3, max = 255)` for the title and `@Size(min = 10, max = 2000)` for the body. On update there is only `@Size`, so a title of three spaces is accepted on update but not on create.
 5. **New reviews start as `PENDING`.** Set in `createReview()`.
 6. **Only the author can edit.** `ReviewService.updateReview()` compares the stored `customerId` with `X-Username` and throws `UnauthorizedReviewAccessException` (403) on a mismatch. Admins get no exemption. A `null` field leaves the stored value unchanged. Every update, even `{}`, which changes no field, sets `status = PENDING` (re-moderation) and `updatedAt = now`.
-7. **The author or an admin can delete.** `ReviewService.deleteReview()` allows the call when `"ADMIN".equalsIgnoreCase(X-User-Role)` or when `X-Username` equals the author, and throws 403 otherwise. The review's votes go with it (JPA `cascade = ALL` and `ON DELETE CASCADE` in the schema).
-8. **Moderation sets any status.** `ReviewService.moderateReview()` writes the requested status and `updatedAt`. There is no role check and no transition rule; `APPROVED → PENDING` and `REJECTED → APPROVED` are as valid as `PENDING → APPROVED`.
-9. **One vote per user per review.** `ReviewService.voteOnReview()` finds the caller's existing vote (`ReviewVoteRepository.findByReviewIdAndCustomerId()`) and overwrites its `helpful` flag, or inserts a new vote. The unique constraint `uq_vote_review_customer` backs this up; concurrent first votes by the same user can end in a 500. There is no rule against voting on your own review, no rule against voting on `PENDING` or `REJECTED` reviews, and no way to withdraw a vote.
-10. **The default product listing shows approved reviews only.** `ReviewController.getByProduct()` defaults `approvedOnly` to `true`. With `false`, `ReviewService.getReviewsByProduct()` returns every status.
+7. **The author or an admin can delete.** `ReviewService.deleteReview()` allows the call when `"ADMIN".equals(X-User-Role)` (exact case) or when `X-Username` equals the author, and throws 403 otherwise. The review's votes go with it (JPA `cascade = ALL` and `ON DELETE CASCADE` in the schema).
+8. **Moderation is admin-only and sets any status.** `ReviewController.moderate()` requires `X-User-Role` exactly `ADMIN` (401 without identity, else 403); `ReviewService.moderateReview()` writes the requested status and `updatedAt`. There is no transition rule; `APPROVED → PENDING` and `REJECTED → APPROVED` are as valid as `PENDING → APPROVED`.
+9. **One vote per user per review.** `ReviewService.voteOnReview()` finds the caller's existing vote (`ReviewVoteRepository.findByReviewIdAndCustomerId()`) and overwrites its `helpful` flag, or inserts a new vote. The unique constraint `uq_vote_review_customer` backs this up; a concurrent first vote by the same user is 409. An author cannot vote on their own review (403), only `APPROVED` reviews take votes (others are 404), and there is no way to withdraw a vote.
+10. **The default product listing shows approved reviews only.** `ReviewController.getByProduct()` defaults `approvedOnly` to `true`. With `false`, `ReviewService.getReviewsByProduct()` returns every status, but the controller honours `false` for `ADMIN` only. `PENDING` and `REJECTED` reviews are otherwise visible only to their author and admins (by id, by customer).
 11. **Summary.** `ReviewService.getProductReviewSummary()`:
     - `averageRating` is the mean rating of `APPROVED` reviews, rounded half-up to one decimal (`Math.round(average * 10.0) / 10.0`), or `0.0` when there are none.
     - `ratingDistribution` counts `APPROVED` reviews per rating. Keys 1 to 5 are always present, with 0 for missing ratings.
@@ -294,35 +294,35 @@ Where the entities and the migrations differ:
 ## Security and identity
 
 The service has no Spring Security and does not see the JWT. It trusts the
-identity headers the gateway sets on authenticated routes:
+identity headers the gateway sets on authenticated routes, and enforces identity,
+ownership and role itself:
 
 | Header | Read by | Default when absent | Used for |
 |---|---|---|---|
-| `X-Username` | `createReview`, `updateReview`, `deleteReview`, `vote` in `ReviewController` | `anonymous` | the author (`customerId`) on create; the ownership check on update and delete; the voter |
-| `X-User-Role` | `deleteReview` only | `CUSTOMER` | the admin override on delete |
+| `X-Username` | create, update, delete, vote, and reads of unapproved reviews in `ReviewController` | none: writes answer 401 `Authentication required`; over 255 characters or a NUL byte is 400 | the author (`customerId`) on create; the ownership check on update and delete; the voter |
+| `X-User-Role` | delete, moderate, unapproved reads, `approvedOnly=false` | not admin | exactly `ADMIN` (no trimming, no case folding) |
 | `X-User-Id` | nothing | — | sent by the gateway (and pinned by the gateway's pact) but ignored |
 
 | Endpoint | Gateway | Service-side check |
 |---|---|---|
-| `POST /api/v1/reviews` | JWT | none; the author is `X-Username` |
-| `GET /api/v1/reviews/{id}` | JWT | none; returns any status |
-| `GET /api/v1/reviews/product/{productId}` | public | none; `approvedOnly=false` returns `PENDING` and `REJECTED` reviews to anyone |
+| `POST /api/v1/reviews` | JWT | `X-Username` required; the author is `X-Username` |
+| `GET /api/v1/reviews/{id}` | JWT | unapproved: author or `ADMIN` (403) |
+| `GET /api/v1/reviews/product/{productId}` | public | `approvedOnly=false` honoured for `ADMIN` only |
 | `GET /api/v1/reviews/product/{productId}/summary` | public | none |
-| `GET /api/v1/reviews/customer/{customerId}` | JWT | none; any user can list anyone's reviews in any status |
+| `GET /api/v1/reviews/customer/{customerId}` | JWT | unapproved reviews only for that user or `ADMIN` (filtered out otherwise) |
 | `PUT /api/v1/reviews/{id}` | JWT | `X-Username` must equal the author |
-| `DELETE /api/v1/reviews/{id}` | JWT | author, or `X-User-Role` equal to `ADMIN` (case-insensitive) |
-| `PATCH /api/v1/reviews/{id}/moderate` | JWT | **none**: any logged-in user can approve, reject or reset any review, including their own |
-| `POST /api/v1/reviews/{id}/vote` | JWT | none |
+| `DELETE /api/v1/reviews/{id}` | JWT | author, or `X-User-Role` exactly `ADMIN` |
+| `PATCH /api/v1/reviews/{id}/moderate` | JWT, and role `ADMIN` at the gateway | `ADMIN` only |
+| `POST /api/v1/reviews/{id}/vote` | JWT | `X-Username` required; not the author; review `APPROVED` |
 
 Gaps:
 
-- **Moderation is unprotected.** The `@Operation` summary says "(Admin)", but `ReviewController.moderate()` reads no header and `ReviewService.moderateReview()` checks nothing. The frontend hides the admin page from customers, but the API does not.
-- **Header trust without the gateway.** Compose publishes port 8087 on the host. A direct call can send `X-User-Role: ADMIN` to delete any review, or another user's `X-Username` to edit their review. A call without headers acts as `anonymous` / `CUSTOMER`. In Kubernetes the Service is cluster-internal (ClusterIP), so only pods can do this.
-- **Unmoderated content is publicly readable** through `approvedOnly=false`, which the frontend's admin page relies on.
-- The actuator exposes `serviceregistry` and full health details without authentication, as on every service.
+- **Moderation is admin-only** at the gateway and in `ReviewController.moderate()`.
+- **Header trust without the gateway.** Compose publishes port 8087 on the host. A direct call can send `X-User-Role: ADMIN` to delete any review, or another user's `X-Username` to edit their review. A call without headers is 401. In Kubernetes the Service is cluster-internal (ClusterIP), so only pods can do this.
+- **Unmoderated content** is readable only by its author and admins; the frontend's admin page uses `approvedOnly=false` as an admin.
+- `serviceregistry` answers 403 to non-loopback callers and health details are hidden, as on every service. Error messages are fixed strings, responses carry `nosniff` and `no-store`, and logged user input is sanitised (`LogSanitizer`).
 
-On the public `GET /api/v1/reviews/product/**` routes the gateway forwards any
-client-supplied `X-User-*` headers untouched, but those two endpoints read none.
+The gateway strips client-supplied `X-User-*` headers on every request, public routes included.
 
 ## Configuration
 
@@ -351,7 +351,7 @@ and the `java-env` ConfigMap.
 | `eureka.instance.lease-renewal-interval-in-seconds` / `lease-expiration-duration-in-seconds` | — | `5` / `15` | a crashed instance leaves the registry in about 20 s |
 | `resilience4j.circuitbreaker.instances.product-service.*` | — | window 10, min calls 5, failure rate 50, open 10 s | not applied to anything |
 | `management.endpoints.web.exposure.include` | — | `health,info,metrics,prometheus,circuitbreakers,serviceregistry` | `serviceregistry` is used by the Kubernetes `preStop` drain |
-| `management.endpoint.health.show-details` | — | `always` | |
+| `management.endpoint.health.show-details` | — | `never` | |
 | `management.endpoint.health.probes.enabled` | `MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED` | Boot default; k8s sets `true` | `/actuator/health/liveness` and `/readiness` for the probes |
 | `management.metrics.tags.application` / `environment` | `ENVIRONMENT` | `review-service` / `development` | common metric tags |
 | `management.metrics.distribution.*` (`http.server.requests`) | — | percentile histogram; SLO 50 ms, 100 ms, 200 ms, 500 ms, 1 s, 2 s | |
@@ -387,11 +387,7 @@ and the `java-env` ConfigMap.
 
 90 unit, slice and pact tests and 22 integration tests.
 
-**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
-
-- `ReviewControllerTest.moderate_byNonAdmin_returns403`: `PATCH /reviews/{id}/moderate` never checks the role, so any customer approves their own review (S-1).
-- `ReviewApiIT.unknownProduct_isAClientError`: a review for a product that product-service answers 404 for returns 500, because `ReviewService` wraps it in a bare `RuntimeException` (R-4, A-4).
-- `ReviewApiIT.productClient_whenProductServiceFails_goesThroughTheFallback`: `spring.cloud.openfeign.circuitbreaker.enabled` is never set, so the fallback and the resilience4j configuration are dead (R-4).
+No tests are disabled for bugs any more; the `@Tag("security")` suite covers identity, ownership, moderation, voting and unpublished-review exposure. The circuit breaker and fallback remain inert (see Known issues).
 
 **Consumer pact with product-service** (`ProductServiceConsumerPactTest`). The
 test builds the real Feign client (the production `FeignConfig`, Boot's Jackson
@@ -452,19 +448,19 @@ Paths are relative to `src/main/java/com/ecommerce/reviewservice/` unless they s
 
 | Issue | Where | Impact | Severity |
 |---|---|---|---|
-| Moderation has no authorization. | `ReviewController.moderate()`, `ReviewService.moderateReview()` | Any logged-in user can approve their own review, reject other people's, or reset any review to `PENDING`. | High |
+| ~~Moderation has no authorization~~ | fixed | see the security fix spec | — |
 | A missing product and an unreachable product-service both end in a 500 with a generic message. | `ReviewService.createReview()` (catch-all `try`), `GlobalExceptionHandler.handleGeneric()` | Clients can't tell "no such product" (should be 404 or 422) from an outage (should be 503), and every attempt is logged at ERROR. The consumer pact test records this as today's behaviour. | Medium |
 | The circuit breaker and the fallback are inert. | `ProductServiceClient` (`fallback`), `application.yaml` (`resilience4j.*`, no `spring.cloud.openfeign.circuitbreaker.enabled`) | No fast failure while product-service is down: each create waits for the retries or the 10 s read timeout. The `CircuitBreakerOpen` alert and the Grafana circuit-breaker panel can never fire for this service. | Medium |
-| `approvedOnly=false` is available to anonymous callers. | `ReviewController.getByProduct()`; gateway public prefix `/api/v1/reviews/product/` | Anyone can read `PENDING` and `REJECTED` reviews, which defeats moderation for reads. | Medium |
-| Identity headers are trusted without verification, with permissive defaults. | `ReviewController` (`@RequestHeader` defaults `anonymous` / `CUSTOMER`) | With direct access to port 8087 (published by compose), a caller can delete any review with `X-User-Role: ADMIN` or edit anyone's review by setting their `X-Username`. | Medium |
-| `GET /{id}` and `GET /customer/{customerId}` return reviews in every status to any authenticated user. | `ReviewService.getReviewById()`, `getReviewsByCustomer()` | Rejected or not-yet-moderated text is readable by other users. | Low |
-| Duplicate checks race with concurrent requests. | `createReview()`, `voteOnReview()` | The unique constraints hold, but the losing request gets a 500 (`DataIntegrityViolationException` through the catch-all) instead of 409 or an update. | Low |
-| The catch-all `@ExceptionHandler(Exception.class)` also swallows framework exceptions that have their own status. | `GlobalExceptionHandler.handleGeneric()` | An unknown path (`NoResourceFoundException`), an unsupported `Content-Type` (`HttpMediaTypeNotSupportedException`) or an unacceptable `Accept` answers 500 instead of 404, 415 or 406, and is logged as an error. | Low |
+| ~~`approvedOnly=false` available to anonymous callers~~ | fixed | see the security fix spec | — |
+| ~~Permissive identity header defaults (`anonymous` / `CUSTOMER`)~~ | fixed | see the security fix spec | — |
+| ~~Unapproved reviews readable by any authenticated user~~ | fixed | see the security fix spec | — |
+| ~~Duplicate-check races returned 500~~ | fixed | see the security fix spec | — |
+| ~~Catch-all swallowed framework exceptions~~ | fixed | see the security fix spec | — |
 | The remote call runs inside the database transaction. | `createReview()` is `@Transactional` around the Feign call | A pooled connection is held for up to about 10 s per create while product-service is slow. | Low |
 | Lists are unpaginated and unordered, and votes load one review at a time. | `getReviewsByProduct()`, `getReviewsByCustomer()`, `toDTO()` | One extra query per review (N+1) and unbounded responses. The summary loads every review of the product just to count them, although the unused `countByProductIdAndStatus()` exists. | Low |
 | Update validation is weaker than create validation. | `UpdateReviewRequest` (only `@Size`) | A whitespace-only title or body can be saved through `PUT`. | Low |
 | `totalReviews` counts every status, while the average and distribution use approved reviews only. | `getProductReviewSummary()` | "4.3 from 10 reviews" can be based on 3 approved reviews. | Low |
 | The product page does not find the user's own review while it is `PENDING`. | frontend `ProductDetailPage.tsx` (`userReview` is searched among approved reviews only) together with rule 5 | After submitting, or after any edit, the page offers "Write a Review" again, and a second submission returns 409. | Low |
-| No verified-purchase check, self-voting allowed, votes on unmoderated reviews allowed, no vote withdrawal, product status ignored, reviews outlive deleted products. | `ReviewService` | Product decisions rather than defects, but none of it is enforced anywhere else either. | Low |
+| No verified-purchase check, no vote withdrawal, product status ignored, reviews outlive deleted products. | `ReviewService` | Product decisions rather than defects, but none of it is enforced anywhere else either. | Low |
 | `OpenApiConfig` declares no server URL. | `config/OpenApiConfig.java` | The gateway's Swagger UI comment states that every service declares the relative server `/`. Without it springdoc derives the server URL from the request it receives, which through the gateway is the instance's own address unless forwarded headers are honoured, so "Try it out" in the gateway UI may not go through the gateway. | Low |
 | Dead code. | `ReviewRepository.countByProductIdAndStatus()`, `ProductServiceClientFallback` | Misleading to readers. | Low |

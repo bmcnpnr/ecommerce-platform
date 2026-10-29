@@ -84,7 +84,7 @@ the reasons are in [k8s/README.md](../k8s/README.md).
 
 | Component | Compose (host) | Kubernetes | Credentials |
 |---|---|---|---|
-| Grafana | http://localhost:3001 (container port 3000) | `grafana-lb`, http://localhost:3001 | `admin` / `admin`: `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` in compose, Secret `platform-secrets` in Kubernetes |
+| Grafana | http://localhost:3001 (container port 3000) | `grafana-lb`, http://localhost:3001 | `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD`, generated into `ecommerce-platform/.env` by `init-secrets.sh`; Secret `platform-secrets` in Kubernetes |
 | Prometheus | http://localhost:9090 | `prometheus-lb`, http://localhost:9090 | none |
 | Alertmanager | http://localhost:9093 | `alertmanager-lb`, http://localhost:9093 | none |
 | Loki | http://localhost:3100 (HTTP API, no UI) | in-cluster only, `loki:3100` | none (`auth_enabled: false`) |
@@ -113,8 +113,8 @@ register with itself).
 
 | Setting | Value | Effect |
 |---|---|---|
-| `management.endpoints.web.exposure.include` | `health,info,metrics,prometheus,circuitbreakers,serviceregistry` | `circuitbreakers` only exists where resilience4j is on the classpath (catalog, order, review). `serviceregistry` is what the Kubernetes preStop hook uses to mark a pod `OUT_OF_SERVICE`. |
-| `management.endpoint.health.show-details` | `always` | Health lists every component (database, disk space, Eureka client and so on) with its details, to anyone. |
+| `management.endpoints.web.exposure.include` | `health,info,metrics,prometheus,circuitbreakers,serviceregistry` | `circuitbreakers` only exists where resilience4j is on the classpath (catalog, order, review). `serviceregistry` is what the Kubernetes preStop hook uses to mark a pod `OUT_OF_SERVICE`; it answers 403 to anything but localhost. |
+| `management.endpoint.health.show-details` | `never` | Health shows the overall status only; component details stay internal (S-6). |
 | `management.endpoint.prometheus.access` | `unrestricted` | |
 | `management.metrics.tags` | `application: ${spring.application.name}`, `environment: ${ENVIRONMENT:development}` | Every meter carries both tags. Compose (`x-java-env`) and Kubernetes (`java-env`) set `ENVIRONMENT=development`. |
 | `management.metrics.distribution.percentiles-histogram.http.server.requests` | `true` | Publishes `_bucket` series, so `histogram_quantile` works. |

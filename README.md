@@ -47,6 +47,10 @@ not compile inside the image. Always run the Maven build before building images,
 or the image will silently package the previous jar.
 
 ```bash
+# Once per machine: generate the git-ignored .env with this installation's secrets
+# (JWT, admin, Eureka, Grafana). Compose refuses to start without it.
+./init-secrets.sh
+
 # Build all services + Docker images, then start
 ./build-all.sh --skip-tests
 docker compose up -d
@@ -57,6 +61,7 @@ docker compose up -d
 
 PowerShell:
 ```powershell
+.\init-secrets.ps1          # once per machine
 .\build-all.ps1 -SkipTests
 docker compose up -d
 
@@ -259,8 +264,11 @@ is intended, update the consumer and re-sync.
 | Loki                 | 3100 |
 | Tempo                | 3200 |
 
-Grafana signs in with `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD`
-(default `admin` / `admin`), overridable via `ecommerce-platform/.env`.
+Grafana signs in with `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD`, the
+shop's admin with `ADMIN_USERNAME` / `ADMIN_PASSWORD` and Eureka with `eureka` /
+`EUREKA_PASSWORD`, all generated into `ecommerce-platform/.env` by
+`init-secrets.sh` (`./init-secrets.sh --print` shows them). There are no default
+passwords.
 
 ## Databases
 

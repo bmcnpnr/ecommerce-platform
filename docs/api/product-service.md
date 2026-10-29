@@ -8,12 +8,12 @@ Service overview: [product-service](../services/product-service.md).
 
 **Content type.** Request bodies are `application/json`. Every response except `204` is `application/json`.
 
-**Authentication.** Enforced only by the gateway. `GET` requests under `/api/v1/products` and `/api/v1/categories` are public. `POST`, `PUT`, `PATCH` and `DELETE` need `Authorization: Bearer <JWT>`; without a valid token the gateway answers `401` with an empty body. A token of any role is accepted: the service performs no role or ownership check on any endpoint, and requests sent directly to port 8082 need no token at all. A token can be obtained like this:
+**Authentication.** Enforced only by the gateway. `GET` requests under `/api/v1/products` and `/api/v1/categories` are public. `POST`, `PUT`, `PATCH` and `DELETE` need `Authorization: Bearer <JWT>`; without a valid token the gateway answers `401` with an empty body. The gateway answers `403` unless the token's role is exactly `ADMIN`, and the service checks again (`@AdminOnly`: `401` without identity, `403` for any other role). Requests sent directly to port 8082 skip the gateway, so they need the `X-Username` and `X-User-Role` headers. `/internal/**` is service-to-service only and not routed. An admin token can be obtained like this (`ADMIN_PASSWORD` comes from `ecommerce-platform/.env`):
 
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/users/login \
   -H 'Content-Type: application/json' \
-  -d '{"username":"alice","password":"Passw0rd!123"}' \
+  -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" \
   | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 ```
 
@@ -57,21 +57,30 @@ TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/users/login \
 | `ProductAlreadyExistsException` | 409 | `Conflict` | `Product with SKU already exists: <sku>` or `Category already exists: <name>` |
 | `InsufficientStockException` | 400 | `Bad Request` | `Insufficient stock for product <sku>. Available: <n>, Requested: <m>` |
 | `MethodArgumentNotValidException` (a `@Valid` body failed) | 400 | `Bad Request` | `Validation failed`, plus `fieldErrors` |
-| `HttpMessageNotReadableException` (missing or malformed body, wrong JSON type) | 400 | `Bad Request` | Spring's exception message |
-| `MissingServletRequestParameterException`, `ServletRequestBindingException` | 400 | `Bad Request` | Spring's message, e.g. `Required request parameter 'q' for method parameter type String is not present` |
-| `MethodArgumentTypeMismatchException` (e.g. a non-numeric id) | 400 | `Bad Request` | Spring's exception message |
-| `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | Spring's message, e.g. `Request method 'GET' is not supported` |
+| `HttpMessageNotReadableException` (missing or malformed body, wrong JSON type, unknown enum value, fractional integer) | 400 | `Bad Request` | `Malformed request body` |
+| `MissingServletRequestParameterException`, `ServletRequestBindingException` | 400 | `Bad Request` | `Missing required parameter '<name>'` |
+| `MethodArgumentTypeMismatchException` (e.g. a non-numeric id) | 400 | `Bad Request` | `Invalid value for parameter '<name>'` |
+| invalid request (page size over 100, NUL byte, unknown sort property) | 400 | `Bad Request` | e.g. `Page size must be between 1 and 100`, `Invalid sort property` |
+| missing identity on an admin endpoint | 401 | `Unauthorized` | `Authentication required` |
+| not `ADMIN` | 403 | `Forbidden` | `Access denied` |
+| unmapped path | 404 | `Not Found` | `Resource not found` |
+| `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | `Method not allowed` |
+| unacceptable `Accept` | 406 | `Not Acceptable` | `Not acceptable` |
+| unique-constraint race | 409 | `Conflict` | `Resource already exists` |
+| unsupported `Content-Type` | 415 | `Unsupported Media Type` | `Unsupported media type` |
 | anything else | 500 | `Internal Server Error` | `An unexpected error occurred` (logged at ERROR with the stack trace) |
 
-"Anything else" includes database constraint failures (a concurrent duplicate SKU or category name, an unknown `categoryId` on `PUT`, an unknown `parentCategoryId`, a price too large for `NUMERIC(19,4)`), an unknown `status` value on `PUT`, an unknown `sort` property, an unsupported `Content-Type` (would be 415), an unacceptable `Accept` header (would be 406) and paths that match no endpoint (would be 404).
+"Anything else" is any unexpected failure, e.g. a non-unique database constraint violation.
+
+Every response carries `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
 
 **Pagination.** `GET /api/v1/products` and `GET /api/v1/products/search` take Spring Data's pageable parameters:
 
 | Parameter | Default | Notes |
 |---|---|---|
 | `page` | `0` | Zero-based. Negative or non-numeric values fall back to 0. |
-| `size` | `20` (`@PageableDefault`) | Values below 1 fall back to 20; values above 2000 are capped at 2000. |
-| `sort` | unsorted | `property` or `property,asc` / `property,desc`; repeat the parameter for several keys. Properties are the entity's: `id`, `sku`, `name`, `description`, `price`, `stockQuantity`, `brand`, `categoryId`, `status`, `createdAt`, `updatedAt`. An unknown property returns 500. |
+| `size` | `20` (`@PageableDefault`) | Values below 1 fall back to 20; values above 100 are `400` `Page size must be between 1 and 100`. |
+| `sort` | unsorted | `property` or `property,asc` / `property,desc`; repeat the parameter for several keys. Properties are the entity's: `id`, `sku`, `name`, `description`, `price`, `stockQuantity`, `brand`, `categoryId`, `status`, `createdAt`, `updatedAt`. An unknown property returns 400. |
 
 The response is a Spring Data `Page` serialized directly (`spring.data.web.pageable.serialization-mode` is left at `direct`):
 
@@ -106,22 +115,23 @@ The frontend reads `content`, `totalElements`, `totalPages`, `size`, `number`, `
 
 **Other JSON rules.** Unknown request properties are ignored (Jackson 3 default). `null` fields are written as `null`, not omitted. Key order in the examples follows the DTO declarations; clients must not depend on it.
 
-**Correlation.** Send `X-Correlation-Id` to have it logged and echoed back; otherwise the service generates a UUID and returns it in the same header. It also appears in error bodies as `correlationId`.
+**Correlation.** Send `X-Correlation-Id` (`^[A-Za-z0-9._-]{1,64}$`) to have it logged and echoed back; otherwise the service generates a UUID and returns it in the same header. It also appears in error bodies as `correlationId`.
 
 ## Endpoints
 
 | Method | Path | Gateway auth | Service-side checks | Summary |
 |---|---|---|---|---|
-| POST | `/api/v1/products` | Bearer JWT | none | Create a product |
+| POST | `/api/v1/products` | `ADMIN` | `ADMIN` | Create a product |
 | GET | `/api/v1/products` | Public | none | Page of `ACTIVE` products |
 | GET | `/api/v1/products/{id}` | Public | none | Product by id, any status |
 | GET | `/api/v1/products/sku/{sku}` | Public | none | Product by SKU, any status |
 | GET | `/api/v1/products/search` | Public | none | Page of `ACTIVE` products whose name contains `q` |
 | GET | `/api/v1/products/category/{categoryId}` | Public | none | `ACTIVE` products of one category |
-| PUT | `/api/v1/products/{id}` | Bearer JWT | none | Partial update |
-| PATCH | `/api/v1/products/{id}/stock` | Bearer JWT | none | Add or remove stock |
-| DELETE | `/api/v1/products/{id}` | Bearer JWT | none | Soft delete |
-| POST | `/api/v1/categories` | Bearer JWT | none | Create a category |
+| PUT | `/api/v1/products/{id}` | `ADMIN` | `ADMIN` | Partial update |
+| PATCH | `/api/v1/products/{id}/stock` | `ADMIN` | `ADMIN` | Add or remove stock |
+| PATCH | `/internal/v1/products/{id}/stock` | not routed | none | Same, for order-service |
+| DELETE | `/api/v1/products/{id}` | `ADMIN` | `ADMIN` | Soft delete |
+| POST | `/api/v1/categories` | `ADMIN` | `ADMIN` | Create a category |
 | GET | `/api/v1/categories` | Public | none | All categories |
 | GET | `/api/v1/categories/{id}` | Public | none | Category by id |
 
@@ -129,7 +139,7 @@ The frontend reads `content`, `totalElements`, `totalPages`, `size`, `number`, `
 
 Creates a product with status `ACTIVE`.
 
-**Auth:** Bearer JWT at the gateway (any role); no service-side checks. The OpenAPI summary says "ADMIN", but nothing enforces it.
+**Auth:** `ADMIN` (403 at the gateway and in the service for any other role).
 
 **Request body** `CreateProductRequest`
 
@@ -138,7 +148,7 @@ Creates a product with status `ACTIVE`.
 | `sku` | string | yes | `@NotBlank` "SKU is required"; `@Size(max = 100)` "size must be between 0 and 100" | Must not exist yet (409). Case-sensitive. Cannot be changed later. |
 | `name` | string | yes | `@NotBlank` "Name is required"; `@Size(max = 200)` "size must be between 0 and 200" | |
 | `description` | string | no | — | Unlimited (`TEXT`). |
-| `price` | number | yes | `@NotNull` "Price is required"; `@DecimalMin("0.01")` "Price must be greater than 0" | At most 15 integer digits and 4 decimals are stored. |
+| `price` | number | yes | `@NotNull` "Price is required"; `@DecimalMin("0", exclusive)` "Price must be greater than 0"; `@Digits(15, 2)` "Price must have at most 15 integer digits and 2 decimals" | More digits are `400`, not rounded. |
 | `stockQuantity` | integer | yes | `@NotNull` "Stock quantity is required"; `@Min(0)` "Stock quantity cannot be negative" | The product is `ACTIVE` even when this is 0. |
 | `brand` | string | no | `@Size(max = 100)` "size must be between 0 and 100" | |
 | `categoryId` | integer | no | Must reference an existing category (404 otherwise). | |
@@ -177,7 +187,8 @@ Creates a product with status `ACTIVE`.
 - `400` validation failure (`fieldErrors` set) or malformed JSON.
 - `404` `Category not found: <categoryId>`.
 - `409` `Product with SKU already exists: <sku>`.
-- `500` when two requests create the same SKU at the same time (the unique constraint rejects the second), or when the price overflows `NUMERIC(19,4)`.
+- `401` / `403` not an admin.
+- `409` `Resource already exists` when two requests create the same SKU at the same time.
 
 **Side effects:** one `INSERT` into `products`; log line `Product created: SKU=<sku>`. No events.
 
@@ -200,13 +211,13 @@ Returns a page of products whose status is `ACTIVE`. `OUT_OF_STOCK` and `INACTIV
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
 | `page` | query | integer | no | `0` | See [Pagination](#conventions). |
-| `size` | query | integer | no | `20` | 1 to 2000. |
+| `size` | query | integer | no | `20` | 1 to 100. |
 | `sort` | query | string | no | unsorted | `property`, `property,asc` or `property,desc`; repeatable. |
 
 **Responses**
 
 - `200 OK` with a [`Page`](#page) of [`ProductDTO`](#productdto).
-- `500` for an unknown `sort` property.
+- `400` for an unknown `sort` property or a `size` over 100.
 
 **Side effects:** none.
 
@@ -295,14 +306,14 @@ Returns a page of `ACTIVE` products whose `name` contains `q`, ignoring case. On
 |---|---|---|---|---|---|
 | `q` | query | string | yes | — | Missing: 400. |
 | `page` | query | integer | no | `0` | |
-| `size` | query | integer | no | `20` | 1 to 2000. |
+| `size` | query | integer | no | `20` | 1 to 100. |
 | `sort` | query | string | no | unsorted | `property`, `property,asc` or `property,desc`; repeatable. |
 
 **Responses**
 
 - `200 OK` with a [`Page`](#page) of [`ProductDTO`](#productdto).
 - `400` `q` missing.
-- `500` for an unknown `sort` property.
+- `400` for an unknown `sort` property or a `size` over 100.
 
 **Side effects:** none.
 
@@ -341,7 +352,7 @@ curl -s http://localhost:8080/api/v1/products/category/10
 
 Partially updates a product: every non-null field in the body replaces the stored value, every `null` or absent field is left unchanged, so a field cannot be cleared. SKU and stock cannot be changed here; if the body contains `sku` or `stockQuantity` they are silently ignored (use the stock endpoint for stock).
 
-**Auth:** Bearer JWT at the gateway (any role); no service-side checks.
+**Auth:** `ADMIN`.
 
 **Path parameters**
 
@@ -357,8 +368,8 @@ Partially updates a product: every non-null field in the body replaces the store
 | `description` | string | no | — | |
 | `price` | number | no | `@DecimalMin("0.01")` "Price must be greater than 0" | |
 | `brand` | string | no | `@Size(max = 100)` | |
-| `categoryId` | integer | no | Not checked by the service; an unknown id fails on the foreign key (500). | |
-| `status` | string | no | Must be exactly `ACTIVE`, `INACTIVE` or `OUT_OF_STOCK`; anything else returns 500. | Not checked against the stock; `ACTIVE` reactivates a soft-deleted product. |
+| `categoryId` | integer | no | Checked by the service; an unknown id is `404`. | |
+| `status` | string | no | Must be exactly `ACTIVE`, `INACTIVE` or `OUT_OF_STOCK`; anything else returns 400 `Unknown product status: <value>`. | Not checked against the stock; `ACTIVE` reactivates a soft-deleted product. |
 
 ```json
 {
@@ -373,7 +384,8 @@ Partially updates a product: every non-null field in the body replaces the store
 - `200 OK` with the updated [`ProductDTO`](#productdto); `updatedAt` is set.
 - `400` validation failure or malformed JSON.
 - `404` `Product not found with id: <id>`.
-- `500` unknown `status` value or unknown `categoryId`.
+- `400` unknown `status` value.
+- `404` `Category not found: <categoryId>`.
 
 **Side effects:** one `UPDATE products` that writes every column (no optimistic lock, see the service document); no events. The new price is what order-service copies into order items from then on.
 
@@ -389,7 +401,7 @@ curl -s -X PUT http://localhost:8080/api/v1/products/1 \
 
 Adds `delta` to the product's stock. A positive delta adds stock (restock, order cancellation); a negative delta removes it (order reservation); `0` is allowed. order-service calls this with `-quantity` when an item is added to an order and with `+quantity` per item when an order is cancelled.
 
-**Auth:** Bearer JWT at the gateway (any role); no service-side checks. Internal callers reach it through Eureka without a token. The OpenAPI summary says "ADMIN/internal", but nothing enforces it.
+**Auth:** `ADMIN`. order-service calls the same operation on `PATCH /internal/v1/products/{id}/stock` (same body and response, no identity needed), which the gateway never routes.
 
 **Path parameters**
 
@@ -401,7 +413,7 @@ Adds `delta` to the product's stock. A positive delta adds stock (restock, order
 
 | Field | Type | Required | Validation | Notes |
 |---|---|---|---|---|
-| `delta` | integer | yes | `@NotNull` "Delta is required" | Any value; no bounds. A fractional number is truncated toward zero. |
+| `delta` | integer | yes | `@NotNull` "Delta is required" | Any integer; a fractional number is `400`. |
 
 ```json
 { "delta": -2 }
@@ -464,9 +476,9 @@ curl -s -X PATCH http://localhost:8080/api/v1/products/1/stock \
 
 ## DELETE /api/v1/products/{id}
 
-Soft-deletes a product: its status becomes `INACTIVE`. The row stays; the product disappears from the list, search and category endpoints but is still returned by id and SKU. Deleting an already `INACTIVE` product succeeds again.
+Soft-deletes a product: its status becomes `INACTIVE`. The row stays; the product disappears from the list, search and category endpoints but is still returned by id and SKU to an `ADMIN`; other callers get `404`. Deleting an already `INACTIVE` product succeeds again.
 
-**Auth:** Bearer JWT at the gateway (any role); no service-side checks.
+**Auth:** `ADMIN`.
 
 **Path parameters**
 
@@ -491,7 +503,7 @@ curl -s -X DELETE http://localhost:8080/api/v1/products/1 -H "Authorization: Bea
 
 Creates a category, optionally under a parent.
 
-**Auth:** Bearer JWT at the gateway (any role); no service-side checks.
+**Auth:** `ADMIN`.
 
 **Request body** `CreateCategoryRequest`
 
@@ -499,7 +511,7 @@ Creates a category, optionally under a parent.
 |---|---|---|---|---|
 | `name` | string | yes | `@NotBlank` "Category name is required"; `@Size(max = 100)` "size must be between 0 and 100" | Unique (409), case-sensitive. |
 | `description` | string | no | — | |
-| `parentCategoryId` | integer | no | Not checked; an unknown id fails on the foreign key (500). | |
+| `parentCategoryId` | integer | no | An unknown id is `404`. | |
 
 ```json
 { "name": "Accessories", "description": "Mice, keyboards, cables", "parentCategoryId": 10 }
@@ -519,8 +531,8 @@ Creates a category, optionally under a parent.
   }
   ```
 - `400` validation failure or malformed JSON.
-- `409` `Category already exists: <name>`.
-- `500` unknown `parentCategoryId`, or a concurrent create with the same name.
+- `409` `Category already exists: <name>` (also for a concurrent create with the same name).
+- `404` `Category not found: <parentCategoryId>`.
 
 **Side effects:** one `INSERT` into `categories`. No events.
 

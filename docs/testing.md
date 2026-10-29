@@ -210,7 +210,9 @@ cd ecommerce-platform/security-tests
 ```
 
 Known holes follow the bug convention above: `@Disabled("BUG S-<n>: ...")`, `it.fails` or `test.fail(true, 'S-<n>: ...')`.
-Each one was run enabled and seen failing for the stated reason.
+Each one was run enabled and seen failing for the stated reason. Since the 2026-10-30 fixes only the open findings are
+pinned: S-5, S-15 and S-16 in the penetration suite and S-7's token storage in Vitest (see [Security: Open](security.md#open)).
+The live suites need the admin password: they read it from `ecommerce-platform/.env`, or from `E2E_ADMIN_PASSWORD` / `ADMIN_PASSWORD`.
 ZAP's rule levels are in `security-tests/zap-rules.conf`: injection, traversal and RCE rules fail the run, and the known header findings (S-7) are warnings.
 Scan reports go to `security-tests/reports/<time>/summary.md`.
 

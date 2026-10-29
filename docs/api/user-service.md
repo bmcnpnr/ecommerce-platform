@@ -10,16 +10,17 @@ Service overview: [user-service](../services/user-service.md).
 
 ## Conventions
 
-**Content type.** Request bodies are JSON and must be sent with `Content-Type: application/json`. A `POST` or `PUT` body sent with another content type, or without one, fails with 500 (see the error table). Responses are `application/json`; `DELETE` returns no body.
+**Content type.** Request bodies are JSON and must be sent with `Content-Type: application/json`. A `POST` or `PUT` body sent with another content type, or without one, fails with 415 (see the error table). Responses are `application/json`; `DELETE` returns no body.
 
-**Authentication.** The gateway does it; user-service checks nothing.
+**Authentication.** The gateway verifies the token; user-service checks ownership and role from the identity headers.
 
-- Public at the gateway (no token): `POST /register`, `POST /login`, `GET /internal/{username}`.
+- Public at the gateway (no token): `POST /register`, `POST /login`.
 - Every other endpoint needs `Authorization: Bearer <JWT>`. A missing, malformed, badly signed or expired token is answered by the gateway with 401 and an empty body; the request never reaches user-service.
-- On authenticated requests the gateway sets `X-Username` (JWT `sub`), `X-User-Id` (`userId` claim) and `X-User-Role` (`role` claim), overwriting anything the client sent. user-service reads only `X-Username`, and only on `GET /me`.
-- No endpoint checks role or ownership. A 401 from user-service itself (with a JSON body) only ever means failed login.
+- On authenticated requests the gateway sets `X-Username` (JWT `sub`), `X-User-Id` (`userId` claim) and `X-User-Role` (`role` claim), overwriting anything the client sent. `GET /me` uses `X-Username`; `/{id}` endpoints compare the path id with `X-User-Id` (owner) or accept `X-User-Role` exactly `ADMIN`.
+- Missing identity is 401 and someone else's id is 403 `Access denied`. A 401 with a JSON body from user-service is a failed login or missing identity.
+- Responses carry `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
 
-**Correlation id.** Send `X-Correlation-Id` to choose the id; otherwise the service generates a UUID. It is always returned in the `X-Correlation-Id` response header and in error bodies as `correlationId`.
+**Correlation id.** Send `X-Correlation-Id` to choose the id (it must match `^[A-Za-z0-9._-]{1,64}$`); otherwise the service generates a UUID. It is always returned in the `X-Correlation-Id` response header and in error bodies as `correlationId`.
 
 **JSON.** Boot 4 uses Jackson 3 with its defaults (the service sets no `spring.jackson.*`):
 
@@ -49,14 +50,19 @@ Ids are JSON integers (Java `Long`); enums are strings. Nothing is paginated.
 | Exception | Status | `error` | `message` | When |
 |---|---|---|---|---|
 | `MethodArgumentNotValidException` | 400 | `Bad Request` | `Validation failed`, with `fieldErrors` | A `@Valid` body breaks a constraint |
-| `HttpMessageNotReadableException` | 400 | `Bad Request` | The framework's message | Malformed JSON, or no body. For a missing body the message names the controller method, for example `Required request body is missing: public org.springframework.http.ResponseEntity<com.ecommerce.user.dto.UserDTO> com.ecommerce.user.controller.UserController.register(com.ecommerce.user.dto.RegisterRequest)` |
-| `MethodArgumentTypeMismatchException` | 400 | `Bad Request` | The framework's message, naming the parameter and the Java types | Non-numeric `{id}` |
-| `ServletRequestBindingException` (includes `MissingRequestHeaderException`), `MissingServletRequestParameterException` | 400 | `Bad Request` | For example `Required request header 'X-Username' for method parameter type String is not present` | `GET /me` without `X-Username`; only possible on direct calls |
-| `InvalidCredentialsException` | 401 | `Unauthorized` | `Invalid username or password`, `Account is inactive` or `Account is suspended` | Login |
-| `UserNotFoundException` | 404 | `Not Found` | `User not found with id: <id>` or `User not found: <username>` | Unknown id or username |
-| `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | For example `Request method 'PATCH' is not supported` | Wrong verb on a mapped path |
-| `UserAlreadyExistsException` | 409 | `Conflict` | `Username already taken: <username>` or `Email already registered: <email>` | Registration |
-| Anything else | 500 | `Internal Server Error` | `An unexpected error occurred` | Includes a wrong or missing `Content-Type` (`HttpMediaTypeNotSupportedException`), a GET on an unmapped path such as `/api/v1/users` (`NoResourceFoundException`), a concurrent duplicate registration (`DataIntegrityViolationException`) and a password over 72 bytes (`IllegalArgumentException` from BCrypt). Logged at ERROR with the stack trace. |
+| `HttpMessageNotReadableException` | 400 | `Bad Request` | `Malformed request body` | Malformed JSON, or no body |
+| `MethodArgumentTypeMismatchException` | 400 | `Bad Request` | `Invalid value for parameter '<name>'` | Non-numeric `{id}` |
+| `ServletRequestBindingException`, `MissingServletRequestParameterException` | 400 | `Bad Request` | `Missing or invalid request parameter` | Missing required header or parameter |
+| `InvalidCredentialsException` | 401 | `Unauthorized` | `Invalid username or password` | Login, whatever the reason |
+| missing identity | 401 | `Unauthorized` | `Authentication required` | `/me` or `/{id}` without `X-Username` / `X-User-Id` |
+| `ForbiddenException` | 403 | `Forbidden` | `Access denied` | `/{id}` of another user, caller not `ADMIN` |
+| `UserNotFoundException` | 404 | `Not Found` | `User not found with id: <id>` or `User not found: <username>` | Unknown id or username; an unmapped path gives `Resource not found` |
+| `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | `Method not allowed` | Wrong verb on a mapped path |
+| not acceptable | 406 | `Not Acceptable` | `Not acceptable` | Unsupported `Accept` |
+| `UserAlreadyExistsException` | 409 | `Conflict` | `Username already taken: <username>` or `Email already registered: <email>`; `Resource already exists or violates a constraint` for a race | Registration |
+| unsupported media type | 415 | `Unsupported Media Type` | `Unsupported media type` | Wrong or missing `Content-Type` |
+| `TooManyLoginAttemptsException` | 429 | `Too Many Requests` | `Too many failed login attempts. Try again later.` | Login lockout; `Retry-After` header in seconds |
+| Anything else | 500 | `Internal Server Error` | `An unexpected error occurred` | Logged at ERROR with the stack trace. |
 
 Field error messages are the ones declared on the DTOs. Constraints declared without a message use Hibernate Validator's default English text, for example `size must be between 0 and 100`. Several messages can be reported for one field, and the order of `fieldErrors` is not guaranteed.
 
@@ -67,16 +73,15 @@ Field error messages are the ones declared on the DTOs. Constraints declared wit
 | POST | `/api/v1/users/register` | Public | Bean Validation; unique username and email | Create a `CUSTOMER` account |
 | POST | `/api/v1/users/login` | Public | Bean Validation; account status; password | Issue a JWT |
 | GET | `/api/v1/users/me` | Bearer JWT | none; user resolved from `X-Username` | The caller's profile |
-| GET | `/api/v1/users/{id}` | Bearer JWT | none (no ownership check) | Any user's profile by id |
-| PUT | `/api/v1/users/{id}` | Bearer JWT | Bean Validation; no ownership check | Partial update of any user's profile |
-| DELETE | `/api/v1/users/{id}` | Bearer JWT | none (no ownership check) | Soft-delete any user |
-| GET | `/api/v1/users/internal/{username}` | Public | none | Any user's profile by username, no token needed |
+| GET | `/api/v1/users/{id}` | Bearer JWT | owner (`X-User-Id`) or `ADMIN` | A user's profile by id |
+| PUT | `/api/v1/users/{id}` | Bearer JWT | owner or `ADMIN`; Bean Validation | Partial update of a user's profile |
+| DELETE | `/api/v1/users/{id}` | Bearer JWT | owner or `ADMIN` | Soft-delete a user |
 
 ## POST /api/v1/users/register
 
 Creates an account with role `CUSTOMER` and status `ACTIVE`. Used by the frontend's register page, which then sends the user to the login page; registration does not log the user in.
 
-**Auth:** Public. No service-side checks beyond validation and uniqueness.
+**Auth:** Public. No service-side checks beyond validation, the password policy and uniqueness.
 
 **Request body** `RegisterRequest`
 
@@ -84,7 +89,7 @@ Creates an account with role `CUSTOMER` and status `ACTIVE`. Used by the fronten
 |---|---|---|---|---|
 | `username` | string | yes | `@NotBlank` (`Username is required`); `@Size(min = 3, max = 50)` (`Username must be between 3 and 50 characters`); `@Pattern("^[a-zA-Z0-9_]+$")` (`Username can only contain letters, digits, and underscores`) | Unique, case-sensitive. Becomes the JWT `sub` and the platform-wide user name. Cannot be changed later. |
 | `email` | string | yes | `@NotBlank` (`Email is required`); `@Email` (`Invalid email format`); `@Size(max = 100)` (`size must be between 0 and 100`) | Unique, case-sensitive. Cannot be changed later. |
-| `password` | string | yes | `@NotBlank` (`Password is required`); `@Size(min = 8)` (`Password must be at least 8 characters`) | No complexity rule and no validated maximum, but more than 72 UTF-8 bytes fails with 500. Stored as a BCrypt hash (cost 10). |
+| `password` | string | yes | `@NotBlank` (`Password is required`); `@PasswordPolicy` | 10 to 72 UTF-8 bytes (`Password must be between 10 and 72 bytes long`), must not contain the username (`Password must not contain the username`), must not be a common password (`Password is too common`); all 400 on field `password`. Stored as a BCrypt hash (cost 10). |
 | `firstName` | string | no | `@Size(max = 50)` (`size must be between 0 and 50`) | |
 | `lastName` | string | no | `@Size(max = 50)` (`size must be between 0 and 50`) | |
 | `phoneNumber` | string | no | `@Size(max = 20)` (`size must be between 0 and 20`) | No format check |
@@ -130,7 +135,7 @@ Any other property, `role` included, is ignored. The default addresses cannot be
     "fieldErrors": [
       { "field": "username", "message": "Username must be between 3 and 50 characters" },
       { "field": "email", "message": "Invalid email format" },
-      { "field": "password", "message": "Password must be at least 8 characters" }
+      { "field": "password", "message": "Password must be between 10 and 72 bytes long" }
     ],
     "message": "Validation failed",
     "path": "/api/v1/users/register",
@@ -141,7 +146,8 @@ Any other property, `role` included, is ignored. The default addresses cannot be
 
 - `409` `Username already taken: <username>`. The username is checked first, so a request that duplicates both gets this message.
 - `409` `Email already registered: <email>`.
-- `500` when the password is over 72 bytes, when two identical registrations race past the uniqueness check, or when the content type is not JSON.
+- `409` `Resource already exists or violates a constraint` when two identical registrations race past the uniqueness check.
+- `415` when the content type is not JSON.
 
 **Side effects:** one `INSERT` into `app_users`. No events, no other calls.
 
@@ -187,11 +193,10 @@ The response does not contain the user's id; read it from `GET /me` or from the 
 
 The checks run in this order (`UserService.login()`):
 
-1. Unknown username: `401` `Invalid username or password`.
-2. Status `INACTIVE` or `SUSPENDED`: `401` `Account is inactive` or `Account is suspended`, whatever password was sent.
-3. Wrong password: `401` `Invalid username or password`.
+1. A username locked out by earlier failures: `429` with `Retry-After`.
+2. Unknown username, wrong password, `INACTIVE` or `SUSPENDED` account: the same `401` `Invalid username or password`. Unknown users still pay a BCrypt comparison.
 
-Also `400` when a field is blank or the JSON is malformed. There is no lockout or rate limit.
+Also `400` when a field is blank or the JSON is malformed. 5 failed logins for a username within 15 minutes lock it (unknown usernames count too); the state is in memory, per instance.
 
 **Side effects:** none. Login is a read-only transaction; nothing records the login.
 
@@ -208,7 +213,7 @@ TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/users/login \
 
 Returns the profile of the user named by `X-Username`. Through the gateway that is always the token's `sub`. The frontend uses it on the profile page and to pre-fill the checkout addresses.
 
-**Auth:** Bearer JWT at the gateway. No service-side checks: the user is resolved from the header.
+**Auth:** Bearer JWT at the gateway; the service answers 401 `Authentication required` without `X-Username`. The user is resolved from the header.
 
 **Headers**
 
@@ -221,7 +226,7 @@ Returns the profile of the user named by `X-Username`. Through the gateway that 
 - `200 OK` with a [`UserDTO`](#userdto), whatever the account's status.
 - `401` from the gateway, empty body: no valid token.
 - `404` `User not found: <username>`: the token names a user that no longer exists (for example after the database was reset).
-- `400` `Required request header 'X-Username' ...`: header absent, which only happens on direct calls.
+- `401` `Authentication required`: header absent, which only happens on direct calls.
 
 **Side effects:** none.
 
@@ -235,7 +240,7 @@ curl -s http://localhost:8080/api/v1/users/me -H "Authorization: Bearer $TOKEN"
 
 Returns the profile with the given id.
 
-**Auth:** Bearer JWT at the gateway. No service-side checks: any authenticated caller can read any user's profile, including email, phone number and addresses. The frontend's API client defines this call but no page uses it.
+**Auth:** Bearer JWT at the gateway. Owner (`X-User-Id` equals `{id}`) or `ADMIN`; otherwise 403 `Access denied`. The frontend's API client defines this call but no page uses it.
 
 **Path parameters**
 
@@ -247,7 +252,8 @@ Returns the profile with the given id.
 
 - `200 OK` with a [`UserDTO`](#userdto), whatever the account's status.
 - `400` non-numeric id.
-- `401` from the gateway, empty body.
+- `401` from the gateway, empty body; `Authentication required` from the service when the identity header is missing.
+- `403` `Access denied`: another user's id, caller not `ADMIN`.
 - `404` `User not found with id: <id>`.
 
 **Side effects:** none.
@@ -258,36 +264,11 @@ Returns the profile with the given id.
 curl -s http://localhost:8080/api/v1/users/42 -H "Authorization: Bearer $TOKEN"
 ```
 
-## GET /api/v1/users/internal/{username}
-
-Returns the profile of the named user. Labelled "Internal endpoint - get user by username (service-to-service)", but no service, script or frontend code calls it.
-
-**Auth:** Public. The gateway lets `/api/v1/users/internal/` through without a token and user-service permits it, so anyone who can reach the gateway can read any account's personal data and probe which usernames exist. No service-side checks.
-
-**Path parameters**
-
-| Name | In | Type | Required | Constraints |
-|---|---|---|---|---|
-| `username` | path | string | yes | Exact, case-sensitive match |
-
-**Responses**
-
-- `200 OK` with a [`UserDTO`](#userdto), whatever the account's status.
-- `404` `User not found: <username>`.
-
-**Side effects:** none.
-
-**Example** (no token)
-
-```bash
-curl -s http://localhost:8080/api/v1/users/internal/admin
-```
-
 ## PUT /api/v1/users/{id}
 
 Partial profile update despite the verb. Each field that is present and non-null replaces the stored value; absent or `null` fields are left unchanged, so a field cannot be cleared back to null (an empty string is accepted). The frontend's profile page calls it with the id it got from `GET /me`.
 
-**Auth:** Bearer JWT at the gateway. No service-side checks: any authenticated caller can update any user.
+**Auth:** Bearer JWT at the gateway. Owner or `ADMIN`; otherwise 403 `Access denied`.
 
 **Path parameters**
 
@@ -320,6 +301,7 @@ Username, email, password, role and status are not part of the body and cannot b
 - `200 OK` with the updated [`UserDTO`](#userdto).
 - `400` validation failure, malformed JSON or non-numeric id.
 - `401` from the gateway, empty body.
+- `403` `Access denied`.
 - `404` `User not found with id: <id>`.
 
 **Side effects:** `UPDATE app_users` of the changed columns and `updated_at`. No events.
@@ -336,7 +318,7 @@ curl -s -X PUT http://localhost:8080/api/v1/users/42 \
 
 Soft delete: sets the status to `INACTIVE` and keeps the row. Afterwards login answers 401 `Account is inactive`; the username and email stay taken; reads still return the user. Tokens already issued stay valid until they expire (up to one hour). Nothing can reactivate the account. The frontend's API client defines this call but no page uses it.
 
-**Auth:** Bearer JWT at the gateway. No service-side checks: any authenticated caller can deactivate any account, `admin` included.
+**Auth:** Bearer JWT at the gateway. Owner or `ADMIN`; otherwise 403 `Access denied`.
 
 **Path parameters**
 
@@ -349,6 +331,7 @@ Soft delete: sets the status to `INACTIVE` and keeps the row. Afterwards login a
 - `204 No Content`, also when the user is already inactive.
 - `400` non-numeric id.
 - `401` from the gateway, empty body.
+- `403` `Access denied`.
 - `404` `User not found with id: <id>`.
 
 **Side effects:** `UPDATE app_users SET status = 'INACTIVE', updated_at = now`. No events.
@@ -361,20 +344,20 @@ curl -i -X DELETE http://localhost:8080/api/v1/users/42 -H "Authorization: Beare
 
 ## Operational endpoints
 
-Served on port 8081 only. The gateway does not route these paths to user-service. All are unauthenticated.
+Served on port 8081 only. The gateway does not route these paths to user-service. No authentication, except `serviceregistry`, which answers 403 to non-loopback callers.
 
 | Method | Path | Purpose |
 |---|---|---|
-| GET | `/actuator/health` | Aggregate health with details (database, disk, discovery). Kubernetes also gets `/actuator/health/liveness` and `/actuator/health/readiness`. |
+| GET | `/actuator/health` | Aggregate health, status only (`show-details: never`). Kubernetes also gets `/actuator/health/liveness` and `/actuator/health/readiness`. |
 | GET | `/actuator/info`, `/actuator/metrics`, `/actuator/prometheus` | Info, metrics, Prometheus scrape |
-| GET, POST | `/actuator/serviceregistry` | Read or set the Eureka status. The Kubernetes `preStop` hook POSTs `{"status":"OUT_OF_SERVICE"}` before shutdown. |
+| GET, POST | `/actuator/serviceregistry` | Read or set the Eureka status, loopback only. The Kubernetes `preStop` hook POSTs `{"status":"OUT_OF_SERVICE"}` before shutdown. |
 | GET | `/api-docs`, `/swagger-ui.html` | OpenAPI document and Swagger UI |
 
 ## Schemas
 
 ### UserDTO
 
-`dto/UserDTO.java`, built by `UserService.toDTO()`. Returned by register, `/me`, `/{id}`, `/internal/{username}` and `PUT /{id}`. The password hash and `updatedAt` are never exposed.
+`dto/UserDTO.java`, built by `UserService.toDTO()`. Returned by register, `/me`, `/{id}` and `PUT /{id}`. The password hash and `updatedAt` are never exposed.
 
 | Field | JSON type | Nullable | Notes |
 |---|---|---|---|
@@ -407,7 +390,7 @@ Built by `JwtService.generateToken()` with JJWT 0.12.6 and signed with HMAC-SHA 
 
 | Part | Name | JSON type | Value |
 |---|---|---|---|
-| header | `alg` | string | Chosen from the secret's length: `HS256` for 32-47 bytes, `HS384` for 48-63, `HS512` for 64 or more. `HS384` with the default 55-byte secret. |
+| header | `alg` | string | Chosen from the secret's length: `HS512`, because the secret must be at least 64 bytes. |
 | payload | `sub` | string | Username. The gateway forwards it as `X-Username`. |
 | payload | `userId` | integer | User id. The gateway forwards it as `X-User-Id`. |
 | payload | `role` | string | `CUSTOMER` or `ADMIN`. The gateway forwards it as `X-User-Role`. |

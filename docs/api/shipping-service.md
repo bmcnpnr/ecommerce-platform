@@ -11,10 +11,12 @@ Service overview: [shipping-service](../services/shipping-service.md).
 
 - **Content type:** request and response bodies are `application/json`. The only exception is `GET /hello`, which returns `text/plain`.
 - **Authentication:**
-  - `/api/v1/shipments/tracking/` and everything under it is public at the gateway for every HTTP method. The service maps only `GET` there.
+  - `GET /api/v1/shipments/tracking/{trackingNumber}` is public at the gateway (`GET` only).
   - Every other path needs `Authorization: Bearer <JWT>`. Without a valid token the gateway answers 401 with an empty body.
-  - The service itself reads no `X-User-*` header and applies no role or ownership rule.
-- **Correlation:** every response carries `X-Correlation-Id`. The service reuses the incoming value or generates a UUID.
+  - `POST /api/v1/shipments` and `PATCH /{id}/status` are admin-only: 403 at the gateway unless the role is exactly `ADMIN`, and the service checks again (`401 Authentication required` without `X-Username`, `403 Access denied`).
+  - Reads by order and history are owner-or-admin: the shipment's `customerId` must equal `X-Username`, otherwise 403.
+  - Responses carry `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
+- **Correlation:** every response carries `X-Correlation-Id`. The service reuses the incoming value if it matches `^[A-Za-z0-9._-]{1,64}$`, otherwise generates a UUID.
 - **Dates:** REST uses Spring Boot 4's Jackson 3 defaults (no `spring.jackson.*` settings and no custom mapper). `LocalDateTime` is written as an ISO-8601 local date-time string without zone, for example `2026-11-03T14:30:15.123456`. That includes `estimatedDelivery`, which is a date-time, not a date. Kafka events use a different form (integer arrays); see the [service page](../services/shipping-service.md#events).
 - **Enums** are sent as their names. Shipment `status` is one of `PENDING`, `PROCESSING`, `SHIPPED`, `OUT_FOR_DELIVERY`, `DELIVERED` or `RETURNED`.
 - **Pagination:** none. The history endpoint returns a plain JSON array.
@@ -35,32 +37,41 @@ Service overview: [shipping-service](../services/shipping-service.md).
 }
 ```
 
-`fieldErrors` is always `null` in this service. It has no handler for `MethodArgumentNotValidException`, so bean-validation failures come back as 500, as the table below shows.
+`fieldErrors` is `null` except on bean-validation failures (`Validation failed`), where it lists `{field, message}` entries.
 
 ### Exception to status mapping
 
 | Exception | Status | `error` | `message` |
 |---|---|---|---|
 | `ShipmentNotFoundException` | 404 | `Not Found` | `Shipment not found for order: {orderId}`, `Shipment not found: {trackingNumber}` or `Shipment not found: {id}` |
-| `InvalidShipmentStateException` | 400 | `Bad Request` | `Shipment already exists for order: {orderId}` or `Cannot update status of a {DELIVERED or RETURNED} shipment` |
-| `HttpMessageNotReadableException` (missing or malformed body), `MethodArgumentTypeMismatchException` (for example a non-numeric `{id}`), `MissingServletRequestParameterException`, `ServletRequestBindingException` | 400 | `Bad Request` | The exception's own message |
-| `HttpRequestMethodNotSupportedException` (for example `POST /api/v1/shipments/tracking/{n}`) | 405 | `Method Not Allowed` | The exception's own message |
-| Anything else: **`MethodArgumentNotValidException` (missing or blank required field)**, `IllegalArgumentException` from an unknown status value, database errors (column length overflow, two shipments for one order), `NoResourceFoundException` (unknown path), `HttpMediaTypeNotSupportedException` | 500 | `Internal Server Error` | `An unexpected error occurred`, logged at ERROR with the stack trace |
+| `InvalidShipmentStateException` | 400 | `Bad Request` | `Unknown shipment status` |
+| `MethodArgumentNotValidException` | 400 | `Bad Request` | `Validation failed`, with `fieldErrors` |
+| `HttpMessageNotReadableException` (missing or malformed body) | 400 | `Bad Request` | `Malformed request body` |
+| `MethodArgumentTypeMismatchException` (for example a non-numeric `{id}`) | 400 | `Bad Request` | `Invalid value for parameter '{name}'` |
+| `MissingServletRequestParameterException`, `ServletRequestBindingException` | 400 | `Bad Request` | `Missing required parameter` / `Invalid request` |
+| `AuthenticationRequiredException` | 401 | `Unauthorized` | `Authentication required` |
+| `AccessDeniedException` | 403 | `Forbidden` | `Access denied` |
+| unmapped path (including a hostile tracking number) | 404 | `Not Found` | `Resource not found` |
+| `HttpRequestMethodNotSupportedException` (for example `POST /api/v1/shipments/tracking/{n}`) | 405 | `Method Not Allowed` | `Method not allowed` |
+| not acceptable | 406 | `Not Acceptable` | `Not acceptable` |
+| `IllegalStatusTransitionException`, `DuplicateShipmentException` | 409 | `Conflict` | `Cannot change status from {A} to {B}`, `Cannot update status of a {DELIVERED or RETURNED} shipment`, `Shipment already exists for order: {orderId}`; `Resource already exists` for a unique-constraint race |
+| `HttpMediaTypeNotSupportedException` | 415 | `Unsupported Media Type` | `Unsupported media type` |
+| Anything else | 500 | `Internal Server Error` | `An unexpected error occurred`, logged at ERROR with the stack trace |
 
 ## Endpoints
 
 | Method | Path | Gateway auth | Service-side checks | Summary |
 |---|---|---|---|---|
-| POST | `/api/v1/shipments` | Bearer JWT | None | Create a shipment manually. No event is published |
-| GET | `/api/v1/shipments/order/{orderId}` | Bearer JWT | None | Get the shipment of an order |
-| GET | `/api/v1/shipments/tracking/{trackingNumber}` | Public, any method | None | Track a shipment by tracking number |
-| PATCH | `/api/v1/shipments/{id}/status` | Bearer JWT | None | Change the status, append history, publish `shipment.updated` |
-| GET | `/api/v1/shipments/{id}/history` | Bearer JWT | None | Status history, oldest first |
+| POST | `/api/v1/shipments` | `ADMIN` | `ADMIN` | Create a shipment manually. No event is published |
+| GET | `/api/v1/shipments/order/{orderId}` | Bearer JWT | owner or `ADMIN` | Get the shipment of an order |
+| GET | `/api/v1/shipments/tracking/{trackingNumber}` | Public, `GET` only | None | Track a shipment by tracking number (limited fields) |
+| PATCH | `/api/v1/shipments/{id}/status` | `ADMIN` | `ADMIN`; transition table (409) | Change the status, append history, publish `shipment.updated` |
+| GET | `/api/v1/shipments/{id}/history` | Bearer JWT | owner or `ADMIN` | Status history, oldest first |
 | GET | `/hello` | Not routed (direct port only) | None | Scaffold greeting |
 
 Shipments are normally created by the `payment.completed` consumer, not by this API.
 
-The examples below assume `GW=http://localhost:8080` and `AUTH="Authorization: Bearer $TOKEN"`. The api-test skill (`.claude/skills/api-test/SKILL.md`) shows how to get a token.
+The examples below assume `GW=http://localhost:8080` and `AUTH="Authorization: Bearer $TOKEN"`; admin-only calls use `ADMIN_AUTH` (a token for `admin` with `ADMIN_PASSWORD` from `ecommerce-platform/.env`). The api-test skill (`.claude/skills/api-test/SKILL.md`) shows how to get a token.
 
 ## POST /api/v1/shipments
 
@@ -71,22 +82,22 @@ Creates a shipment in `PENDING` from the request. This path differs from the aut
 - it ignores `estimatedDelivery`;
 - it does not check whether the order exists or has been paid.
 
-If it runs first, the later `payment.completed` for the order is skipped. No frontend page calls this endpoint; the `shipmentsApi.createShipment()` function exists in the frontend but is unused.
+There is one shipment per order (unique constraint, `V3`): a manual create for an order that already has one is `409`, and the later `payment.completed` for the order is skipped. No frontend page calls this endpoint; the `shipmentsApi.createShipment()` function exists in the frontend but is unused.
 
-**Auth:** Bearer JWT. No service-side checks.
+**Auth:** `ADMIN` only.
 
 **Request body** `CreateShipmentRequest`
 
 | Field | Type | Required | Validation | Notes |
 |---|---|---|---|---|
 | `orderId` | integer (`Long`) | yes | `@NotNull` | The order must not have a shipment yet |
-| `customerId` | string | yes | `@NotBlank` | Stored as-is. At most 255 characters in the database |
-| `originAddress` | string | yes | `@NotBlank` | |
-| `destinationAddress` | string | yes | `@NotBlank` | |
-| `carrier` | string | no | none | Defaults to `DHL`. Free text, at most 50 characters in the database |
-| `estimatedDelivery` | string | no | none | **Ignored.** The service always sets now + 5 days |
+| `customerId` | string | yes | `@NotBlank`, `@Size(max = 255)`, no NUL | |
+| `originAddress` | string | yes | `@NotBlank`, `@Size(max = 1000)`, no NUL | |
+| `destinationAddress` | string | yes | `@NotBlank`, `@Size(max = 1000)`, no NUL | |
+| `carrier` | string | no | `@Size(max = 50)`, no NUL | Defaults to `DHL` |
+| `estimatedDelivery` | string | no | `@Size(max = 64)`, no NUL | **Ignored.** The service always sets now + 5 days |
 
-A violation of `@NotNull` or `@NotBlank` returns **500**, not 400 (see [Conventions](#exception-to-status-mapping)).
+A violation returns 400 with `fieldErrors`.
 
 ```json
 {
@@ -107,7 +118,7 @@ A violation of `@NotNull` or `@NotBlank` returns **500**, not 400 (see [Conventi
     "id": 32,
     "orderId": 8,
     "customerId": "alice",
-    "trackingNumber": "TRACK-9C04E1D7-B",
+    "trackingNumber": "TRACK-9C04E1D7-5A7B33C2",
     "status": "PENDING",
     "carrier": "UPS",
     "originAddress": "Warehouse, 123 Storage St",
@@ -118,15 +129,16 @@ A violation of `@NotNull` or `@NotBlank` returns **500**, not 400 (see [Conventi
   }
   ```
 
-- `400` with `Shipment already exists for order: {orderId}`, or when the body is malformed.
-- `500` when a required field is missing or blank, a value overflows a column, or a tracking number collides.
+- `400` for a validation failure (`fieldErrors`) or a malformed body.
+- `401` / `403` no identity / not an admin.
+- `409` `Shipment already exists for order: {orderId}`.
 
 **Side effects:** inserts one `shipments` row. Nothing is published.
 
 **Example**
 
 ```bash
-curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+curl -s -X POST -H "$ADMIN_AUTH" -H 'Content-Type: application/json' \
   -d '{"orderId":8,"customerId":"alice","originAddress":"Warehouse, 123 Storage St","destinationAddress":"Bagdat Cd. 10, Istanbul","carrier":"UPS"}' \
   "$GW/api/v1/shipments"
 ```
@@ -135,7 +147,7 @@ curl -s -X POST -H "$AUTH" -H 'Content-Type: application/json' \
 
 Returns the shipment of an order. The frontend's `OrderDetailPage` uses this endpoint.
 
-**Auth:** Bearer JWT. No service-side checks.
+**Auth:** Bearer JWT; the shipment's `customerId` must equal `X-Username`, or the caller is `ADMIN` (403 otherwise).
 
 **Path parameters**
 
@@ -147,7 +159,7 @@ Returns the shipment of an order. The frontend's `OrderDetailPage` uses this end
 
 - `200 OK` with a [`ShipmentDTO`](#shipmentdto).
 - `404` with `Shipment not found for order: {orderId}`. This is normal before the payment completes.
-- `500` when the order has two shipments, which the schema does not prevent.
+- `403` the shipment belongs to someone else. An order has at most one shipment.
 
 **Side effects:** none.
 
@@ -159,36 +171,29 @@ curl -s -H "$AUTH" "$GW/api/v1/shipments/order/7"
 
 ## GET /api/v1/shipments/tracking/{trackingNumber}
 
-Public tracking: returns the whole shipment for an exact, case-sensitive tracking number match. The frontend's `TrackingPage` uses this endpoint.
+Public tracking: returns a limited view for an exact, case-sensitive tracking number match. The frontend's `TrackingPage` uses this endpoint.
 
-**Auth:** **Public.** The gateway requires no token on `/api/v1/shipments/tracking/` and everything under it, for any method. Here the service answers only `GET`; other methods get 405. There are no service-side checks.
+**Auth:** **Public**, `GET` only. The gateway requires no token on `/api/v1/shipments/tracking/*`; other methods need a token and the service answers 405. There are no service-side checks.
 
 **Path parameters**
 
 | Name | In | Type | Required | Constraints |
 |---|---|---|---|---|
-| `trackingNumber` | path | string | yes | Format `TRACK-XXXXXXXX-X` with upper-case hex digits. Exact match |
+| `trackingNumber` | path | string | yes | Format `TRACK-XXXXXXXX-XXXXXXXX` with upper-case hex digits (64 bits). Exact match |
 
 **Responses**
 
-- `200 OK` with a [`ShipmentDTO`](#shipmentdto). The response exposes these fields to anyone holding the number:
-  - `id`, `orderId` and `customerId`, which in practice is the customer's username;
-  - both addresses;
-  - `carrier`, `status` and the dates.
+- `200 OK` with a `PublicTrackingDTO`: only `trackingNumber`, `status`, `carrier`, `estimatedDelivery` and the `events` (each with `eventDescription`, `newStatus`, `location`, `eventTimestamp`). No customer, order id, ids or addresses.
 
   ```json
   {
-    "id": 31,
-    "orderId": 7,
-    "customerId": "alice",
-    "trackingNumber": "TRACK-3F2A9C1B-4",
+    "trackingNumber": "TRACK-3F2A9C1B-4D5E6F70",
     "status": "SHIPPED",
     "carrier": "DHL",
-    "originAddress": "Warehouse, 123 Storage St",
-    "destinationAddress": "Customer Address",
     "estimatedDelivery": "2026-11-03T14:30:15.123456",
-    "actualDelivery": null,
-    "createdAt": "2026-10-29T14:30:15.122870"
+    "events": [
+      { "eventDescription": "Left the warehouse", "newStatus": "SHIPPED", "location": "Istanbul hub", "eventTimestamp": "2026-10-30T09:12:44.512031" }
+    ]
   }
   ```
 
@@ -199,7 +204,7 @@ Public tracking: returns the whole shipment for an exact, case-sensitive trackin
 **Example** (no token)
 
 ```bash
-curl -s "$GW/api/v1/shipments/tracking/TRACK-3F2A9C1B-4"
+curl -s "$GW/api/v1/shipments/tracking/TRACK-3F2A9C1B-4D5E6F70"
 ```
 
 ## PATCH /api/v1/shipments/{id}/status
@@ -209,13 +214,13 @@ Sets a shipment's status. This endpoint is the only way a status ever changes: t
 The service handles a request in this order:
 
 1. Load the shipment, or return `404`.
-2. Convert `status` with `ShipmentStatus.valueOf()`. The conversion is case-sensitive, and an unknown value returns `500`.
-3. Refuse with `400` if the current status is `DELIVERED` or `RETURNED`.
+2. Convert `status` with `ShipmentStatus.valueOf()`. The conversion is case-sensitive, and an unknown value returns `400`.
+3. Refuse with `409` unless the move is in the transition table: `PENDING` to `PROCESSING`, `PROCESSING` to `SHIPPED`, `SHIPPED` to `OUT_FOR_DELIVERY` or `RETURNED`, `OUT_FOR_DELIVERY` to `DELIVERED` or `RETURNED`. `DELIVERED` and `RETURNED` are terminal.
 4. Apply the change.
 
-Any status may be set from any non-terminal status, including the current one or an earlier one. Setting `DELIVERED` also sets `actualDelivery` to now.
+Setting `DELIVERED` also sets `actualDelivery` to now.
 
-**Auth:** Bearer JWT. No service-side checks: any logged-in user can change any shipment.
+**Auth:** `ADMIN` only (403 at the gateway and in the service).
 
 **Path parameters**
 
@@ -227,9 +232,9 @@ Any status may be set from any non-terminal status, including the current one or
 
 | Field | Type | Required | Validation | Notes |
 |---|---|---|---|---|
-| `status` | string | yes | `@NotBlank` | Must be an exact `ShipmentStatus` name. Blank or missing gives 500, and an unknown value gives 500 |
-| `location` | string | no | none | Stored in the history and sent in `shipment.updated`. At most 255 characters in the database |
-| `description` | string | no | none | History text. Defaults to `Status updated to {STATUS}`. At most 500 characters in the database |
+| `status` | string | yes | `@NotBlank`, `@Size(max = 30)`, no NUL | Must be an exact `ShipmentStatus` name. Blank or missing gives 400, and an unknown value gives 400 |
+| `location` | string | no | `@Size(max = 255)`, no NUL | Stored in the history and sent in `shipment.updated` |
+| `description` | string | no | `@Size(max = 500)`, no NUL | History text. Defaults to `Status updated to {STATUS}` |
 
 ```json
 { "status": "SHIPPED", "location": "Istanbul hub", "description": "Left the warehouse" }
@@ -238,9 +243,10 @@ Any status may be set from any non-terminal status, including the current one or
 **Responses**
 
 - `200 OK` with the updated [`ShipmentDTO`](#shipmentdto).
-- `400` with `Cannot update status of a DELIVERED shipment` (or `RETURNED`), or when the body is malformed.
+- `400` for a validation failure, an unknown `status` or a malformed body.
+- `401` / `403` no identity / not an admin.
 - `404` with `Shipment not found: {id}`.
-- `500` when `status` is missing or blank, `status` is not an enum name, or `location` or `description` exceeds the column length. In the last case nothing is published: the history row's INSERT runs inside `save()` (IDENTITY id), before `shipment.updated` is sent, so the request rolls back first (pinned by `ShipmentLifecycleIT`). Publishing before commit is still a risk for genuine commit-time failures.
+- `409` with `Cannot change status from {A} to {B}` or `Cannot update status of a DELIVERED shipment` (or `RETURNED`); nothing is published.
 
 **Side effects:**
 
@@ -251,7 +257,7 @@ Any status may be set from any non-terminal status, including the current one or
 **Example**
 
 ```bash
-curl -s -X PATCH -H "$AUTH" -H 'Content-Type: application/json' \
+curl -s -X PATCH -H "$ADMIN_AUTH" -H 'Content-Type: application/json' \
   -d '{"status":"SHIPPED","location":"Istanbul hub","description":"Left the warehouse"}' \
   "$GW/api/v1/shipments/31/status"
 ```
@@ -260,7 +266,7 @@ curl -s -X PATCH -H "$AUTH" -H 'Content-Type: application/json' \
 
 Returns the shipment's status changes in ascending `eventTimestamp` order. Creating a shipment records nothing, so a shipment that has never been PATCHed has an empty history.
 
-**Auth:** Bearer JWT. No service-side checks. The frontend's public `TrackingPage` calls this endpoint too. An anonymous visitor therefore gets 401 there, and the frontend redirects to `/login`.
+**Auth:** Bearer JWT; owner of the shipment or `ADMIN` (403 otherwise). The frontend's public `TrackingPage` no longer calls it: the public tracking response carries the events inline.
 
 **Path parameters**
 
@@ -285,6 +291,7 @@ Returns the shipment's status changes in ascending `eventTimestamp` order. Creat
   ]
   ```
 
+- `403` the shipment belongs to someone else.
 - `404` with `Shipment not found: {id}`.
 
 **Side effects:** none.
@@ -316,7 +323,7 @@ Source: `dto/ShipmentDTO.java`.
 | `id` | integer (`Long`) | Sequential |
 | `orderId` | integer (`Long`) | |
 | `customerId` | string | From `payment.completed` (in practice the username) or from the REST body |
-| `trackingNumber` | string | `TRACK-XXXXXXXX-X` |
+| `trackingNumber` | string | `TRACK-XXXXXXXX-XXXXXXXX` |
 | `status` | string | `ShipmentStatus` name |
 | `carrier` | string | `DHL` unless the REST request set another value |
 | `originAddress` | string | `Warehouse, 123 Storage St` for automatically created shipments |

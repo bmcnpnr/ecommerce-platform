@@ -7,7 +7,8 @@ byte-for-byte.
 
 ```
 00-namespace.yaml            namespace: ecommerce
-01-secrets.yaml              JWT, Grafana and the seven database credentials
+01-secrets.yaml              the seven database credentials (platform-secrets and
+                             eureka-credentials are created by deploy.sh from ../.env)
 02-config.yaml               the java-env ConfigMap (x-java-env from compose)
 05-monitoring-config.yaml    GENERATED from ../../ecommerce-monitoring
 10-databases.yaml            7 database StatefulSets, one per service: 6 postgres + MongoDB for catalogdb

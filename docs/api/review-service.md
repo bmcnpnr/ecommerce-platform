@@ -16,20 +16,21 @@ Service overview, rules and known issues: [review-service](../services/review-se
 without a token. Every other review endpoint needs `Authorization: Bearer <JWT>`;
 without a valid one the gateway answers 401 with an empty body and the request
 never reaches the service. The service itself checks no token. It reads the
-headers the gateway sets from the token:
+headers the gateway sets from the token and enforces identity and ownership:
 
 | Header | Read by | Default if absent | Meaning |
 |---|---|---|---|
-| `X-Username` | create, update, delete, vote | `anonymous` | the caller's username. It becomes the review's `customerId` and is compared with it for ownership. |
-| `X-User-Role` | delete | `CUSTOMER` | `ADMIN` (any case) may delete any review |
+| `X-Username` | create, update, delete, vote, reads of unapproved reviews | none: 401 `Authentication required` on writes | the caller's username. It becomes the review's `customerId` and is compared with it for ownership. Over 255 characters or a NUL byte: 400. |
+| `X-User-Role` | delete, moderate, unapproved reads | treated as not admin | exactly `ADMIN` (no trimming, no case folding, no `ROLE_` prefix) |
 | `X-User-Id` | — | — | ignored |
 
-The defaults only apply to direct calls on port 8087. Through the gateway the
-authenticated routes always carry the headers.
+On direct calls to port 8087 whoever calls chooses the headers. Through the gateway
+the authenticated routes always carry them. Responses carry `nosniff` and `no-store`.
 
 Get a token with `POST /api/v1/users/login` (see [user-service](../services/user-service.md)).
-The seeded administrator is `admin` / `admin`. For a customer, register one first
-with `POST /api/v1/users/register`.
+The seeded administrator is `admin`, with the password from `ADMIN_PASSWORD` in
+`ecommerce-platform/.env`. For a customer, register one first with
+`POST /api/v1/users/register`.
 
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/users/login \
@@ -40,7 +41,7 @@ TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/users/login \
 Run the examples from Git Bash or WSL, not PowerShell 5.1, which strips the
 quotes out of JSON arguments to `curl.exe`.
 
-**Correlation ID.** Send `X-Correlation-Id` to choose one. Otherwise the service
+**Correlation ID.** Send `X-Correlation-Id` to choose one (`^[A-Za-z0-9._-]{1,64}$`). Otherwise the service
 generates a UUID. Either way it comes back in the `X-Correlation-Id` response
 header and in every error body.
 
@@ -75,17 +76,18 @@ header and in every error body.
 |---|---|---|---|
 | `ReviewNotFoundException` | 404 | `Not Found` | `Review not found with id: <id>` |
 | `DuplicateReviewException` | 409 | `Conflict` | `Customer <username> has already reviewed product <productId>` |
-| `UnauthorizedReviewAccessException` | 403 | `Forbidden` | `Only the review author can update this review` or `Only the review author or an admin can delete this review` |
+| `UnauthenticatedException` | 401 | `Unauthorized` | `Authentication required` |
+| `UnauthorizedReviewAccessException` | 403 | `Forbidden` | `Access denied` (a read, moderate) or the specific text: `Only the review author can update this review`, `Only the review author or an admin can delete this review`, `Authors cannot vote on their own review` |
 | `MethodArgumentNotValidException` (Bean Validation on a body) | 400 | `Validation Failed` | `Request validation failed`, with `fieldErrors` |
-| `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | Spring's message, e.g. `Request method 'PATCH' is not supported` |
-| `MissingServletRequestParameterException`, `ServletRequestBindingException`, `HttpMessageNotReadableException` (missing or malformed JSON), `MethodArgumentTypeMismatchException` (e.g. a non-numeric ID or an unknown `status` value) | 400 | `Bad Request` | Spring's or Jackson's exception message, passed through as is |
+| `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | `Method not allowed` |
+| `HttpMessageNotReadableException` (missing or malformed JSON) | 400 | `Bad Request` | `Malformed request body` |
+| `MethodArgumentTypeMismatchException` (e.g. a non-numeric ID or an unknown `status` value) | 400 | `Bad Request` | `Invalid value for parameter '<name>'` |
+| `MissingServletRequestParameterException`, `ServletRequestBindingException` | 400 | `Bad Request` | `Missing or invalid request parameter` |
+| not acceptable / unsupported `Content-Type` / unmapped path | 406 / 415 / 404 | | `Not acceptable` / `Unsupported media type` / `Resource not found` |
+| unique-constraint race (duplicate review, first vote) | 409 | `Conflict` | `Resource already exists or violates a constraint` |
 | anything else | 500 | `Internal Server Error` | `An unexpected error occurred` (the exception is logged at ERROR) |
 
-"Anything else" includes three cases worth knowing:
-
-- product-service says the product does not exist, or product-service can't be reached (`POST /api/v1/reviews`);
-- a concurrent duplicate review or first vote that trips a unique constraint;
-- framework exceptions with their own status, such as an unknown path (would be 404), an unsupported `Content-Type` (415) or an unacceptable `Accept` (406).
+"Anything else" includes product-service saying the product does not exist, or product-service being unreachable (`POST /api/v1/reviews`).
 
 Validation messages are Hibernate Validator's English defaults: `must not be
 null`, `must not be blank`, `must be greater than or equal to 1`, `must be less
@@ -104,15 +106,15 @@ in the JVM's default zone; the images set no `TZ`. `rating` is an integer.
 
 | Method | Path | Gateway auth | Service-side checks | Summary |
 |---|---|---|---|---|
-| `POST` | `/api/v1/reviews` | Bearer JWT | none; the author is `X-Username` | create a review |
-| `GET` | `/api/v1/reviews/{id}` | Bearer JWT | none | get one review, any status |
+| `POST` | `/api/v1/reviews` | Bearer JWT | `X-Username` required (401); the author is `X-Username` | create a review |
+| `GET` | `/api/v1/reviews/{id}` | Bearer JWT | unapproved: author or `ADMIN` | get one review |
 | `GET` | `/api/v1/reviews/product/{productId}` | public | none | list a product's reviews |
 | `GET` | `/api/v1/reviews/product/{productId}/summary` | public | none | a product's rating summary |
-| `GET` | `/api/v1/reviews/customer/{customerId}` | Bearer JWT | none | list one user's reviews, any status |
+| `GET` | `/api/v1/reviews/customer/{customerId}` | Bearer JWT | unapproved ones only for that user or `ADMIN` | list one user's reviews |
 | `PUT` | `/api/v1/reviews/{id}` | Bearer JWT | `X-Username` must be the author | edit a review |
 | `DELETE` | `/api/v1/reviews/{id}` | Bearer JWT | author, or `X-User-Role` `ADMIN` | delete a review |
-| `PATCH` | `/api/v1/reviews/{id}/moderate` | Bearer JWT | **none** | set the moderation status |
-| `POST` | `/api/v1/reviews/{id}/vote` | Bearer JWT | none | cast or change a vote |
+| `PATCH` | `/api/v1/reviews/{id}/moderate` | `ADMIN` | `ADMIN` | set the moderation status |
+| `POST` | `/api/v1/reviews/{id}/vote` | Bearer JWT | `X-Username` required; not the author; review `APPROVED` | cast or change a vote |
 
 ---
 
@@ -122,7 +124,7 @@ Creates a review in status `PENDING`. The service first asks product-service
 whether the product exists, then rejects a second review of the same product by
 the same user.
 
-**Auth:** Bearer JWT. The author is `X-Username`. No role check.
+**Auth:** Bearer JWT. The author is `X-Username`; without it the service answers 401.
 
 **Request body** `CreateReviewRequest`
 
@@ -164,7 +166,7 @@ the same user.
 
 - **400** validation failure (with `fieldErrors`), or a missing or unparsable body.
 - **409** this username already reviewed this product.
-- **500** the product does not exist, **or** product-service is unavailable (no instance, connection refused after 3 attempts, 10 s read timeout, any HTTP error). The body only says `An unexpected error occurred`. Also 500 when two identical requests race and the second hits the unique constraint.
+- **500** the product does not exist, **or** product-service is unavailable (no instance, connection refused after 3 attempts, 10 s read timeout, any HTTP error). The body only says `An unexpected error occurred`.
 
 **Side effects:** one Feign call `GET /api/v1/products/{productId}` to
 product-service (body discarded); one `INSERT` into `reviews`. No events.
@@ -181,9 +183,9 @@ curl -s -X POST http://localhost:8080/api/v1/reviews \
 
 ## GET /api/v1/reviews/{id}
 
-Returns one review in any status.
+Returns one review. `PENDING` and `REJECTED` reviews are visible only to their author and `ADMIN`.
 
-**Auth:** Bearer JWT at the gateway. No service-side checks.
+**Auth:** Bearer JWT at the gateway. For an unapproved review of someone else the service answers 403 `Access denied` (401 without `X-Username`).
 
 **Path parameters**
 
@@ -210,17 +212,17 @@ curl -s http://localhost:8080/api/v1/reviews/11 -H "Authorization: Bearer $TOKEN
 ## GET /api/v1/reviews/product/{productId}
 
 Lists a product's reviews. By default only `APPROVED` ones, which is what the
-product page shows. With `approvedOnly=false` it returns every status; the
+product page shows. With `approvedOnly=false` an `ADMIN` gets every status; anyone else still gets only approved reviews. The
 admin moderation page uses that.
 
-**Auth:** Public at the gateway, including `approvedOnly=false`. No service-side checks.
+**Auth:** Public at the gateway. `approvedOnly=false` is honoured for `ADMIN` only.
 
 **Path / query parameters**
 
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
 | `productId` | path | integer (int64) | yes | — | not checked against product-service; an unknown ID returns `[]` |
-| `approvedOnly` | query | boolean | no | `true` | `false` includes `PENDING` and `REJECTED` |
+| `approvedOnly` | query | boolean | no | `true` | `false` includes `PENDING` and `REJECTED`, for `ADMIN` only |
 
 **Responses**
 
@@ -261,7 +263,7 @@ curl -s 'http://localhost:8080/api/v1/reviews/product/1?approvedOnly=false'
 
 The rating summary for a product's page.
 
-**Auth:** Public at the gateway. No service-side checks.
+**Auth:** Public at the gateway.
 
 **Path parameters**
 
@@ -299,9 +301,9 @@ curl -s http://localhost:8080/api/v1/reviews/product/1/summary
 
 ## GET /api/v1/reviews/customer/{customerId}
 
-Lists every review one user wrote, in every status.
+Lists the reviews one user wrote. `PENDING` and `REJECTED` ones are included only when the caller is that user or `ADMIN`; they are filtered out otherwise.
 
-**Auth:** Bearer JWT at the gateway. No service-side checks: any logged-in user can list anyone's reviews.
+**Auth:** Bearer JWT at the gateway.
 
 **Path parameters**
 
@@ -372,7 +374,7 @@ curl -s -X PUT http://localhost:8080/api/v1/reviews/11 \
 
 Deletes a review and all of its votes.
 
-**Auth:** Bearer JWT. Allowed for the author (`X-Username`) or when `X-User-Role` is `ADMIN` (compared case-insensitively).
+**Auth:** Bearer JWT. Allowed for the author (`X-Username`) or when `X-User-Role` is exactly `ADMIN`; 401 without `X-Username`.
 
 **Path parameters**
 
@@ -401,7 +403,7 @@ curl -s -o /dev/null -w '%{http_code}\n' -X DELETE http://localhost:8080/api/v1/
 
 Sets a review's moderation status. Any status can be set from any status.
 
-**Auth:** Bearer JWT. **No service-side checks.** Although the operation is labelled "(Admin)", any logged-in user can call it (see [Known issues](../services/review-service.md#known-issues-and-limitations)).
+**Auth:** `ADMIN` only: 403 at the gateway unless the role is exactly `ADMIN`, and again in the service (`401` without identity, `403 Access denied`).
 
 **Path / query parameters**
 
@@ -415,7 +417,7 @@ There is no request body.
 **Responses**
 
 - **200** the updated [`ReviewDTO`](#reviewdto).
-- **400** `status` missing (`Required request parameter 'status' ...`) or not one of the three values.
+- **400** `status` missing or not one of the three values.
 - **404** unknown `id`.
 
 **Side effects:** one `UPDATE` of `reviews` (`status`, `updated_at`). An `APPROVED` review starts appearing in the default listing and in the summary.
@@ -424,7 +426,7 @@ There is no request body.
 
 ```bash
 ADMIN_TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/users/login \
-  -H 'Content-Type: application/json' -d '{"username":"admin","password":"admin"}' \
+  -H 'Content-Type: application/json' -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASSWORD\"}" \
   | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
 curl -s -X PATCH 'http://localhost:8080/api/v1/reviews/11/moderate?status=APPROVED' \
   -H "Authorization: Bearer $ADMIN_TOKEN"
@@ -436,10 +438,9 @@ curl -s -X PATCH 'http://localhost:8080/api/v1/reviews/11/moderate?status=APPROV
 
 Records whether the caller found a review helpful. A user has at most one vote
 per review: voting again overwrites the earlier vote. A vote can't be withdrawn.
-The author may vote on their own review, and votes are accepted on reviews in any
-status.
+An author cannot vote on their own review, and only `APPROVED` reviews take votes.
 
-**Auth:** Bearer JWT. The voter is `X-Username`. No other checks.
+**Auth:** Bearer JWT. The voter is `X-Username`; 401 without it.
 
 **Path parameters**
 
@@ -461,8 +462,9 @@ status.
 
 - **200** the [`ReviewDTO`](#reviewdto) with recounted `helpfulVotes` and `unhelpfulVotes`.
 - **400** `helpful` missing or `null`, or an unparsable body.
-- **404** unknown `id`.
-- **500** two first votes by the same user on the same review raced into the unique constraint.
+- **403** `Authors cannot vote on their own review`.
+- **404** unknown `id`, or a review that is not `APPROVED`.
+- **409** two first votes by the same user on the same review raced into the unique constraint.
 
 **Side effects:** an `INSERT` into, or an `UPDATE` of, `review_votes`. The review's `updatedAt` does not change.
 

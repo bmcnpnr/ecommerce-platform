@@ -14,6 +14,31 @@ user can act as any other. **Medium** means a real defect or exposure with a
 workaround or a limited blast radius. **Low** means a quality or maintainability
 issue.
 
+## Resolved on 2026-10-30
+
+The security fixes on branch `feature/security-hardening`, across all 13 repositories. The rules every
+service follows are in the [security fix spec](security-fix-spec.md), and [Security](security.md) describes the result.
+Every fixed finding's test marker was removed, and each test now passes. All 10 Java builds pass `mvn verify`.
+The frontend passes 525 Vitest tests and 40 pact tests, and `sync-pacts.sh` regenerates and verifies every contract.
+
+| Findings | Fix | Where |
+|---|---|---|
+| S-98, S-99 | Spring Boot 4.0.1 → 4.0.9 and Spring Cloud 2025.1.4 (every flagged library now at or above its fixed version). axios 1.21, zod 4, react-router 7. `npm audit --omit=dev` is clean. | all poms, frontend |
+| S-4, S-19, S-3, S-18, S-10 | No committed secrets: `init-secrets.sh` / `.ps1` generate the git-ignored `.env`, compose requires it, and `k8s/deploy.sh` turns it into Secrets. The JWT secret must be at least 64 bytes or the gateway and user-service refuse to start. Pact tokens are signed with a test-only constant. The admin is seeded only from `ADMIN_PASSWORD`, and an existing `admin`/`admin` is rotated once. The Grafana password is generated and reset on deploy. Eureka requires HTTP Basic. | platform, gateway, user, discovery, frontend, monitoring |
+| S-1, S-2, S-9, S-12, S-13 | Gateway: path-pattern public list, non-normal paths 400, `/internal/` 404, admin-only operations 403, tokens need `sub`/`exp`, sanitised logging. Services: roles and ownership on every endpoint (401/403), exact-case `ADMIN`. `/users/internal/{username}` deleted. | gateway, every service |
+| I-1, I-2, I-8, I-9, S-63, S-64, S-67, S-75..S-77, S-79, S-82..S-84, I-6 | Payments are verified against the order (CONFIRMED, owner, exact total) through an internal order-service endpoint. `payment.completed` only pays a matching CONFIRMED order. Quantities are integers 1–1000, lines go only on PENDING orders, and order and shipment status follow transition tables. No payment takeover or re-opening. Optimistic locking makes process/refund publish once. Tracking numbers carry 64 bits, and there is one shipment per order. | order, payment, shipping |
+| S-8, S-33 | Public tracking returns status, carrier, ETA and history only. Unapproved reviews are visible to their author and admins. | shipping, review, frontend |
+| S-11, S-14, S-17, S-20, S-23 | Generic login errors. A username locks after 5 failures in 15 minutes (429). Passwords are 10–72 bytes, not containing the username, not common. Constant-cost login for unknown users. | user, frontend |
+| S-30..S-32, S-37 | Exact-case admin, no anonymous reviewer, no self-votes or votes on unpublished reviews, `X-Username` length checked. | review |
+| S-40..S-57, S-61, S-62, S-65, S-66, S-70..S-74, S-78, S-80, S-81, S-86, S-87, S-21, S-22, S-24, S-34..S-36 | Client errors are 4xx (404/405/406/409/415), never 500. Error bodies carry fixed messages without type names. Every field is validated (lengths, NUL, decimals, currency, card digits, URLs, page sizes, sort fields). Every service sends `nosniff`/`no-store` and validates `X-Correlation-Id`. | every service |
+| S-6, S-97 | Health details are hidden. `/actuator/serviceregistry` answers only localhost (the k8s `preStop` drain). nginx no longer proxies `/actuator/`. | every service, frontend |
+| S-7 (headers), S-90..S-94 | CSP and the usual headers, `server_tokens off`. The token goes only to the API's origin. Guards require a live session. The post-login redirect is validated. The tracking number is URL-encoded. | frontend |
+| S-95, S-96 | Logged event fields have control characters stripped and are capped at 256 characters. | notification |
+
+**Still open:** S-5 (published infrastructure ports, unauthenticated Kafka and Kafka UI), S-7 (token in `localStorage`),
+S-15 (registration enumeration), S-16 (no token revocation), and advisories in the dev-only vitest toolchain. Their tests stay
+pinned. [Security: Open](security.md#open) explains why each needs a design change rather than a patch.
+
 ## Resolved on 2026-10-29
 
 Changes made while writing these docs, all built and tested (the smoke test 24/24
@@ -45,6 +70,8 @@ Deprecation status after these changes:
 - What remains is third-party code that calls JDK internals and needs upstream releases: kafka-clients 4.1.1, XStream 1.4.21 inside the Eureka server, and Lombok at compile time. See D-2 below.
 
 ## Overview
+
+The table is the state found in October 2026. For what has been fixed since, see [Resolved on 2026-10-30](#resolved-on-2026-10-30).
 
 | ID | Finding | Area | Severity | Verified |
 |---|---|---|---|---|
@@ -310,6 +337,8 @@ It found the holes below. Every one is pinned by a test that asserts the secure 
 `it.fails` in Vitest, `test.fail(true, 'S-<n>: ...')` in Playwright. Each was run enabled and seen failing for the stated reason.
 Ids that would duplicate an older finding reuse it (S-1, S-3, S-4, S-6 to S-11, I-1, I-2, I-6, I-8 are re-pinned at more levels).
 
+**Status:** all of these were fixed on 2026-10-30 except S-5, S-7 (token storage), S-15 and S-16; see [Resolved on 2026-10-30](#resolved-on-2026-10-30).
+
 ### High and medium
 
 | Id | Finding | Severity | Pinned in |
@@ -369,7 +398,9 @@ Ids that would duplicate an older finding reuse it (S-1, S-3, S-4, S-6 to S-11, 
 
 A test that finds a bug asserts the correct behaviour and is disabled, so `mvn verify` stays green. Remove the `@Disabled` (or switch `it.fails` to `it`) in the same change that fixes the bug.
 
-**All of the bugs below were fixed on 2026-10-29 and their markers removed; no test is disabled today.** The findings themselves stay open where the fix was partial (S-1 covers only user update/delete and review moderation; R-1 only notification-service; I-3 only the double cancel; I-6 only payments, not shipments). What changed:
+**All of the bugs below were fixed on 2026-10-29 and their markers removed.** After the 2026-10-30 security fixes the only
+pinned tests left are the open security findings: S-5 and S-15/S-16 (`test.fail` in `ecommerce-frontend/e2e/security`) and
+S-7's token-storage test (`it.fails` in `src/test/security/tokenHandling.security.test.tsx`). The findings themselves stay open where the fix was partial (S-1 covers only user update/delete and review moderation; R-1 only notification-service; I-3 only the double cancel; I-6 only payments, not shipments). What changed:
 
 | Finding | Fix |
 |---|---|

@@ -1,6 +1,6 @@
 # API reference
 
-All 54 HTTP endpoints of the platform: how to call them, the conventions they
+All 53 HTTP endpoints of the platform: how to call them, the conventions they
 share, and where the detailed reference for each one lives.
 
 ## Three ways in
@@ -13,7 +13,7 @@ share, and where the detailed reference for each one lives.
 
 | Service | Markdown reference | OpenAPI | Endpoints |
 |---|---|---|---|
-| user-service | [user-service.md](user-service.md) | [user-service.json](openapi/user-service.json) | 7 |
+| user-service | [user-service.md](user-service.md) | [user-service.json](openapi/user-service.json) | 6 |
 | product-service | [product-service.md](product-service.md) | [product-service.json](openapi/product-service.json) | 12 |
 | catalog-service | [catalog-service.md](catalog-service.md) | [catalog-service.json](openapi/catalog-service.json) | 7 |
 | order-service | [order-service.md](order-service.md) | [order-service.json](openapi/order-service.json) | 9, including a leftover greeting |
@@ -35,13 +35,13 @@ properties so that unchanged APIs produce no diff.
 |---|---|
 | Base URL | `http://localhost:8080`, the gateway. The service ports 8081–8087 work too, but they skip authentication and identity headers. Use them for debugging only. |
 | Versioning | Every path starts with `/api/v1/`. There is no other version. |
-| Authentication | `Authorization: Bearer <JWT>` from `POST /api/v1/users/login`, valid for one hour. Public endpoints are marked in the index. A missing or bad token returns **401 with an empty body**, from the gateway. |
-| Identity | The gateway passes `X-Username`, `X-User-Id` and `X-User-Role` to the service. Clients never send these. Few endpoints act on them: see [Security](../security.md#authorization). |
+| Authentication | `Authorization: Bearer <JWT>` from `POST /api/v1/users/login`, valid for one hour. Public endpoints are marked in the index. A missing or bad token (or one without `sub` and `exp`) returns **401 with an empty body**, from the gateway. A role other than exactly `ADMIN` on an admin-only route returns **403**; a non-normalised path (`..`, `%2e`, `%2f`, `;`, `//`) returns 400 and any `/internal/` path 404. |
+| Identity | The gateway passes `X-Username`, `X-User-Id` and `X-User-Role` to the service. Clients never send these. Services check ownership against `X-Username` (`X-User-Id` in user-service) and the role against exactly `ADMIN`: missing identity is 401, someone else's resource 403. See [Security](../security.md#authorization). |
 | Content | `application/json` in both directions. Unknown request fields are **ignored** (Jackson 3 default), so a misspelled field fails silently. |
 | Dates | ISO-8601 local date-times without an offset, e.g. `2026-10-29T18:07:12.345678`, in the server's zone (UTC in the containers). Kafka events use a different form; see the [Event catalog](../events.md). |
 | Money | JSON numbers. Postgres-backed amounts come back with 4 decimals (`39.9800`), and catalog prices with 2. |
-| Enums | sent and returned as their exact upper-case names. A wrong value is often a **500**, not a 400 (`valueOf` without a handler). |
-| Correlation | Each service echoes `X-Correlation-Id`, or generates one, and puts it in error bodies and its own log lines. It isn't propagated between services. |
+| Enums | sent and returned as their exact upper-case names. A wrong value is a 400. |
+| Correlation | Each service echoes `X-Correlation-Id` if it matches `^[A-Za-z0-9._-]{1,64}$`, otherwise generates one, and puts it in error bodies and its own log lines. It isn't propagated between services. |
 
 ### Errors
 
@@ -64,13 +64,16 @@ is `null` (or `[]` in catalog-service) otherwise.
 
 | Status | Typically means |
 |---|---|
-| 400 | validation failed, malformed JSON, or an illegal state transition (order-service uses 400, never 409, for transitions) |
-| 401 | gateway: no, invalid or expired token. user-service: bad credentials or inactive account. |
+| 400 | validation failed, malformed JSON, a page size over 100, or a non-normalised path at the gateway |
+| 401 | gateway: no, invalid or expired token. A service: no identity headers. user-service: bad credentials (one generic message). |
+| 403 | the role is not exactly `ADMIN` for an admin-only operation, or the resource belongs to someone else |
 | 404 | the resource doesn't exist, or the path matches no gateway route |
 | 405 | the path exists, but not for that method |
-| 409 | a duplicate (username, email, SKU, review per product, completed payment) or an optimistic-lock conflict (catalog) |
-| 500 | an unexpected error. It is also returned for several client mistakes the handlers don't map: unknown enum values, a wrong `Content-Type`, unmapped paths in some services, shipping-service validation errors, and a product-service 404 seen through catalog- or review-service. |
-| 502 / 503 | order-service could not use product-service (503 for unreachable, 502 for an unexpected status) |
+| 409 | a duplicate (username, email, SKU, review per product, payment, shipment per order), an illegal status transition (order, shipment) or an optimistic-lock conflict |
+| 415 / 406 | wrong `Content-Type` / unacceptable `Accept` |
+| 429 | user-service login lockout (5 failures in 15 minutes), with `Retry-After` |
+| 500 | an unexpected error, with the fixed message `An unexpected error occurred`. Still returned when product-service fails inside review-service, or for an unknown category id in some product-service paths. |
+| 502 / 503 | order-service could not use product-service (503 for unreachable, 502 for an unexpected status or price); payment-service could not reach order-service (503) |
 
 The per-service references list the exact status of every error path.
 
@@ -95,21 +98,21 @@ Other list endpoints return plain, unpaginated JSON arrays.
 
 ## Endpoint index
 
-**Gateway** is what the gateway requires: *public* means no token. **Checks**
-are the identity-based checks the service itself applies. "None" means any
-authenticated caller may act on any record.
+**Gateway** is what the gateway requires: *public* means no token, `ADMIN`
+means role exactly `ADMIN` (403 otherwise). **Checks** are the identity-based
+checks the service itself applies (owner means `customerId` equals `X-Username`;
+user-service compares the path id with `X-User-Id`).
 
 ### user-service
 
 | Method | Path | Gateway | Checks | Purpose |
 |---|---|---|---|---|
 | POST | `/api/v1/users/register` | public | validation, unique username and email | create a `CUSTOMER` account |
-| POST | `/api/v1/users/login` | public | credentials, account status | get a JWT |
-| GET | `/api/v1/users/me` | JWT | resolves `X-Username` | the caller's profile |
-| GET | `/api/v1/users/{id}` | JWT | none | any user's profile |
-| PUT | `/api/v1/users/{id}` | JWT | none | partial update of any profile |
-| DELETE | `/api/v1/users/{id}` | JWT | none | deactivate any account |
-| GET | `/api/v1/users/internal/{username}` | **public** | none | any full profile, by username |
+| POST | `/api/v1/users/login` | public | credentials (one generic error), lockout | get a JWT |
+| GET | `/api/v1/users/me` | JWT | resolves `X-Username` (401 without) | the caller's profile |
+| GET | `/api/v1/users/{id}` | JWT | owner or `ADMIN` | a user's profile |
+| PUT | `/api/v1/users/{id}` | JWT | owner or `ADMIN` | partial update of a profile |
+| DELETE | `/api/v1/users/{id}` | JWT | owner or `ADMIN` | deactivate an account |
 
 ### product-service
 
@@ -120,13 +123,13 @@ authenticated caller may act on any record.
 | GET | `/api/v1/products/sku/{sku}` | public | — | product by SKU |
 | GET | `/api/v1/products/search?q=` | public | — | page of `ACTIVE` products whose name contains `q` |
 | GET | `/api/v1/products/category/{categoryId}` | public | — | `ACTIVE` products in a category |
-| POST | `/api/v1/products` | JWT | none (meant for admins) | create a product |
-| PUT | `/api/v1/products/{id}` | JWT | none (meant for admins) | partial update |
-| PATCH | `/api/v1/products/{id}/stock` | JWT | none | adjust stock by `{"delta": n}` (used by order-service) |
-| DELETE | `/api/v1/products/{id}` | JWT | none (meant for admins) | soft delete |
+| POST | `/api/v1/products` | `ADMIN` | `ADMIN` | create a product |
+| PUT | `/api/v1/products/{id}` | `ADMIN` | `ADMIN` | partial update |
+| PATCH | `/api/v1/products/{id}/stock` | `ADMIN` | `ADMIN` | adjust stock by `{"delta": n}` |
+| DELETE | `/api/v1/products/{id}` | `ADMIN` | `ADMIN` | soft delete |
 | GET | `/api/v1/categories` | public | — | all categories |
 | GET | `/api/v1/categories/{id}` | public | — | category by ID |
-| POST | `/api/v1/categories` | JWT | none (meant for admins) | create a category |
+| POST | `/api/v1/categories` | `ADMIN` | `ADMIN` | create a category |
 
 ### catalog-service
 
@@ -137,63 +140,65 @@ authenticated caller may act on any record.
 | GET | `/api/v1/catalog/category/{categoryId}` | public | — | entries in a category |
 | GET | `/api/v1/catalog/featured` | public | — | featured entries |
 | GET | `/api/v1/catalog/product/{productId}` | public | — | entry by product ID |
-| POST | `/api/v1/catalog/sync/{productId}` | JWT | none | pull a product from product-service into the catalog |
-| PATCH | `/api/v1/catalog/product/{productId}` | JWT | none | set `featured`, `imageUrl`, `price` |
+| POST | `/api/v1/catalog/sync/{productId}` | `ADMIN` | `ADMIN` | pull a product from product-service into the catalog |
+| PATCH | `/api/v1/catalog/product/{productId}` | `ADMIN` | `ADMIN`; validated body | set `featured`, `imageUrl`, `price` |
 
 ### order-service
 
 | Method | Path | Gateway | Checks | Purpose |
 |---|---|---|---|---|
-| POST | `/api/v1/orders?customerId=` | JWT | none (`customerId` comes from the caller) | create a `PENDING` order |
-| GET | `/api/v1/orders/{orderId}` | JWT | none | an order with its items |
-| GET | `/api/v1/orders/customer/{customerId}` | JWT | none | a customer's orders |
-| POST | `/api/v1/orders/{orderId}/items` | JWT | order not `CANCELLED`/`PAID`, stock available | add a line and reserve stock |
-| POST | `/api/v1/orders/{orderId}/products?productId=&quantity=` | JWT | as above, quantity **not** validated | legacy add-line |
-| POST | `/api/v1/orders/{orderId}/confirm` | JWT | order `PENDING` with at least one item | confirm, publish `order.placed` |
-| PATCH | `/api/v1/orders/{orderId}/status?status=` | JWT | none (any transition) | set a status, meant for admins |
-| DELETE | `/api/v1/orders/{orderId}` | JWT | not `SHIPPED`/`DELIVERED` | cancel, release stock, publish `order.cancelled` |
+| POST | `/api/v1/orders?customerId=` | JWT | `customerId` defaults to the caller; others only for `ADMIN` | create a `PENDING` order |
+| GET | `/api/v1/orders/{orderId}` | JWT | owner or `ADMIN` | an order with its items |
+| GET | `/api/v1/orders/customer/{customerId}` | JWT | that customer or `ADMIN` | a customer's orders |
+| POST | `/api/v1/orders/{orderId}/items` | JWT | owner or `ADMIN`; order `PENDING`; quantity 1 to 1000; stock available | add a line and reserve stock |
+| POST | `/api/v1/orders/{orderId}/products?productId=&quantity=` | JWT | as above | legacy add-line |
+| POST | `/api/v1/orders/{orderId}/confirm` | JWT | owner or `ADMIN`; order `PENDING` with at least one item | confirm, publish `order.placed` |
+| PATCH | `/api/v1/orders/{orderId}/status?status=` | `ADMIN` | `ADMIN`; transition table (409) | move a status |
+| DELETE | `/api/v1/orders/{orderId}` | JWT | owner or `ADMIN`; not `CANCELLED`/`SHIPPED`/`DELIVERED` | cancel, release stock, publish `order.cancelled` |
 | GET | `/api/v1/orders/hello` | JWT | — | greeting (leftover scaffold) |
 
 ### payment-service
 
 | Method | Path | Gateway | Checks | Purpose |
 |---|---|---|---|---|
-| POST | `/api/v1/payments` | JWT | none (amount, order and customer come from the caller) | create a `PENDING` payment |
-| POST | `/api/v1/payments/{id}/process` | JWT | payment `PENDING` | simulated gateway (80 % approve), publish `payment.completed` or `payment.failed` |
-| POST | `/api/v1/payments/{id}/refund` | JWT | payment `COMPLETED` | full refund, publish `payment.refunded` |
-| GET | `/api/v1/payments/{id}` | JWT | none | a payment |
-| GET | `/api/v1/payments/order/{orderId}` | JWT | none | the payment of an order |
-| GET | `/api/v1/payments/customer/{customerId}` | JWT | none | a customer's payments |
+| POST | `/api/v1/payments` | JWT | `customerId` is the caller; order `CONFIRMED`, owned by the payer, amount equals the total (503 if order-service is down) | create a `PENDING` payment |
+| POST | `/api/v1/payments/{id}/process` | JWT | owner or `ADMIN`; payment `PENDING` | simulated gateway (80 % approve), publish `payment.completed` or `payment.failed` |
+| POST | `/api/v1/payments/{id}/refund` | `ADMIN` | `ADMIN`; payment `COMPLETED` | full refund, publish `payment.refunded` |
+| GET | `/api/v1/payments/{id}` | JWT | owner or `ADMIN` | a payment |
+| GET | `/api/v1/payments/order/{orderId}` | JWT | owner or `ADMIN` | the payment of an order |
+| GET | `/api/v1/payments/customer/{customerId}` | JWT | that customer or `ADMIN` | a customer's payments |
 
 ### shipping-service
 
 | Method | Path | Gateway | Checks | Purpose |
 |---|---|---|---|---|
-| GET | `/api/v1/shipments/tracking/{trackingNumber}` | **public**, any method | — | track a parcel (includes customer ID and addresses) |
-| GET | `/api/v1/shipments/order/{orderId}` | JWT | none | the shipment of an order |
-| GET | `/api/v1/shipments/{id}/history` | JWT | none | status history, oldest first |
-| PATCH | `/api/v1/shipments/{id}/status` | JWT | not already `DELIVERED`/`RETURNED` | set a status, publish `shipment.updated` |
-| POST | `/api/v1/shipments` | JWT | none | create a shipment by hand (publishes nothing) |
+| GET | `/api/v1/shipments/tracking/{trackingNumber}` | **public**, `GET` only | — | track a parcel (tracking number, status, carrier, ETA and events only) |
+| GET | `/api/v1/shipments/order/{orderId}` | JWT | owner or `ADMIN` | the shipment of an order |
+| GET | `/api/v1/shipments/{id}/history` | JWT | owner or `ADMIN` | status history, oldest first |
+| PATCH | `/api/v1/shipments/{id}/status` | `ADMIN` | `ADMIN`; transition table (409) | set a status, publish `shipment.updated` |
+| POST | `/api/v1/shipments` | `ADMIN` | `ADMIN`; one per order (409) | create a shipment by hand (publishes nothing) |
 
 ### review-service
 
 | Method | Path | Gateway | Checks | Purpose |
 |---|---|---|---|---|
-| GET | `/api/v1/reviews/product/{productId}?approvedOnly=` | public | — | a product's reviews (approved only by default) |
+| GET | `/api/v1/reviews/product/{productId}?approvedOnly=` | public | `approvedOnly=false` for `ADMIN` only | a product's reviews (approved only by default) |
 | GET | `/api/v1/reviews/product/{productId}/summary` | public | — | average rating and distribution |
 | POST | `/api/v1/reviews` | JWT | author = `X-Username`, one per product | create a review (`PENDING`) |
-| GET | `/api/v1/reviews/{id}` | JWT | none | one review, any status |
-| GET | `/api/v1/reviews/customer/{customerId}` | JWT | none | a user's reviews |
+| GET | `/api/v1/reviews/{id}` | JWT | unapproved: author or `ADMIN` | one review |
+| GET | `/api/v1/reviews/customer/{customerId}` | JWT | unapproved: that user or `ADMIN` | a user's reviews |
 | PUT | `/api/v1/reviews/{id}` | JWT | author only | edit, back to `PENDING` |
 | DELETE | `/api/v1/reviews/{id}` | JWT | author or `ADMIN` | delete |
-| PATCH | `/api/v1/reviews/{id}/moderate?status=` | JWT | **none** | approve or reject |
-| POST | `/api/v1/reviews/{id}/vote` | JWT | one vote per user | mark helpful or unhelpful |
+| PATCH | `/api/v1/reviews/{id}/moderate?status=` | `ADMIN` | `ADMIN` | approve or reject |
+| POST | `/api/v1/reviews/{id}/vote` | JWT | one vote per user; not your own review; `APPROVED` only | mark helpful or unhelpful |
 
 ## Management endpoints
 
 Not part of the public API, but reachable on each service port:
-`/actuator/health`, `/info`, `/metrics`, `/prometheus`, `/circuitbreakers`,
-`/serviceregistry`, plus `/api-docs` and `/swagger-ui.html` on every service.
+`/actuator/health` (status only), `/info`, `/metrics`, `/prometheus`, `/circuitbreakers`,
+`/serviceregistry` (loopback only), plus `/api-docs` and `/swagger-ui.html` on every service.
+Service-to-service endpoints under `/internal/v1/` (`PATCH /products/{id}/stock`,
+`GET /orders/{id}`) are never routed by the gateway.
 Through the gateway, only `/api-docs/<service>` is routed. See
 [Security](../security.md#management-and-infrastructure-endpoints) for why the
 writable `serviceregistry` endpoint matters.

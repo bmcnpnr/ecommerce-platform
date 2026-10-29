@@ -5,10 +5,10 @@ product-service is the system of record for products and categories. It owns eac
 | | |
 |---|---|
 | Repository | `ecommerce-product-service` |
-| Stack | Java 25 · Spring Boot 4.0.1 · Spring MVC · Spring Data JPA (Hibernate) · Bean Validation · Flyway · Lombok · Jackson 3 · springdoc-openapi 2.8.5 · Eureka client · Micrometer + OpenTelemetry |
+| Stack | Java 25 · Spring Boot 4.0.9 · Spring MVC · Spring Data JPA (Hibernate) · Bean Validation · Flyway · Lombok · Jackson 3 · springdoc-openapi 2.8.5 · Eureka client · Micrometer + OpenTelemetry |
 | Port | 8082 |
 | Eureka service ID | `product-service` |
-| Gateway routes | `/api/v1/products/**`, `/api/v1/categories/**` (GET is public, every other method needs a JWT) |
+| Gateway routes | `/api/v1/products/**`, `/api/v1/categories/**` (GET is public, every other method needs an `ADMIN` JWT). `/internal/v1/products/**` is not routed |
 | Data store | PostgreSQL 16 `productdb` (Flyway `V1`, `V2`; Hibernate `ddl-auto: validate`) |
 | Publishes | — |
 | Consumes | — |
@@ -110,20 +110,21 @@ The `INACTIVE` to `OUT_OF_STOCK` edge is a side effect of rule 4 below: draining
 
 | Method | Path | Gateway auth | Purpose |
 |---|---|---|---|
-| POST | `/api/v1/products` | Bearer JWT | Create a product |
+| POST | `/api/v1/products` | `ADMIN` | Create a product |
 | GET | `/api/v1/products` | Public | Page of `ACTIVE` products |
 | GET | `/api/v1/products/{id}` | Public | Product by id (any status) |
 | GET | `/api/v1/products/sku/{sku}` | Public | Product by SKU (any status) |
 | GET | `/api/v1/products/search?q=` | Public | Page of `ACTIVE` products whose name contains `q` |
 | GET | `/api/v1/products/category/{categoryId}` | Public | `ACTIVE` products of one category (list) |
-| PUT | `/api/v1/products/{id}` | Bearer JWT | Partial update |
-| PATCH | `/api/v1/products/{id}/stock` | Bearer JWT | Adjust stock by `delta` |
-| DELETE | `/api/v1/products/{id}` | Bearer JWT | Soft delete (`INACTIVE`) |
-| POST | `/api/v1/categories` | Bearer JWT | Create a category |
+| PUT | `/api/v1/products/{id}` | `ADMIN` | Partial update |
+| PATCH | `/api/v1/products/{id}/stock` | `ADMIN` | Adjust stock by `delta` |
+| PATCH | `/internal/v1/products/{id}/stock` | not routed | Same, for order-service (`InternalProductController`) |
+| DELETE | `/api/v1/products/{id}` | `ADMIN` | Soft delete (`INACTIVE`) |
+| POST | `/api/v1/categories` | `ADMIN` | Create a category |
 | GET | `/api/v1/categories` | Public | All categories (list) |
 | GET | `/api/v1/categories/{id}` | Public | Category by id |
 
-No endpoint performs a service-side role or ownership check. Full reference: [API reference](../api/product-service.md).
+Writes check `X-User-Role` exactly `ADMIN` in the service as well (`@AdminOnly`). Full reference: [API reference](../api/product-service.md).
 
 ## Events
 
@@ -221,10 +222,10 @@ Where the entities and the migrations differ:
 
 ## Security and identity
 
-- **Gateway.** `GET` on `/api/v1/products...` and `/api/v1/categories...` is public. `POST`, `PUT`, `PATCH` and `DELETE` need a valid JWT of any role; the gateway then sets `X-Username`, `X-User-Id` and `X-User-Role`.
-- **Service.** There is no Spring Security, no `X-User-*` header is read anywhere, and no endpoint checks a role or ownership. The "(ADMIN)" and "(ADMIN/internal)" in the springdoc `@Operation` summaries are labels only. Any registered user can create, edit, re-price, restock and soft-delete products and create categories. `ecommerce-platform/smoke-test.sh` relies on this: it creates a product with the token of a user it has just registered, whose role is `CUSTOMER` (`UserService` in user-service assigns `UserRole.CUSTOMER` on registration). The frontend hides its admin pages behind a client-side role check (`src/routes/AdminRoute.tsx`), which does not protect the API.
-- **Why it matters.** order-service copies `price` into the order item when an item is added, so a re-priced product changes what customers are charged; stock and status changes change what can be ordered.
-- **Bypassing the gateway.** docker-compose publishes port 8082 on the host, so every endpoint, including the stock endpoint, can be called at `http://localhost:8082` without any token. Internal callers reach the service the same way (through Eureka, without credentials), and the service cannot tell them apart from anyone else.
+- **Gateway.** `GET` on `/api/v1/products...` and `/api/v1/categories...` is public. `POST`, `PUT`, `PATCH` and `DELETE` need a JWT whose role is exactly `ADMIN` (otherwise 403 at the edge); the gateway sets `X-Username`, `X-User-Id` and `X-User-Role`.
+- **Service.** There is no Spring Security. `@AdminOnly` on the write endpoints is enforced by `security/AuthorizationInterceptor`: 401 `Authentication required` without `X-Username`, 403 `Access denied` unless `X-User-Role` is exactly `ADMIN`. A soft-deleted (`INACTIVE`) product is 404 by id or SKU for non-admins. `PATCH /internal/v1/products/{id}/stock` needs no identity and is never routed by the gateway. `smoke-test.sh` logs in as the admin from `.env` for its writes. The frontend's client-side role check (`src/routes/AdminRoute.tsx`) is only a convenience.
+- **Why it matters.** order-service copies `price` into the order item when an item is added, so only admins can re-price or restock.
+- **Bypassing the gateway.** docker-compose publishes port 8082 on the host, so any endpoint, including `/internal/**`, can be called at `http://localhost:8082` with forged identity headers or none.
 
 ## Configuration
 
@@ -244,7 +245,7 @@ From `src/main/resources/application.yaml`, plus what docker-compose and Kuberne
 | `eureka.instance.prefer-ip-address` | `EUREKA_INSTANCE_PREFER_IP_ADDRESS` (k8s) | `true` | Register the pod IP, which other pods can dial. |
 | `eureka.instance.lease-renewal-interval-in-seconds` / `lease-expiration-duration-in-seconds` | — | `5` / `15` | A crashed instance leaves the registry in about 20 s. |
 | `management.endpoints.web.exposure.include` | — | `health,info,metrics,prometheus,circuitbreakers,serviceregistry` | `circuitbreakers` has no effect here (no resilience4j on the classpath). |
-| `management.endpoint.health.show-details` | — | `always` | |
+| `management.endpoint.health.show-details` | — | `never` | |
 | `management.endpoint.health.probes.enabled` | `MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED` (k8s) | unset | k8s sets `true` for `/actuator/health/liveness` and `/readiness`. |
 | `management.metrics.tags.environment` | `ENVIRONMENT` | `development` | Common tag (with `application`). |
 | `management.tracing.sampling.probability` | `TRACING_SAMPLING_PROBABILITY` | `1.0` | Trace every request. |
@@ -253,7 +254,7 @@ From `src/main/resources/application.yaml`, plus what docker-compose and Kuberne
 | `springdoc.api-docs.path` / `swagger-ui.path` | — | `/api-docs` / `/swagger-ui.html` | OpenAPI. |
 | `logging.pattern.console` | — | `%d{yyyy-MM-dd HH:mm:ss} [%thread] [%X{correlationId}] %-5level %logger{36} - %msg%n` | |
 | `logging.level.com.ecommerce` | — | `DEBUG` | |
-| `spring.data.web.pageable.*` | — | not set: `page`, `size` (default 20 via `@PageableDefault`), max size 2000, 0-based, `serialization-mode: direct` | Boot defaults, see the API reference. |
+| `spring.data.web.pageable.*` | — | not set: `page`, `size` (default 20 via `@PageableDefault`), `PageLimits` rejects a size over 100 with 400, 0-based, `serialization-mode: direct` | Boot defaults, see the API reference. |
 | `spring.jackson.*` | — | not set | Jackson 3 defaults: ISO-8601 dates, unknown properties ignored. |
 | `JAVA_OPTS` | `JAVA_OPTS` | `-XX:MaxRAMPercentage=55 -XX:ActiveProcessorCount=2 -XX:+ExitOnOutOfMemoryError` (compose and k8s) | Read by the Dockerfile entrypoint. |
 
@@ -282,11 +283,7 @@ Runtime: compose `mem_limit: 768m`, healthcheck `wget http://localhost:8082/actu
 
 99 unit, slice and pact tests and 20 integration tests.
 
-**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
-
-- `ProductApiIT.concurrentDecrements_neverOversell`: 40 concurrent `-1` updates on stock 10 all succeed (I-5).
-- `ProductServiceTest.updateStock_drainingInactiveProduct_staysInactive`: a soft-deleted product becomes `OUT_OF_STOCK` at 0, then `ACTIVE` on restock (I-13).
-- `ProductApiIT.updateProduct_unknownStatus_is400`, `updateProduct_unknownCategory_is404`, `createCategory_unknownParent_is404`: an unknown status, `categoryId` or `parentCategoryId` returns 500 (A-4). The H2 profile has no foreign keys, so only Postgres shows the last two.
+No tests are disabled for bugs any more; the `@Tag("security")` suite covers admin-only writes, injection, bounds and error bodies.
 
 ### Pact provider states and pinned interactions
 
@@ -340,14 +337,13 @@ Paths are relative to `src/main/java/com/ecommerce/product/` unless stated.
 
 | Issue | Where | Impact | Severity |
 |---|---|---|---|
-| No authorization on any write endpoint; the "(ADMIN)" summaries are not enforced and no `X-User-Role` is read. | `controller/ProductController.java`, `controller/CategoryController.java` | Any registered customer can change prices (which order-service copies into orders), stock and status, soft-delete products and create categories. Port 8082 is also reachable without a token. | High |
+| ~~No authorization on any write endpoint~~ | fixed | Writes are `@AdminOnly` (401/403); the gateway refuses non-admins too. Port 8082 still skips the gateway in compose. | — |
 | Stock adjustment is an unlocked read-modify-write (no row lock, no `@Version`, no atomic update, no `CHECK`). | `ProductService.updateStock()`, `model/Product.java`, `V2__create_products.sql` | Concurrent reservations for one product can all succeed and overwrite each other: overselling and lost restorations. | High |
 | Full-row `UPDATE` without a version column. | `ProductService.updateProduct()` vs `updateStock()` | A `PUT` that overlaps a stock change can write back the old `stock_quantity`. | Medium |
 | A soft-deleted product is not protected: its stock can still be adjusted, draining it to 0 moves it to `OUT_OF_STOCK` and a restock makes it `ACTIVE` again; `GET /{id}` returns it and order-service does not check `status`. | `ProductService.updateStock()`, `getProductById()` | Deleted products can still be ordered and can silently come back into listings. | Medium |
 | Sold-out and soft-deleted products vanish from `GET /api/v1/products`, and no endpoint lists them. The admin product table uses that endpoint. | `ProductService.getAllProducts()`; frontend `pages/admin/AdminProductsPage.tsx` | Once a product sells out an admin cannot find it in the UI to restock it. | Medium |
 | The admin edit form sends `sku` and `stockQuantity` in the `PUT` body; `UpdateProductRequest` has neither, and Jackson 3 ignores unknown properties. | frontend `AdminProductsPage.handleEdit()`; `dto/UpdateProductRequest.java` | SKU and stock edits report success but are dropped. | Medium |
-| Invalid input that reaches the database or `valueOf` returns 500: unknown `status` on `PUT`, unknown `categoryId` on `PUT`, unknown `parentCategoryId`, duplicate SKU or category name under concurrency, unknown `sort` property. | `ProductService.updateProduct()`, `createCategory()`, `createProduct()` | Client errors reported as server errors, logged at ERROR. | Low |
-| Unsupported `Content-Type`, unacceptable `Accept` and unmapped paths (`NoResourceFoundException`) are not in the handler's client-error list. | `exception/GlobalExceptionHandler.java` | 500 instead of 415, 406 and 404. | Low |
+| ~~Client errors reported as 500~~ | fixed | Bad status, category, sort property, content type, `Accept` and unmapped paths are 400/404/406/415; unique races are 409; messages are fixed strings. | — |
 | Products are created `ACTIVE` even with `stockQuantity` 0. | `ProductService.createProduct()` | A sold-out product can be listed until its stock is first adjusted. | Low |
 | `updatedAt` is `null` until the first update; the frontend type declares it as a non-optional string. | `model/Product.java`; frontend `src/types/index.ts` | UI code that formats `updatedAt` gets `null`. | Low |
 | Search matches only `name` with `upper(name) like '%q%'`; the `idx_products_name` B-tree cannot serve it, and `idx_products_sku` duplicates the unique index. | `ProductRepository.findByNameContainingIgnoreCaseAndStatus()`; `V2__create_products.sql` | Sequential scans for every search; one redundant index to maintain. | Low |

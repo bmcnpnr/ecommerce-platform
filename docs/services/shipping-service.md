@@ -5,10 +5,10 @@ shipping-service creates and tracks shipments. It normally creates a shipment by
 | | |
 |---|---|
 | Repository | `ecommerce-shipping-service` |
-| Stack | Java 25 · Spring Boot 4.0.1 · Spring MVC · Spring Data JPA (Hibernate 7.2) · Flyway · spring-kafka 4.0 · Spring Cloud 2025.1.1 Eureka client · springdoc-openapi 2.8.5 · Micrometer (Prometheus) + OpenTelemetry tracing · Lombok |
+| Stack | Java 25 · Spring Boot 4.0.9 · Spring MVC · Spring Data JPA (Hibernate 7.2) · Flyway · spring-kafka 4.0 · Spring Cloud 2025.1.4 Eureka client · springdoc-openapi 2.8.5 · Micrometer (Prometheus) + OpenTelemetry tracing · Lombok |
 | Port | 8086 |
 | Eureka service ID | `shipping-service` |
-| Gateway routes | `/api/v1/shipments/**`. `/api/v1/shipments/tracking/` and everything under it is public for every HTTP method; all other paths need a JWT |
+| Gateway routes | `/api/v1/shipments/**`. `GET /api/v1/shipments/tracking/{trackingNumber}` is public; `POST /api/v1/shipments` and `PATCH /{id}/status` need an `ADMIN` JWT; all other paths need a JWT |
 | Data store | PostgreSQL 16 `shippingdb` (Flyway). docker-compose publishes it on host port 5437 |
 | Publishes | `shipment.created`, `shipment.updated` |
 | Consumes | `payment.completed` (group `shipping-service`) |
@@ -59,9 +59,9 @@ The REST path, `POST /api/v1/shipments` (`ShipmentService.createShipment()`), in
 | Field | Column | Java type | REST JSON | Notes |
 |---|---|---|---|---|
 | `id` | `id` | `Long` | number | `BIGSERIAL` identity. Sequential |
-| `orderId` | `order_id` | `Long` | number | One shipment per order is checked in code, not in the schema |
+| `orderId` | `order_id` | `Long` | number | One shipment per order (unique constraint, `V3`) |
 | `customerId` | `customer_id` | `String` | string | Copied from `payment.completed`, which in practice holds the username; or taken from the REST body |
-| `trackingNumber` | `tracking_number` | `String` | string | `TRACK-` + 8 hex digits + `-` + 1 hex digit (rule 2). `UNIQUE` |
+| `trackingNumber` | `tracking_number` | `String` | string | `TRACK-` + 8 hex digits + `-` + 8 hex digits (rule 2). `UNIQUE` |
 | `status` | `status` | `ShipmentStatus` | string | Starts as `PENDING` (entity default) |
 | `carrier` | `carrier` | `String` | string | Free text, at most 50 characters in the database. `DHL` unless the REST request says otherwise |
 | `originAddress` | `origin_address` | `String` | string | The Kafka path writes the placeholder `Warehouse, 123 Storage St` |
@@ -96,7 +96,7 @@ Each row records one status change. `ShipmentService.updateShipmentStatus()` is 
 
 ### Lifecycle
 
-Only `PATCH /api/v1/shipments/{id}/status` changes the status, and its only rule is that `DELIVERED` and `RETURNED` are final. From any other status, any status can be set, including going backwards, jumping straight to `DELIVERED`, or setting the current status again.
+Only `PATCH /api/v1/shipments/{id}/status` (admin) changes the status, and only along `ShipmentStatus.next()`: `PENDING` to `PROCESSING`, `PROCESSING` to `SHIPPED`, `SHIPPED` to `OUT_FOR_DELIVERY` or `RETURNED`, `OUT_FOR_DELIVERY` to `DELIVERED` or `RETURNED`. `DELIVERED` and `RETURNED` are final. An illegal move is 409 and publishes nothing.
 
 ```mermaid
 stateDiagram-v2
@@ -123,12 +123,12 @@ stateDiagram-v2
 
 1. **One shipment per order.** Both creation paths call `ShipmentRepository.findByOrderId()` first.
    - In `PaymentEventConsumer.handlePaymentCompleted()`, an existing shipment means the service logs a WARN and returns.
-   - In `ShipmentService.createShipment()`, it means a 400 with `Shipment already exists for order: {orderId}`.
-   - `shipments.order_id` has no unique constraint, so the check is not safe against two concurrent creations.
-2. **Tracking number.** Both paths duplicate the expression `"TRACK-" + UUID.randomUUID().toString().substring(0, 10).toUpperCase()`. The first 10 characters of a UUID string are 8 hex digits, a hyphen and 1 more hex digit, so the format is `TRACK-XXXXXXXX-X` (for example `TRACK-3F2A9C1B-4`), with 36 random bits.
+   - In `ShipmentService.createShipment()`, it means a 409 with `Shipment already exists for order: {orderId}`.
+   - `shipments.order_id` is unique (`V3` first keeps the earliest row per order), so a concurrent creation fails on the constraint (409 on REST, handled idempotently by the consumer).
+2. **Tracking number.** `model/TrackingNumbers` builds it from a `SecureRandom`: the format is `TRACK-XXXXXXXX-XXXXXXXX` (for example `TRACK-3F2A9C1B-4D5E6F70`), with 64 random bits.
    - The column is `UNIQUE`.
    - On the Kafka path, a collision fails the insert. The listener then retries with a fresh number.
-   - On the REST path, a collision returns 500.
+   - On the REST path, a collision returns 409.
 3. **Carrier.** The Kafka path always uses `DHL`. The REST path uses the request's `carrier`, or `DHL` when it is null. Carrier is free text: there is no carrier enum or list.
 4. **Addresses.** The Kafka path hard-codes the origin `Warehouse, 123 Storage St` and the destination `Customer Address`, because `payment.completed` has no address. The address the user enters at checkout never reaches this service. The REST path stores the addresses from the request.
 5. **Estimated delivery.** Both paths set `LocalDateTime.now().plusDays(5)` (date and time). `createShipment()` ignores the request's `estimatedDelivery` string, and nothing ever recalculates the value.
@@ -140,17 +140,17 @@ stateDiagram-v2
    5. It appends a `ShipmentEvent`.
    6. It publishes `shipment.updated`.
 7. **Events are sent from inside the transaction.** Both publishes happen before the database commit, with a fire-and-forget `KafkaTemplate.send()` (see [Events](#events)).
-8. **No endpoint checks the caller's identity.** See [Security and identity](#security-and-identity).
+8. **Authorization.** Create and status change are admin-only; reads are owner-or-admin; tracking is public with a limited response. See [Security and identity](#security-and-identity).
 
 ## API
 
 | Method | Path | Gateway auth | Purpose |
 |---|---|---|---|
-| POST | `/api/v1/shipments` | Bearer JWT | Create a shipment manually. No event is published |
-| GET | `/api/v1/shipments/order/{orderId}` | Bearer JWT | Get the shipment of an order |
-| GET | `/api/v1/shipments/tracking/{trackingNumber}` | **Public**, any method | Track by tracking number |
-| PATCH | `/api/v1/shipments/{id}/status` | Bearer JWT | Change the status, append history, publish `shipment.updated` |
-| GET | `/api/v1/shipments/{id}/history` | Bearer JWT | Status history, oldest first |
+| POST | `/api/v1/shipments` | `ADMIN` | Create a shipment manually. No event is published |
+| GET | `/api/v1/shipments/order/{orderId}` | Bearer JWT | Get the shipment of an order (owner or `ADMIN`) |
+| GET | `/api/v1/shipments/tracking/{trackingNumber}` | **Public**, `GET` only | Track by tracking number (limited fields) |
+| PATCH | `/api/v1/shipments/{id}/status` | `ADMIN` | Change the status, append history, publish `shipment.updated` |
+| GET | `/api/v1/shipments/{id}/history` | Bearer JWT | Status history, oldest first (owner or `ADMIN`) |
 | GET | `/hello` | Not routed by the gateway | Leftover scaffold greeting (`ShippingController`) |
 
 Full reference: [API reference](../api/shipping-service.md).
@@ -185,12 +185,12 @@ Full reference: [API reference](../api/shipping-service.md).
 | `shipmentId` | `Long` | integer | The new row's id |
 | `orderId` | `Long` | integer | From `payment.completed` |
 | `customerId` | `String` | string | From `payment.completed` |
-| `trackingNumber` | `String` | string | `TRACK-XXXXXXXX-X` |
+| `trackingNumber` | `String` | string | `TRACK-XXXXXXXX-XXXXXXXX` |
 | `carrier` | `String` | string | Always `DHL` on this path |
 | `estimatedDelivery` | `java.time.LocalDateTime` | integer array | `LocalDateTime.now().plusDays(5)` |
 
 ```json
-{"shipmentId":31,"orderId":7,"customerId":"alice","trackingNumber":"TRACK-3F2A9C1B-4","carrier":"DHL","estimatedDelivery":[2026,11,3,14,30,15,123456789]}
+{"shipmentId":31,"orderId":7,"customerId":"alice","trackingNumber":"TRACK-3F2A9C1B-4D5E6F70","carrier":"DHL","estimatedDelivery":[2026,11,3,14,30,15,123456789]}
 ```
 
 `estimatedDelivery` is a **`LocalDateTime`** on the producer side. The value has date and time, and the database column is `TIMESTAMP`. It therefore travels as a date-time array of up to 7 integers, never as a 3-element date. The notification-service poison-pill incident came from that service's mirror class declaring the field as `LocalDate`. With no `ErrorHandlingDeserializer`, every `shipment.created` record failed in the deserializer and was re-polled forever. The mirror (`ecommerce-notification-service` `event/ShipmentCreatedEvent.java`) now declares `LocalDateTime`, and the Pact contract pins the array form.
@@ -216,7 +216,7 @@ Full reference: [API reference](../api/shipping-service.md).
 There is no `customerId` in this event.
 
 ```json
-{"shipmentId":31,"orderId":7,"trackingNumber":"TRACK-3F2A9C1B-4","newStatus":"SHIPPED","location":"Istanbul hub","updatedAt":[2026,10,30,9,12,44,512000000]}
+{"shipmentId":31,"orderId":7,"trackingNumber":"TRACK-3F2A9C1B-4D5E6F70","newStatus":"SHIPPED","location":"Istanbul hub","updatedAt":[2026,10,30,9,12,44,512000000]}
 ```
 
 ### Consumed
@@ -239,7 +239,7 @@ There is no `customerId` in this event.
 3. It publishes `shipment.created`.
 4. The JPA transaction commits.
 
-**Idempotency:** a redelivered event, or a second `payment.completed` for the same order, finds the existing shipment. It creates nothing and publishes nothing. Records are keyed by `orderId` and consumed with concurrency 1, so events for one order are processed one at a time. A REST creation running at the same moment is not covered: there is no unique constraint on `order_id`. If a shipment was created through REST first, the event is skipped and that order never gets a `shipment.created`.
+**Idempotency:** a redelivered event, or a second `payment.completed` for the same order, finds the existing shipment (or loses the unique-constraint race and is treated the same way). It creates nothing and publishes nothing. A `payment.completed` with a missing or non-positive amount, or a bad `orderId` or `customerId`, is logged and dropped without a retry. If a shipment was created through REST first, the event is skipped and that order never gets a `shipment.created`.
 
 **Failure handling:** the factory sets no error handler, so spring-kafka's default `DefaultErrorHandler` applies.
 
@@ -260,7 +260,7 @@ Flyway migrations live in `src/main/resources/db/migration/`. Hibernate validate
 | Column | Type | Constraints and default |
 |---|---|---|
 | `id` | `BIGSERIAL` | Primary key |
-| `order_id` | `BIGINT` | `NOT NULL`, indexed (`idx_shipments_order_id`), **not unique** |
+| `order_id` | `BIGINT` | `NOT NULL`, indexed (`idx_shipments_order_id`), unique (`V3`) |
 | `customer_id` | `VARCHAR(255)` | `NOT NULL`, indexed (`idx_shipments_customer`) |
 | `tracking_number` | `VARCHAR(100)` | `UNIQUE NOT NULL`, plus a second index `idx_shipments_tracking` |
 | `status` | `VARCHAR(30)` | `NOT NULL DEFAULT 'PENDING'` |
@@ -288,7 +288,7 @@ erDiagram
     shipments ||--o{ shipment_events : "status history"
     shipments {
         bigint id PK "BIGSERIAL"
-        bigint order_id "NOT NULL, indexed, not unique"
+        bigint order_id "NOT NULL, unique"
         varchar customer_id "VARCHAR(255) NOT NULL, indexed"
         varchar tracking_number UK "VARCHAR(100) NOT NULL"
         varchar status "VARCHAR(30) NOT NULL DEFAULT PENDING"
@@ -312,7 +312,7 @@ erDiagram
 
 The entities and the migrations differ in these places:
 
-- `order_id` is indexed but not unique, so one shipment per order is enforced only by the lookup in code.
+- `order_id` is unique (`V3__unique_shipment_per_order.sql`, which deletes later duplicates first).
 - `tracking_number` has the index implied by `UNIQUE` and also an explicit `idx_shipments_tracking`. The second index is redundant.
 - The SQL defaults for `status`, `created_at` and `updated_at` never apply, because Hibernate inserts every column. `updated_at` is inserted as NULL, and `ShipmentDTO` does not expose it.
 - The length limits on `carrier` (50), `event_description` (500) and `location` (255) exist only in the database. The request DTOs do not validate lengths, so an over-long value fails at commit with 500.
@@ -321,29 +321,22 @@ The entities and the migrations differ in these places:
 ## Security and identity
 
 - **Gateway:**
-  - `/api/v1/shipments/tracking/` and everything under it needs no token, for any HTTP method. The service maps only `GET` there, so other methods get 405 from the service.
-  - Every other `/api/v1/shipments/**` path needs a valid JWT.
-  - The gateway does not strip client-supplied `X-User-*` headers on public paths. That does not matter here, because this service reads none of them.
-- **Service:** no Spring Security and no `X-User-*` headers. No endpoint checks the caller's role or ownership:
+  - `GET /api/v1/shipments/tracking/*` needs no token; any other method there needs one.
+  - `POST /api/v1/shipments` and `PATCH /api/v1/shipments/*/status` need role `ADMIN` (403 otherwise).
+  - Every other `/api/v1/shipments/**` path needs a valid JWT. The gateway strips client `X-User-*` headers on every request.
+- **Service:** `RequestIdentity` checks `X-Username` and `X-User-Role` (exactly `ADMIN`) before any work: 401 `Authentication required` without identity, 403 `Access denied` otherwise.
 
-| Endpoint | What a caller can do |
+| Endpoint | Rule |
 |---|---|
-| `POST /api/v1/shipments` | Any logged-in user can create a shipment for any order that has none, with any `customerId` and addresses. That also stops the later `payment.completed` from creating the real one |
-| `GET /api/v1/shipments/order/{orderId}` | Any logged-in user can read any order's shipment |
-| `GET /api/v1/shipments/tracking/{trackingNumber}` | **Anyone, without a token**, can read the shipment |
-| `PATCH /api/v1/shipments/{id}/status` | Any logged-in user can set any shipment's status. Ids are sequential. The user can also set the terminal `DELIVERED` or `RETURNED`, and after that no further change is possible |
-| `GET /api/v1/shipments/{id}/history` | Any logged-in user can read any shipment's history |
+| `POST /api/v1/shipments` | `ADMIN` |
+| `GET /api/v1/shipments/order/{orderId}` | the shipment's `customerId` equals `X-Username`, or `ADMIN` |
+| `GET /api/v1/shipments/tracking/{trackingNumber}` | **public**, `GET` only |
+| `PATCH /api/v1/shipments/{id}/status` | `ADMIN`; transition table (409) |
+| `GET /api/v1/shipments/{id}/history` | owner or `ADMIN` |
 
-- **What the public tracking endpoint reveals:** the whole `ShipmentDTO`:
-  - `id`, the internal sequential id;
-  - `orderId`;
-  - `customerId`, which in practice is the customer's username, since the checkout sends the username as the payment's `customerId`;
-  - `trackingNumber`, `status` and `carrier`;
-  - `originAddress` and `destinationAddress`, which for Kafka-created shipments hold placeholders but for REST-created ones hold whatever addresses were given;
-  - `estimatedDelivery`, `actualDelivery` and `createdAt`.
-
-  The frontend `TrackingPage` displays the order number, carrier, dates and both addresses. A tracking number has 36 random bits, and the service does no rate limiting.
-- docker-compose publishes port 8086 on the host, so all endpoints, including `PATCH`, are reachable without a token at `http://localhost:8086`.
+- **What the public tracking endpoint reveals:** only `PublicTrackingDTO`: `trackingNumber`, `status`, `carrier`, `estimatedDelivery` and the `events` (`eventDescription`, `newStatus`, `location`, `eventTimestamp`). No customer, order id, internal id or addresses. A tracking number has 64 random bits, and a hostile or malformed number is a plain 404.
+- Responses carry `nosniff` and `no-store`; `X-Correlation-Id` is kept only if it matches `^[A-Za-z0-9._-]{1,64}$`; `/actuator/serviceregistry` answers 403 to non-loopback callers.
+- docker-compose publishes port 8086 on the host, so a direct call can forge the identity headers.
 - The OpenAPI document declares a global `bearerAuth` scheme (`config/OpenApiConfig.java`). It is documentation only.
 
 ## Configuration
@@ -365,7 +358,7 @@ The entities and the migrations differ in these places:
 | `eureka.instance.prefer-ip-address` | | `true` | |
 | `eureka.instance.lease-renewal-interval-in-seconds` / `lease-expiration-duration-in-seconds` | | `5` / `15` | |
 | `management.endpoints.web.exposure.include` | | `health,info,metrics,prometheus,circuitbreakers,serviceregistry` | `circuitbreakers` has no effect because resilience4j is absent |
-| `management.endpoint.health.show-details` | | `always` | |
+| `management.endpoint.health.show-details` | | `never` | |
 | `management.endpoint.prometheus.access` | | `unrestricted` | |
 | `management.metrics.tags.application` / `environment` | `ENVIRONMENT` (environment only) | `shipping-service` / `development` | |
 | `management.metrics.distribution.percentiles-histogram.http.server.requests` | | `true` | |
@@ -439,10 +432,7 @@ Run everything with `mvn verify` (106 unit, slice and pact tests, plus 17 integr
 
 Because the file sits under `src/main`, it ships inside the production jar, where H2 is absent, so activating the profile in a container would fail at startup. It belongs in `src/test/resources`.
 
-**Disabled tests that pin bugs** (see [Findings](../findings.md#bugs-pinned-by-tests)):
-
-- `ShipmentControllerTest` (two tests): there is no `MethodArgumentNotValidException` handler, so a validation failure on `POST /api/v1/shipments` and a blank status on `PATCH /{id}/status` return 500 instead of 400 (A-4).
-- `ShipmentLifecycleIT.unknownStatus_is400_andChangesNothing`: an unknown status makes `ShipmentStatus.valueOf` throw, returned as 500 (A-4).
+No tests are disabled for bugs any more; the `@Tag("security")` suite covers authorization, private tracking, transitions and tracking-number entropy.
 
 **Gaps:** the unit and pact tests run on H2 with Flyway disabled, but `*IT` classes run both migrations on Postgres.
 
@@ -472,18 +462,18 @@ Paths are relative to `src/main/java/com/ecommerce/shipping/`.
 
 | Issue | Where | Impact | Severity |
 |---|---|---|---|
-| No authorization on status changes | `ShipmentController.updateStatus()`, `ShipmentService.updateShipmentStatus()` | Any logged-in user, and self-registration is public, can move any shipment (sequential ids) to any status. That includes the terminal `DELIVERED` or `RETURNED`, after which the API allows no correction. Each change also triggers a `shipment.updated` notification | High |
-| The public tracking endpoint returns the full `ShipmentDTO` | `ShipmentController.trackShipment()`, gateway public prefix `/api/v1/shipments/tracking/` | Anyone holding a tracking number sees the customer's username (`customerId`), the order id, the internal id and both addresses. The tracking number has 36 random bits and there is no rate limiting | Medium |
-| Validation failures return 500. `GlobalExceptionHandler` has no `MethodArgumentNotValidException` handler, so the catch-all takes it | `exception/GlobalExceptionHandler.java` | A missing or blank required field on `POST /api/v1/shipments` or `PATCH /{id}/status` returns 500 `An unexpected error occurred` instead of 400 with `fieldErrors`, and is logged at ERROR | Medium |
+| ~~No authorization on status changes~~ | fixed | see the security fix spec | — |
+| ~~Public tracking returned the full `ShipmentDTO`~~ | fixed | see the security fix spec | — |
+| ~~Validation failures return 500~~ | fixed | see the security fix spec | — |
 | Kafka-created shipments use placeholder addresses and a fixed carrier | `PaymentEventConsumer.handlePaymentCompleted()` | Every automatically created shipment ships from `Warehouse, 123 Storage St` to `Customer Address` with DHL. The checkout address is never used | Medium |
 | The consumer has no dead-letter topic and no back-off | `config/KafkaProducerConfig.kafkaListenerContainerFactory()` | During a database or other transient failure longer than 10 immediate attempts, the `payment.completed` record is logged and skipped. The paid order never gets a shipment and nothing retries it | Medium |
 | Events are sent inside the DB transaction, fire-and-forget | `PaymentEventConsumer`, `ShipmentService.updateShipmentStatus()` | If the commit fails, a phantom event has already gone out. For example, a `description` over 500 characters or a `location` over 255 characters gives a 500 after `shipment.updated` was sent. If the send fails after commit, the event is lost and only logged | Medium |
 | The REST creation path is incomplete | `ShipmentService.createShipment()` | It publishes no `shipment.created`, writes no history row, ignores `estimatedDelivery`, and does not check that the order exists or is paid. Because the consumer then skips that order, it never gets `shipment.created` | Medium |
-| The public tracking page calls an authenticated endpoint | Frontend `pages/tracking/TrackingPage.tsx` calls `GET /api/v1/shipments/{id}/history`, which needs a JWT | An anonymous visitor gets a 401, and the frontend's axios interceptor redirects to `/login` right after the shipment loads | Medium |
+| ~~Public tracking page called an authenticated endpoint~~ | fixed | see the security fix spec | — |
 | Shipping ignores the rest of the order lifecycle | No listener for `payment.refunded` or `order.cancelled`. order-service has no `shipment.*` listener | A refunded or cancelled order keeps an active shipment, and the order never becomes `SHIPPED` or `DELIVERED` from shipping data | Medium |
-| No transition rules other than "terminal is final" | `ShipmentService.updateShipmentStatus()` | Statuses can go backwards (`SHIPPED` to `PENDING`), repeat, or jump from `PENDING` to `DELIVERED`. Each repeat adds history and an event | Low |
-| An unknown status string returns 500 | `ShipmentStatus.valueOf()` in `updateShipmentStatus()` | `{"status":"shipped"}` or a typo returns 500 instead of 400 | Low |
-| One shipment per order is not enforced in the database | `V1__create_shipments.sql` (`order_id` not unique) | A REST create racing the consumer can produce two rows. After that, `findByOrderId()` throws, so `GET /order/{orderId}` returns 500 and the consumer's check fails for that order | Low |
-| Unmapped framework exceptions end in the catch-all as 500 | `GlobalExceptionHandler.general()` | Unknown paths (`NoResourceFoundException`) and a wrong `Content-Type` return 500 instead of 404 or 415 | Low |
+| ~~No transition rules other than "terminal is final"~~ | fixed | see the security fix spec | — |
+| ~~Unknown status string returns 500~~ | fixed | see the security fix spec | — |
+| ~~One shipment per order not enforced in the database~~ | fixed | see the security fix spec | — |
+| ~~Unmapped framework exceptions end in the catch-all as 500~~ | fixed | see the security fix spec | — |
 | Dead code and configuration: `/hello` with `ShippingService` and their tests; `ShipmentRepository.findByCustomerId()`; `CreateShipmentRequest.estimatedDelivery`; `circuitbreakers` exposure; the redundant `idx_shipments_tracking` index | Various | Misleading to readers. `/hello` is reachable directly on port 8086 | Low |
 | `application-test.yaml` lives in `src/main/resources` | `src/main/resources/application-test.yaml` | It ships in the production jar. It belongs in `src/test/resources` | Low |

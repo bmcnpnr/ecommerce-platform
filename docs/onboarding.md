@@ -44,6 +44,7 @@ before.
 
 ```bash
 cd ecommerce-platform
+./init-secrets.sh            # once: generates the git-ignored .env (JWT, admin, Eureka, Grafana secrets)
 ./build-all.sh --skip-tests        # Maven for all ten Spring repos, then docker compose build
 docker compose up -d               # 38 containers
 ```
@@ -67,9 +68,9 @@ until [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/api/v1/products
 | Storefront | http://localhost:3000 | React SPA; nginx proxies `/api` to the gateway |
 | API gateway | http://localhost:8080 | every API call goes here |
 | Swagger UI, all services | http://localhost:8080/swagger-ui.html | pick a service from the dropdown, log in, Authorize, Try it out |
-| Eureka | http://localhost:8761 | which instances are registered |
+| Eureka | http://localhost:8761 | which instances are registered (`eureka` / `EUREKA_PASSWORD` from `.env`) |
 | Kafka UI | http://localhost:8090 | topics, messages, consumer groups and lag |
-| Grafana | http://localhost:3001 | `admin` / `admin` by default; dashboards, Loki logs, Tempo traces |
+| Grafana | http://localhost:3001 | `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` from `.env`; dashboards, Loki logs, Tempo traces |
 | Prometheus | http://localhost:9090 | |
 | Alertmanager | http://localhost:9093 | |
 | Databases | Postgres on `localhost:5432`–`5438`, MongoDB on `localhost:27017` | credentials in `docker-compose.yml` |
@@ -88,9 +89,11 @@ TOKEN=$(curl -s -X POST -H 'Content-Type: application/json' \
 curl -s -H "Authorization: Bearer $TOKEN" "$GW/api/v1/users/me"
 ```
 
-For the storefront's admin pages, log in as `admin` / `admin`. user-service
-seeds that account on every start, and it is the only way an `ADMIN` exists.
-It is fine locally and a finding everywhere else ([Security](security.md)).
+For the storefront's admin pages, log in as `ADMIN_USERNAME` / `ADMIN_PASSWORD`
+from `ecommerce-platform/.env` (`./init-secrets.sh --print` shows them). user-service
+seeds that account from those variables, and it is the only way an `ADMIN` exists
+([Security](security.md)). Passwords for new accounts need 10 to 72 bytes and must
+not contain the username.
 
 Always go through the gateway. A direct call to a service port skips routing,
 authentication and identity headers, so it proves less. The
