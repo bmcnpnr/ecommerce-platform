@@ -177,7 +177,7 @@ sequenceDiagram
         K-->>O: order status CANCELLED (stock stays reserved)
         K-->>N: payment.failed, logged
     end
-    Note over B: the SPA shows Order Placed in both cases and clears cartOrderId
+    Note over B: the SPA reports success in both cases (A-1) and clears cartOrderId
 ```
 
 What a successful purchase leaves behind:

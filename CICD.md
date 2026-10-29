@@ -18,7 +18,7 @@ an independent CI project. Ten repositories own their pipeline in
 | Repository type | CI | Continuous delivery |
 |---|---|---|
 | Ten Java 25 / Spring Boot services | Maven verify on a Docker-enabled VM, tests, JAR and Docker build | Docker Hub image |
-| React / TypeScript frontend | Vitest, TypeScript/Vite and Docker build | nginx Docker Hub image |
+| React / TypeScript frontend | Vitest, TypeScript/Vite and Docker build. Playwright e2e on demand (pipeline parameters `run-e2e`, `e2e-base-url`), against an environment that is already running | nginx Docker Hub image |
 | Monitoring configuration | YAML/JSON, Prometheus, Alertmanager validation | Versioned config bundle |
 | Platform orchestration | Compose, ShellCheck, PowerShell parser | Versioned deployment bundle |
 

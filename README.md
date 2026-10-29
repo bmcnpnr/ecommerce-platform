@@ -123,7 +123,24 @@ docker compose up -d
 GW=http://otherhost:8080 ./smoke-test.sh
 ```
 
-Run it from Git Bash or WSL, **not PowerShell** — PowerShell 5.1 strips the double
+**Browser end-to-end tests (Playwright, 26 tests)** — live in `ecommerce-frontend/e2e`
+and drive the real SPA in Chromium against a running stack: sign-up and login,
+search, cart, checkout through payment and Kafka, cancel, tracking and the admin
+pages. Each test seeds its own data, so the suite is safe to run in parallel and
+against a shared environment.
+
+```bash
+cd ../ecommerce-frontend
+npm run e2e:install                   # once: Chromium
+npm run e2e                           # against http://localhost:3000
+E2E_BASE_URL=https://staging.example.com npm run e2e
+scripts/e2e-docker.sh                 # in the Playwright image, for agents without Node
+```
+
+Every run writes an HTML report (traces, screenshots and videos of failures),
+JUnit XML and a Markdown summary to `reports/`. See `ecommerce-frontend/e2e/README.md`.
+
+Run the smoke test from Git Bash or WSL, **not PowerShell** — PowerShell 5.1 strips the double
 quotes out of a JSON body passed to `curl.exe`, so requests arrive malformed and
 the failures look like application bugs.
 

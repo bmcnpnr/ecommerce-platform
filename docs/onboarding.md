@@ -171,6 +171,7 @@ See [Frontend](frontend.md) for its structure and its API usage.
 | All services | `./build-all.sh` (without `--skip-tests`) | — |
 | Frontend | `npx vitest run` | — |
 | End to end | `./smoke-test.sh` | the running stack |
+| Browser end to end | `npm run e2e:install` once, then `npm run e2e` in `ecommerce-frontend` | the running stack (`E2E_BASE_URL`, default `http://localhost:3000`). Report: `npm run e2e:report` |
 | Contracts across repos | `./sync-pacts.sh` | — |
 
 If you change what a service **sends** or **expects** across a boundary (a Feign

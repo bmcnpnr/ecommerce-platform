@@ -6,13 +6,13 @@ The frontend is the platform's only user interface. It is a React single-page ap
 |---|---|
 | Repository | `ecommerce-frontend` |
 | Stack | React 18.3.1 · TypeScript 5.9.3 · Vite 6.4.1 · MUI 6.5.0 (plus `@mui/lab` for Timeline) · React Router 6.30.3 · TanStack Query 5.90.21 · zustand 5.0.11 · axios 1.13.6 · react-hook-form 7.71.2 with zod 3.25.76 · date-fns 4.1.0 |
-| Tests | Vitest 2.1.9 (jsdom 26) · Testing Library 16 · MSW 2.12.10. 42 tests |
+| Tests | Vitest 2.1.9 (jsdom 26) · Testing Library 16 · MSW 2.12.10. 42 tests. Browser end to end: Playwright 1.64.1, 26 tests against a running stack ([details](#end-to-end-tests-playwright)) |
 | Dev server | `npm run dev`: Vite on port 3000, `/api` proxied to `http://localhost:8080` |
 | Container | `nginx:1.27-alpine` listening on port 80. Host port 3000 (compose maps `3000:80`, the k8s Service `frontend-lb` listens on 3000) |
 | How it reaches the API | Images are built with `VITE_API_BASE_URL=/`, so axios calls the same-origin path `/api/v1/...`. nginx proxies `/api/` to `api-gateway:8080`, and the gateway routes by path prefix to the services through Eureka |
 | Services it calls | user-service, product-service, order-service, payment-service, shipping-service and review-service. It never calls catalog-service (`/api/v1/catalog`) and has no use for notification-service |
 | Session | JWT from `POST /api/v1/users/login`, persisted by zustand in the localStorage key `auth-storage` and sent as `Authorization: Bearer <token>` |
-| CI | CircleCI jobs `test`, `build`, `validate-image` and `publish-image` (Docker Hub) |
+| CI | CircleCI jobs `test`, `build`, `validate-image` and `publish-image` (Docker Hub), plus an `e2e` job run only on demand |
 
 The versions are the ones `package-lock.json` resolves. `package.json` declares caret ranges.
 
@@ -41,8 +41,11 @@ Related docs: [api-gateway](services/api-gateway.md), [user-service](services/us
 | `src/components/review/` | `ReviewCard` (votes, edit and delete for the author, approve and reject for moderation), `ReviewForm`, `ReviewSummary`, `RatingDistribution` |
 | `src/theme/theme.ts` | MUI theme (primary `#1976d2`, secondary `#9c27b0`, 8 px radius, buttons without uppercase) |
 | `src/test/` | Vitest suites, MSW `handlers.ts` and `server.ts`, `setup.ts`, `utils/renderWithProviders.tsx` |
+| `e2e/` | Playwright suite: `tests/*.spec.ts`, `fixtures.ts` (per-test customer and products, `signIn`), `support/api.ts` (gateway client for seeding), `global-setup.ts` (waits for the stack), `reporters/summary-reporter.ts`, its own `tsconfig.json` and `README.md` |
+| `playwright.config.ts` | Playwright settings: target from `E2E_BASE_URL`, retries and workers on CI, the reporters writing to `reports/` |
+| `scripts/e2e-docker.sh` | Runs the Playwright suite in the `mcr.microsoft.com/playwright` image |
 | `public/favicon.svg` | Favicon, copied to `dist/` as is (no content hash) |
-| `vite.config.ts` | React plugin, `@` alias to `src` (configured, but every import is relative), dev server and proxy, Vitest settings |
+| `vite.config.ts` | React plugin, `@` alias to `src` (configured, but every import is relative), dev server and proxy, Vitest settings (which exclude `e2e/`) |
 | `tsconfig.json`, `tsconfig.node.json` | Strict TypeScript for `src` (`noEmit`, bundler module resolution) and a separate project for `vite.config.ts` |
 | `Dockerfile`, `nginx.conf`, `.dockerignore` | Two-stage image build and the nginx server config baked into it |
 | `.env.example` | Documents `VITE_API_BASE_URL`. `.env` itself is ignored by git and by Docker |
@@ -338,7 +341,7 @@ The Edit dialog in `AdminProductsPage` reuses the create form and sends the whol
 `CheckoutPage` collects a shipping and a billing address (zod: at least 5 characters each, pre-filled from the profile defaults only if `['me', username]` is already cached) and keeps them in component state for the review step. `handlePlaceOrder` calls `confirmOrder(cartOrderId)`, which sends no body, and the payment request has no address fields. No order-service endpoint accepts addresses: `OrderService.createOrder()` and `confirmOrder()` never set `Order.shippingAddress` or `billingAddress`, so `OrderDTO` always returns them as null and OrderDetailPage always shows "No address information". The shipment that shipping-service creates on `payment.completed` uses the hard-coded origin "Warehouse, 123 Storage St" and destination "Customer Address" (`PaymentEventConsumer.handlePaymentCompleted()`).
 
 **M4. The payment outcome is ignored.**
-`POST /api/v1/payments/{id}/process` simulates a gateway: `PaymentService.processPayment()` succeeds 8 times out of 10 and otherwise sets status FAILED with `failureReason` "Payment declined by gateway". It answers 200 in both cases and publishes `payment.completed` or `payment.failed`. `handlePlaceOrder` awaits the call but never reads the returned status. It always clears `cartOrderId`, shows "Order Placed!" and says payment "is being processed". After a decline, order-service's `payment.failed` listener sets the order to CANCELLED without restoring stock, and the user learns about it only on the order detail page.
+`POST /api/v1/payments/{id}/process` simulates a gateway: `PaymentService.processPayment()` succeeds 8 times out of 10 and otherwise sets status FAILED with `failureReason` "Payment declined by gateway". It answers 200 in both cases and publishes `payment.completed` or `payment.failed`. `handlePlaceOrder` awaits the call but never reads the returned status. It always clears `cartOrderId` and reports success (the "Order placed successfully!" toast; the "Order Placed!" screen meant to say payment "is being processed" never renders, see [Known issues](#known-issues-and-limitations)). After a decline, order-service's `payment.failed` listener sets the order to CANCELLED without restoring stock, and the user learns about it only on the order detail page.
 
 **M5. Product list endpoints return ACTIVE products only.**
 `ProductService.getAllProducts()` uses `findByStatus(ACTIVE)`, `searchProducts()` filters ACTIVE, and `getProductsByCategory()` drops anything not ACTIVE. Effects in the UI:
@@ -509,7 +512,7 @@ sequenceDiagram
         Pay-->>B: 200 PaymentDTO, status FAILED
         K-->>O: payment.failed sets the order to CANCELLED, stock is not restored
     end
-    Note over B: Either way the UI clears cartOrderId and shows Order Placed
+    Note over B: Either way the UI clears cartOrderId and reports success
 ```
 
 - **Step order in `CheckoutPage`:** step 1 collects the addresses, step 2 the payment method (CREDIT_CARD, DEBIT_CARD, BANK_TRANSFER, DIGITAL_WALLET) and, for card methods, `cardLastFour` (exactly 4 characters or empty), step 3 reviews and places the order. The three calls run in sequence (`handlePlaceOrder`). Currency is always `USD`, and `amount` is the `totalAmount` returned by the confirm call.
@@ -674,6 +677,9 @@ sequenceDiagram
 | `test` | `vitest` | Watch mode locally. CI runs `npm test -- --run` |
 | `test:ui` | `vitest --ui` | Vitest browser UI (`@vitest/ui` is installed) |
 | `test:coverage` | `vitest run --coverage` | Fails: no coverage provider (`@vitest/coverage-v8`) is installed |
+| `e2e` | `playwright test` | Playwright suite against `E2E_BASE_URL` (default `http://localhost:3000`); needs a running stack |
+| `e2e:install` | `playwright install --with-deps chromium` | Downloads Chromium and its OS dependencies, once per machine |
+| `e2e:report` | `playwright show-report reports/html` | Opens the last e2e HTML report |
 
 The dev server and the compose `frontend` container both use host port 3000, so they cannot run at the same time.
 
@@ -744,6 +750,7 @@ Other k8s details:
 - `build`: `npm run build`, then stores `dist` as the artifact `frontend`.
 - `validate-image` (after `test` and `build`): `docker build --pull` with `VITE_API_BASE_URL=${VITE_API_BASE_URL:-/}` and OCI labels for revision and source, tagged `local/ecommerce-frontend:sha-<12 chars>`. Nothing is pushed.
 - `publish-image` (after `validate-image`, context `ecommerce-dockerhub`, only on `develop`, `main`, `master` or tags matching `^v.*`): fails unless `DOCKERHUB_USERNAME` and `DOCKERHUB_ACCESS_TOKEN` are set. It normalises CircleCI's literal `<nil>` for an unset tag or branch, which previously produced the invalid reference `<user>/<image>:<nil>`. It builds and pushes `<user>/ecommerce-frontend:sha-<12 chars>`, then adds a delivery tag: the git tag, else `develop` on the develop branch, else `latest`.
+- `e2e` (workflow `e2e`, only when the pipeline parameter `run-e2e` is true; the `ci-cd` workflow is skipped then): runs `npx playwright test` in `mcr.microsoft.com/playwright:v1.64.1-noble` against the pipeline parameter `e2e-base-url`. The test exit code is saved, the JUnit file is stored as test results and `reports/` and `test-results/e2e` as artifacts, and a last step fails the job if a test failed. The pipeline starts no stack, so the URL must point at a running environment.
 
 ## Testing
 
@@ -770,12 +777,18 @@ Infrastructure:
 
 Gaps:
 
-- No tests for the cart, checkout, order list and detail, product list and detail, the admin pages, the review components, or any hook.
+- No unit tests for the cart, checkout, order list and detail, product list and detail, the admin pages, the review components, or any hook. The Playwright suite covers those flows in a browser, but only against a running stack.
 - The axios interceptors (token injection, the expiry check, the 401 redirect, error-message mapping) are untested. jsdom does not implement navigation, so the `window.location.href` redirect cannot be observed as written.
 - The mocks are hand-written and not tied to the backend: there are no Pact consumer tests for the frontend, unlike the service-to-service contracts. They have already drifted (M12).
 - Unmocked calls only warn. For example, the history request that TrackingPage makes in its tests (`/api/v1/shipments/1/history`) has no handler and goes to the real network.
 - Some assertions are weak. The LoginPage submit test only checks that no alert is visible, and the TrackingPage URL-parameter test only checks that the input exists, not that a lookup ran.
 - `npm run test:coverage` cannot run (no coverage provider installed).
+
+### End-to-end tests (Playwright)
+
+`e2e/` holds a Playwright suite (`@playwright/test` 1.64.1, Chromium) that drives the built SPA against a running stack, with nothing mocked. Each test registers its own customer and creates its own products through the gateway, so the suite runs in parallel and can be repeated against a long-lived environment. It covers registration and login, the route guards, search and product detail, the cart (stock reserved on add, released on clear), the full checkout through payment (accepting either simulated payment outcome and checking that the order ends PAID or CANCELLED to match), order cancel, shipment tracking after `payment.completed`, and the admin product, category and review-moderation pages. Known bugs are kept as `test.fail` tests: M1, and the missing confirmation screen ([findings](findings.md) A-6, see [Known issues](#known-issues-and-limitations)).
+
+`npm run e2e` targets `E2E_BASE_URL` (default `http://localhost:3000`). `scripts/e2e-docker.sh` runs the same suite in the `mcr.microsoft.com/playwright` image for agents without Node, and CircleCI has an opt-in `e2e` workflow (pipeline parameters `run-e2e` and `e2e-base-url`). Every run writes `reports/html/`, `reports/junit.xml`, `reports/results.json` and `reports/summary.md`. Details: `ecommerce-frontend/e2e/README.md`.
 
 ## Known issues and limitations
 
@@ -785,7 +798,8 @@ Gaps:
 | Identity, ownership and amounts come from the client (M10). Orders are created for a `customerId` the browser chooses, payments carry a client-chosen `customerId` and `amount`, and orders, payments, shipments and users are read and changed by id without an owner check | `src/hooks/useOrders.ts` `useCreateOrder`, `src/pages/checkout/CheckoutPage.tsx` `handlePlaceOrder`; `OrderController`, `PaymentService.initiatePayment()`, `UserService.updateUser()` | A user can read, cancel or modify other users' orders and profiles by id, create orders in another user's name, and get an order marked PAID for any amount | High |
 | Public tracking redirects signed-out visitors to `/login` (M1) | `src/pages/tracking/TrackingPage.tsx`, `src/hooks/useShipments.ts`, `src/api/axios.ts`; gateway `JwtAuthenticationFilter.isPublicEndpoint()`, `ShipmentController.getHistory()` | Shipment tracking does not work without a login | High |
 | Checkout addresses are discarded (M3) | `src/pages/checkout/CheckoutPage.tsx`; `OrderService.createOrder()` and `confirmOrder()`; shipping `PaymentEventConsumer.handlePaymentCompleted()` | Every shipment goes to "Customer Address". Order detail always shows "No address information" | High |
-| A declined payment is reported as a placed order (M4) | `CheckoutPage.handlePlaceOrder()`; `PaymentService.processPayment()` | About one checkout in five shows "Order Placed!" and empties the cart while the order is cancelled (without restoring stock) | High |
+| The checkout confirmation screen never appears. `handlePlaceOrder` sets `cartOrderId` to null and `orderComplete` to true in one batched render, and the empty-cart early return is checked before the `orderComplete` branch, so the page shows "Your cart is empty" (with the "Order placed successfully!" toast) instead of "Order Placed!" and its View Order button. Found by the e2e suite ([findings](findings.md) A-6) | `src/pages/checkout/CheckoutPage.tsx` | The customer is not told the order number and has no link to the order | Medium |
+| A declined payment is reported as a placed order (M4) | `CheckoutPage.handlePlaceOrder()`; `PaymentService.processPayment()` | About one checkout in five reports success and empties the cart while the order is cancelled (without restoring stock) | High |
 | Stock edits in the product Edit dialog are silently dropped (M2) | `src/pages/admin/AdminProductsPage.tsx`, `UpdateProductRequest` in `src/types/index.ts`; product `UpdateProductRequest`, `ProductService.updateProduct()` | The admin believes stock changed. The request still returns 200 | Medium |
 | List endpoints return ACTIVE products only (M5) | `ProductListPage`, `AdminProductsPage`, `AdminDashboard`; `ProductService.getAllProducts()`, `searchProducts()`, `getProductsByCategory()` | Out-of-stock and deleted products vanish from the admin table and cannot be restocked or reactivated from the UI. The "Out of Stock" and "Inactive" filters are always empty | Medium |
 | A user's own pending review is invisible (M6) | `ProductDetailPage`, `useProductReviews`; `ReviewService.createReview()`, `updateReview()` | A second attempt fails with 409. Authors cannot edit or delete a pending or rejected review. Edited reviews disappear until approved | Medium |

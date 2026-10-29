@@ -107,7 +107,7 @@ containers), with Kafka UI alongside. See [Observability](observability.md).
 | API docs | springdoc-openapi 2.8.5 (services, Spring MVC) and 3.0.3 (gateway, WebFlux UI) |
 | Observability | Micrometer 1.16 with the Prometheus registry, OpenTelemetry 1.55 tracing to Tempo 2.5, Prometheus 2.52, Grafana 11.1, Loki 3.1 with promtail, Alertmanager 0.27 |
 | Frontend | React 18, TypeScript 5.9, Vite 6, MUI 6.5, TanStack Query 5, zustand 5, axios, React Router 6, react-hook-form with zod, served by nginx 1.27 |
-| Testing | JUnit 5, Mockito, Spring test slices, H2 2.4, Testcontainers 2.0.3, pact-jvm 4.7.5, Vitest 2 with MSW 2 |
+| Testing | JUnit 5, Mockito, Spring test slices, H2 2.4, Testcontainers 2.0.3, pact-jvm 4.7.5, Vitest 2 with MSW 2, Playwright 1.64.1 (browser end to end) |
 | Delivery | Maven 3.9, Docker, Docker Compose, Kubernetes (Docker Desktop, Kustomize), CircleCI and GitHub Actions, Docker Hub |
 
 ## Design in brief
@@ -167,14 +167,16 @@ contention.
 | Contract | Pact, consumer-driven: Feign calls, gateway identity headers, the JWT format, all seven event types | inside the same `mvn verify` | 10 pacts, 24 interactions ([ADR-008](adr/ADR-008-pact-without-broker.md)) |
 | Frontend | components, stores, API client and pages with Vitest and MSW | `npx vitest run`, CI | 42 tests |
 | End to end | 24 checks through the gateway: authentication, routing, Feign, MongoDB catalog, the Kafka round trip | `ecommerce-platform/smoke-test.sh` against compose or Kubernetes | 24 checks |
+| Browser end to end | the real SPA in Chromium against a running stack: sign-up and login, route guards, search, cart and stock reservation, checkout through payment, cancel, tracking after `payment.completed`, the admin pages. Each test seeds its own users and products through the gateway | `npm run e2e` in `ecommerce-frontend` (or `scripts/e2e-docker.sh`); CircleCI only on demand, since no pipeline starts a stack | 26 tests, two of them pinned known bugs (`test.fail`) |
 
 How each layer is wired:
 
 - The JPA services' tests use H2 with `ddl-auto: create-drop` and Flyway disabled. The **Flyway migrations are never exercised by any test**; they first run when a real Postgres container starts.
 - The catalog's MongoDB tests skip, rather than fail, when Docker isn't running.
-- The Kafka tests use an embedded broker, so no test needs the stack.
+- The Kafka tests use an embedded broker, so no unit, slice or contract test needs the stack. The smoke test and the Playwright suite do, and nothing runs them automatically (T-2).
+- The Playwright suite writes `reports/html/`, `reports/junit.xml`, `reports/results.json` and `reports/summary.md` on every run. Details: [Frontend: end-to-end tests](frontend.md#end-to-end-tests-playwright).
 
-There are no load tests, browser end-to-end tests or security tests. See
+There are no load tests or security tests. See
 [Findings](findings.md) for the gaps that matter most.
 
 ## Quality attributes at a glance

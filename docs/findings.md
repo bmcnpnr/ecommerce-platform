@@ -16,7 +16,7 @@ issue.
 ## Resolved on 2026-10-29
 
 Changes made while writing these docs, all built and tested (146 backend tests,
-42 frontend tests, the smoke test 24/24 on Kubernetes):
+42 frontend tests, the smoke test 24/24 on Kubernetes, the Playwright suite 26/26):
 
 | Change | Where |
 |---|---|
@@ -28,6 +28,7 @@ Changes made while writing these docs, all built and tested (146 backend tests,
 | Removed the never-read `spring.kafka.producer/consumer` YAML blocks, which named the deprecated classes and contradicted the code. | order, payment, shipping, notification |
 | `smoke-test.sh`: the Kafka check now works against Kubernetes as well as compose, and no longer matches order 6 inside order 60. | ecommerce-platform |
 | New `export-openapi.sh`: regenerates the committed OpenAPI files through the gateway, deterministically. | ecommerce-platform |
+| New **Playwright browser end-to-end suite** (26 tests, `e2e/`): runs locally, on any CI agent with Node, or in the Playwright Docker image (`scripts/e2e-docker.sh`), and writes HTML, JUnit, JSON and Markdown reports on every run. CircleCI gained an opt-in `e2e` workflow. It found A-6. | ecommerce-frontend |
 
 Deprecation status after these changes:
 
@@ -65,10 +66,12 @@ Deprecation status after these changes:
 | R-4 | Circuit breakers and fallbacks inactive in catalog and review; product 404 becomes 500 | Resilience | Medium | |
 | O-1 | No alert is delivered anywhere | Operations | Medium | |
 | O-2 | Traces stop at Feign and Kafka hops; logs carry no trace IDs | Operations | Medium | |
-| A-1 | The SPA shows a declined payment as "Order Placed!" | UX | Medium | |
+| A-1 | The SPA reports a declined payment as a successful order | UX | Medium | |
 | A-2 | Public tracking page calls a JWT-only endpoint; anonymous visitors get sent to login | UX | Medium | |
 | A-3 | Admin pages expect endpoints that don't exist (all orders, pending reviews) | Functional | Medium | |
+| A-6 | Checkout never shows its confirmation screen: after Place Order the customer sees "Your cart is empty" | UX | Medium | yes (e2e) |
 | T-1 | Flyway migrations are never exercised by any test | Testing | Medium | |
+| T-2 | The smoke test and the Playwright suite need a running stack, and no pipeline runs them automatically | Testing | Low | |
 | S-9 | Gateway forwards client `X-User-*` headers on public routes and matches public paths on the raw path | Security | Low | yes (not exploitable today) |
 | S-10 | Eureka registry is unauthenticated and published | Security | Low (dev) | |
 | R-5 | One partition per topic: consumers can't scale out | Scalability | Low | |
@@ -215,10 +218,23 @@ public page.
 each handler.
 **A-5.** Pass `args` to `SpringApplication.run` in `UserServiceApplication`.
 
+**A-6.** In `CheckoutPage.handlePlaceOrder()` the SPA clears `cartOrderId` and sets
+`orderComplete` in one batched render, and the empty-cart early return is checked
+before the `orderComplete` branch. The "Order Placed!" screen, with the order number
+and its View Order button, therefore never renders; only the "Order placed
+successfully!" toast shows. *Verified* by the Playwright suite, which keeps it as a
+`test.fail` test. **Fix:** check `orderComplete` before the empty-cart condition, then
+remove the `test.fail` line in `e2e/tests/checkout.spec.ts`.
+
 ### Testing, delivery, maintenance
 
 **T-1.** Run the repository tests against Postgres with Testcontainers and
 Flyway enabled. The CI machines already support Testcontainers.
+
+**T-2.** Start the stack in a pipeline (compose on a machine executor, or a kind
+cluster) after the images are built, then run `smoke-test.sh` and the Playwright
+suite against it, or trigger the frontend's `e2e` workflow after each deployment to
+a shared environment.
 
 **D-1.** Choose one CI system, and update [CICD.md](../CICD.md) until then.
 
@@ -236,8 +252,8 @@ whole platform on one version.
 flowchart LR
     P1["1. Security baseline<br/>S-1..S-6, S-9"] --> P2["2. Purchase integrity<br/>I-1..I-9"]
     P2 --> P3["3. Messaging reliability<br/>R-1..R-4, I-10"]
-    P3 --> P4["4. Operability<br/>O-1..O-4, T-1"]
-    P4 --> P5["5. Product completeness<br/>I-7, I-11, A-1..A-3, real notifications"]
+    P3 --> P4["4. Operability<br/>O-1..O-4, T-1, T-2"]
+    P4 --> P5["5. Product completeness<br/>I-7, I-11, A-1..A-3, A-6, real notifications"]
 ```
 
 1. **Security baseline.** Close the account and admin holes before anything else. S-1 is the largest item. The rest are configuration changes.
