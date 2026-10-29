@@ -1,0 +1,307 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Payment Service API",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "API gateway"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Payments",
+      "description": "Payment processing"
+    }
+  ],
+  "paths": {
+    "/api/v1/payments": {
+      "post": {
+        "tags": [
+          "Payments"
+        ],
+        "summary": "Initiate a payment",
+        "operationId": "initiatePayment",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InitiatePaymentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/payments/{id}/refund": {
+      "post": {
+        "tags": [
+          "Payments"
+        ],
+        "summary": "Refund a completed payment",
+        "operationId": "refundPayment",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/payments/{id}/process": {
+      "post": {
+        "tags": [
+          "Payments"
+        ],
+        "summary": "Process payment (simulate gateway)",
+        "operationId": "processPayment",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/payments/{id}": {
+      "get": {
+        "tags": [
+          "Payments"
+        ],
+        "operationId": "getPaymentById",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/payments/order/{orderId}": {
+      "get": {
+        "tags": [
+          "Payments"
+        ],
+        "operationId": "getByOrderId",
+        "parameters": [
+          {
+            "name": "orderId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/PaymentDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/payments/customer/{customerId}": {
+      "get": {
+        "tags": [
+          "Payments"
+        ],
+        "operationId": "getByCustomer",
+        "parameters": [
+          {
+            "name": "customerId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PaymentDTO"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "InitiatePaymentRequest": {
+        "type": "object",
+        "properties": {
+          "amount": {
+            "type": "number",
+            "minimum": 0.01
+          },
+          "cardLastFour": {
+            "type": "string",
+            "maxLength": 4,
+            "minLength": 0
+          },
+          "currency": {
+            "type": "string",
+            "maxLength": 3,
+            "minLength": 0
+          },
+          "customerId": {
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "orderId": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "amount",
+          "customerId",
+          "method",
+          "orderId"
+        ]
+      },
+      "PaymentDTO": {
+        "type": "object",
+        "properties": {
+          "amount": {
+            "type": "number"
+          },
+          "cardLastFour": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "currency": {
+            "type": "string"
+          },
+          "customerId": {
+            "type": "string"
+          },
+          "failureReason": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "method": {
+            "type": "string"
+          },
+          "orderId": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "status": {
+            "type": "string"
+          },
+          "transactionId": {
+            "type": "string"
+          },
+          "updatedAt": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  }
+}

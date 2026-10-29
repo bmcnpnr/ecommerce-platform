@@ -1,8 +1,17 @@
 # CircleCI CI/CD
 
 Each directory in this workspace is an independent Git repository and therefore
-an independent CircleCI project. Every repository owns its pipeline in
+an independent CI project. Ten repositories own their pipeline in
 `.circleci/config.yml`.
+
+> **Three repositories have moved to GitHub Actions:** ecommerce-service-discovery,
+> ecommerce-shipping-service and ecommerce-user-service. Their
+> `.github/workflows/ci-cd.yml` is a port of the CircleCI pipeline below, with
+> the same three jobs (verify → validate-image → publish-image), the same
+> trusted-ref publishing rules and image tags. Docker Hub credentials come from
+> the repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_ACCESS_TOKEN`
+> instead of the `ecommerce-dockerhub` context. Their CircleCI configs were
+> removed, so skip them in the CircleCI setup steps below.
 
 ## Pipeline coverage
 

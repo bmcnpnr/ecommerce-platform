@@ -114,10 +114,20 @@ fi
 chk "catalog search by name"           200 "$(code "$GW/api/v1/catalog/search?q=Smoke")"
 chk "unknown product is 404 in catalog" 404 "$(code "$GW/api/v1/catalog/product/999999")"
 
+# The stack runs under Docker Compose or Kubernetes (k8s/); read the consumer's
+# log from whichever one is up.
+notification_logs() {
+  if [ -n "$(docker compose ps -q notification-service 2>/dev/null)" ]; then
+    docker compose logs notification-service --since 2m 2>/dev/null
+  else
+    kubectl -n ecommerce logs deployment/notification-service --since=2m 2>/dev/null
+  fi
+}
+
 note "Kafka consumer picked the event up"
 sleep 5
-if docker compose logs notification-service --since 2m 2>/dev/null \
-     | grep -q "orderId=$ORDER_ID"; then
+# The trailing comma keeps orderId=6 from matching orderId=60.
+if notification_logs | grep -q "orderId=$ORDER_ID,"; then
   printf '  \033[32mPASS\033[0m  %s\n' "notification-service consumed order $ORDER_ID"; pass=$((pass+1))
 else
   printf '  \033[31mFAIL\033[0m  %s\n' "no notification logged for order $ORDER_ID"; fail=$((fail+1))

@@ -1,0 +1,17 @@
+{
+  "name": "ecommerce-docs-pdf",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Builds docs/ into one navigable PDF (cover, contents, bookmarks, rendered Mermaid diagrams).",
+  "type": "module",
+  "scripts": {
+    "build": "node build-pdf.mjs",
+    "watch": "node build-pdf.mjs --watch"
+  },
+  "dependencies": {
+    "github-slugger": "2.0.0",
+    "marked": "15.0.6",
+    "mermaid": "11.4.1",
+    "puppeteer-core": "23.11.1"
+  }
+}

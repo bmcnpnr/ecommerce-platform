@@ -2,6 +2,26 @@
 
 Central repository for running the full e-commerce microservices stack.
 
+## Documentation
+
+**[docs/](docs/README.md)** is the documentation hub for the whole platform:
+
+- [architecture](docs/architecture.md), [communication](docs/communication.md) and [end-to-end flows](docs/flows.md);
+- one deep dive per service under [docs/services/](docs/services/);
+- the [API reference](docs/api/README.md) with generated [OpenAPI files](docs/api/openapi/), and the Kafka [event catalog](docs/events.md);
+- the [data model](docs/data-model.md), [security](docs/security.md) and [observability](docs/observability.md);
+- the [onboarding guide](docs/onboarding.md) and [runbook](docs/runbook.md);
+- [architecture decisions](docs/adr/README.md), and [findings and a roadmap](docs/findings.md).
+
+Every API can be tried from one Swagger UI at http://localhost:8080/swagger-ui.html
+once the stack is up. `./export-openapi.sh` regenerates the committed OpenAPI
+files from a running stack.
+
+To get all of it as one navigable PDF (contents page and bookmarks), run
+`cd docs-pdf && npm install && npm run build`. The output is
+`dist/ecommerce-platform-documentation.pdf`, and `npm run watch` rebuilds it as
+the docs change.
+
 ## Repository layout
 
 ```
@@ -117,7 +137,7 @@ container via an embedded broker) against a Pact mock and records what it sends 
 which response/event fields it relies on; each provider owns a `*ProviderPactTest`
 that replays those pacts against the **real** application (controllers + JPA on H2
 over HTTP, or the real service/producer code serialized with the production Kafka
-`JsonSerializer`). Both run as ordinary Surefire tests, so `mvn verify`, CircleCI and
+`JacksonJsonSerializer`). Both run as ordinary Surefire tests, so `mvn verify`, CI and
 `./build-all.sh` already execute them — no broker and no running stack.
 
 | Consumer → Provider | Transport | What is pinned |
@@ -133,9 +153,11 @@ over HTTP, or the real service/producer code serialized with the production Kafk
 | notification-service ← payment-service | Kafka | `payment.completed`, `payment.failed`, `payment.refunded` |
 | notification-service ← shipping-service | Kafka | `shipment.created`, `shipment.updated` |
 
-Kafka events travel as spring-kafka `JsonSerializer` output — note that `LocalDateTime`
+Kafka events travel as spring-kafka `JacksonJsonSerializer` output — note that `LocalDateTime`
 fields are **integer arrays** (`[y, M, d, H, m, s, nanos]`), not ISO strings; the pacts
-pin that form. Record key (`orderId`) and topic are part of each message's metadata.
+pin that form. Jackson 3 would write ISO strings by default, so each producer's
+`KafkaProducerConfig.eventJsonMapper()` switches on `DateTimeFeature.WRITE_DATES_AS_TIMESTAMPS`
+to keep the format the deprecated Jackson 2 `JsonSerializer` produced. Record key (`orderId`) and topic are part of each message's metadata.
 
 The repositories are independent Git projects and there is no Pact broker, so the
 pact files are the hand-off: a consumer test writes `target/pacts/<consumer>-<provider>.json`,

@@ -1,0 +1,340 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Shipping Service API",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "API gateway"
+    }
+  ],
+  "security": [
+    {
+      "bearerAuth": []
+    }
+  ],
+  "tags": [
+    {
+      "name": "Shipments",
+      "description": "Shipment tracking"
+    }
+  ],
+  "paths": {
+    "/api/v1/shipments": {
+      "post": {
+        "tags": [
+          "Shipments"
+        ],
+        "operationId": "createShipment",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateShipmentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipmentDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shipments/{id}/status": {
+      "patch": {
+        "tags": [
+          "Shipments"
+        ],
+        "operationId": "updateStatus",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateShipmentStatusRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipmentDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/hello": {
+      "get": {
+        "tags": [
+          "shipping-controller"
+        ],
+        "operationId": "sayHello",
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shipments/{id}/history": {
+      "get": {
+        "tags": [
+          "Shipments"
+        ],
+        "operationId": "getHistory",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ShipmentEventDTO"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shipments/tracking/{trackingNumber}": {
+      "get": {
+        "tags": [
+          "Shipments"
+        ],
+        "summary": "Track shipment by tracking number (public)",
+        "operationId": "trackShipment",
+        "parameters": [
+          {
+            "name": "trackingNumber",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipmentDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/shipments/order/{orderId}": {
+      "get": {
+        "tags": [
+          "Shipments"
+        ],
+        "operationId": "getByOrderId",
+        "parameters": [
+          {
+            "name": "orderId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/ShipmentDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "CreateShipmentRequest": {
+        "type": "object",
+        "properties": {
+          "carrier": {
+            "type": "string"
+          },
+          "customerId": {
+            "type": "string"
+          },
+          "destinationAddress": {
+            "type": "string"
+          },
+          "estimatedDelivery": {
+            "type": "string"
+          },
+          "orderId": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "originAddress": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "customerId",
+          "destinationAddress",
+          "orderId",
+          "originAddress"
+        ]
+      },
+      "ShipmentDTO": {
+        "type": "object",
+        "properties": {
+          "actualDelivery": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "carrier": {
+            "type": "string"
+          },
+          "createdAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "customerId": {
+            "type": "string"
+          },
+          "destinationAddress": {
+            "type": "string"
+          },
+          "estimatedDelivery": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "orderId": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "originAddress": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "trackingNumber": {
+            "type": "string"
+          }
+        }
+      },
+      "UpdateShipmentStatusRequest": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "ShipmentEventDTO": {
+        "type": "object",
+        "properties": {
+          "eventDescription": {
+            "type": "string"
+          },
+          "eventTimestamp": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "location": {
+            "type": "string"
+          },
+          "newStatus": {
+            "type": "string"
+          },
+          "shipmentId": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  }
+}

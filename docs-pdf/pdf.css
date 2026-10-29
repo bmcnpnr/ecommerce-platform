@@ -1,0 +1,82 @@
+/* Print styles for the documentation PDF. Headings: h1 = part, h2 = document, h3+ = sections. */
+:root {
+  --ink: #1f2328;
+  --muted: #59636e;
+  --accent: #0b5cad;
+  --rule: #d8dee4;
+  --soft: #f4f6f8;
+}
+html { font-size: 10pt; }
+body {
+  font-family: "Segoe UI", -apple-system, "Helvetica Neue", Arial, sans-serif;
+  color: var(--ink);
+  line-height: 1.5;
+  margin: 0;
+}
+a { color: var(--accent); text-decoration: none; }
+a.ext::after { content: " ↗"; font-size: 0.8em; }
+code, pre { font-family: "Cascadia Mono", Consolas, "Courier New", monospace; }
+code { font-size: 0.88em; background: var(--soft); padding: 0.05em 0.3em; border-radius: 3px; overflow-wrap: anywhere; }
+pre {
+  background: var(--soft);
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  padding: 0.6em 0.8em;
+  font-size: 8.3pt;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  break-inside: avoid;
+}
+pre code { background: none; padding: 0; }
+pre.mermaid { background: none; border: none; text-align: center; padding: 0.4em 0; }
+pre.mermaid svg { max-width: 100%; height: auto; max-height: 235mm; }
+
+/* Cover */
+.cover { height: 250mm; display: flex; flex-direction: column; justify-content: center; }
+.cover-kicker { text-transform: uppercase; letter-spacing: 0.15em; color: var(--muted); font-size: 10pt; }
+.cover-title { font-size: 30pt; line-height: 1.15; margin: 0.2em 0 0.3em; border: none; }
+.cover-sub { font-size: 13pt; color: var(--muted); margin: 0 0 2em; }
+.cover-meta, .cover-hint { color: var(--muted); font-size: 9.5pt; max-width: 120mm; }
+
+/* Contents */
+.toc { break-before: page; }
+.toc-title { font-size: 20pt; margin: 0 0 0.6em; }
+.toc-part { break-inside: avoid-page; margin-bottom: 1em; }
+.toc-part h3 { font-size: 12pt; margin: 0.6em 0 0.3em; padding-bottom: 0.15em; border-bottom: 2px solid var(--accent); }
+.toc-part ol { margin: 0; padding-left: 1.4em; }
+.toc-part li { margin: 0.25em 0; break-inside: avoid; }
+.toc-doc { font-weight: 600; }
+.toc-sections { font-size: 8pt; color: var(--muted); line-height: 1.45; }
+.toc-sections a { color: var(--muted); }
+.toc-sections span { margin: 0 0.35em; color: var(--rule); }
+
+/* Part dividers */
+.part { break-before: page; padding-top: 70mm; }
+.part-label { text-transform: uppercase; letter-spacing: 0.15em; color: var(--accent); font-weight: 600; }
+.part h1 { font-size: 26pt; margin: 0.1em 0 0.6em; border-bottom: 3px solid var(--accent); padding-bottom: 0.2em; }
+.part-docs { font-size: 11.5pt; line-height: 1.8; }
+
+/* Documents */
+.doc { break-before: page; }
+.crumb { font-size: 8pt; color: var(--muted); border-bottom: 1px solid var(--rule); padding-bottom: 0.3em; margin-bottom: 0.8em; }
+.crumb span { font-family: "Cascadia Mono", Consolas, monospace; }
+h2.doc-title { font-size: 19pt; margin: 0 0 0.5em; color: var(--ink); }
+h3 { font-size: 13.5pt; margin: 1.4em 0 0.4em; padding-bottom: 0.15em; border-bottom: 1px solid var(--rule); }
+h4 { font-size: 11.5pt; margin: 1.1em 0 0.3em; }
+h5, h6 { font-size: 10.5pt; margin: 1em 0 0.3em; }
+h2, h3, h4, h5, h6 { break-after: avoid; }
+p, li { orphans: 3; widows: 3; }
+
+/* Tables */
+table { border-collapse: collapse; width: 100%; margin: 0.6em 0 1em; font-size: 8.4pt; line-height: 1.35; }
+/* break-word (not anywhere) so columns are at least one word wide: no "Reposito-ry" splits */
+th, td { border: 1px solid var(--rule); padding: 0.3em 0.45em; text-align: left; vertical-align: top; overflow-wrap: break-word; }
+td code, th code { overflow-wrap: anywhere; }
+th { background: var(--soft); font-weight: 600; }
+/* key/value tables written as "| | |" have an empty header row: hide it */
+thead:not(:has(th:not(:empty))) { display: none; }
+tr { break-inside: avoid; }
+thead { display: table-header-group; }
+
+blockquote { margin: 0.8em 0; padding: 0.4em 0.9em; border-left: 3px solid var(--accent); background: var(--soft); color: var(--ink); }
+hr { border: none; border-top: 1px solid var(--rule); }
