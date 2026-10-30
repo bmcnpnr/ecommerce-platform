@@ -24,6 +24,10 @@
     {
       "name": "Categories",
       "description": "Product category management"
+    },
+    {
+      "name": "Internal",
+      "description": "Service-to-service endpoints (not routed by the gateway)"
     }
   ],
   "paths": {
@@ -235,13 +239,55 @@
         }
       }
     },
+    "/internal/v1/products/{id}/stock": {
+      "patch": {
+        "tags": [
+          "Internal"
+        ],
+        "summary": "Adjust product stock (internal, used by order-service)",
+        "operationId": "updateStock",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StockUpdateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "*/*": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProductDTO"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/products/{id}/stock": {
       "patch": {
         "tags": [
           "Products"
         ],
-        "summary": "Update product stock (ADMIN/internal)",
-        "operationId": "updateStock",
+        "summary": "Update product stock (ADMIN)",
+        "operationId": "updateStock_1",
         "parameters": [
           {
             "name": "id",
@@ -352,7 +398,7 @@
         "tags": [
           "Products"
         ],
-        "summary": "Get products by category",
+        "summary": "Get products by category (first page of at most 100; use page and size for more)",
         "operationId": "getProductsByCategory",
         "parameters": [
           {
@@ -362,6 +408,14 @@
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "pageable",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/Pageable"
             }
           }
         ],
@@ -430,7 +484,9 @@
             "format": "int64"
           },
           "description": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 5000,
+            "minLength": 0
           },
           "name": {
             "type": "string",
@@ -439,10 +495,12 @@
           },
           "price": {
             "type": "number",
-            "minimum": 0.01
+            "minimum": 0
           },
           "status": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 30,
+            "minLength": 0
           }
         }
       },
@@ -502,7 +560,9 @@
             "format": "int64"
           },
           "description": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 5000,
+            "minLength": 0
           },
           "name": {
             "type": "string",
@@ -511,7 +571,7 @@
           },
           "price": {
             "type": "number",
-            "minimum": 0.01
+            "minimum": 0
           },
           "sku": {
             "type": "string",
@@ -535,7 +595,9 @@
         "type": "object",
         "properties": {
           "description": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 5000,
+            "minLength": 0
           },
           "name": {
             "type": "string",

@@ -17,8 +17,9 @@ for the bugs the tests have found, see [Findings: bugs pinned by tests](findings
 | Browser end to end | `ecommerce-frontend/e2e/` | `npm run e2e` | running stack |
 | Load | `ecommerce-platform/load-tests/` | `./run-load.sh browse.js` | running stack, Docker |
 | Security, per service | `<repo>/src/test/**/security/*SecurityTest`, `integration/*SecurityIT`, `ecommerce-frontend/src/test/security/` | `mvn verify -Dgroups=security`, `npx vitest run src/test/security` | as unit / integration |
-| Penetration (live) | `ecommerce-frontend/e2e/security/` | `npm run e2e:security` | running stack |
+| Penetration (live) | `ecommerce-frontend/e2e/security/` | `E2E_API_URL=http://localhost:8080 npm run e2e:security` (the management-endpoint tests need the gateway's own origin) | running stack |
 | Scanners (SCA, secrets, misconfig, DAST) | `ecommerce-platform/security-tests/` | `./run-security.sh` | Docker; DAST: running stack |
+| Alert rules and monitoring configs | `ecommerce-monitoring/prometheus/tests/*.test.yml`, `ecommerce-monitoring/.circleci/validate.Dockerfile` | `docker build --target prometheus-validation -f .circleci/validate.Dockerfile .` (also `loki-`, `promtail-`, `tempo-validation`) | Docker |
 
 `mvn test` is the fast inner loop. `mvn verify` is the whole suite and is what CI runs: Surefire
 runs `*Test` in the `test` phase, then Failsafe runs `*IT` in `integration-test` and fails the
@@ -89,7 +90,7 @@ IT classes (static singletons). Extend it rather than starting your own:
 | Repository | Base | Containers / stubs |
 |---|---|---|
 | order-service | `ContainersBase`, `ApplicationTestBase` | Postgres, Kafka, WireMock (product-service) |
-| payment-service | `AbstractIntegrationTest` | Postgres, Kafka |
+| payment-service | `AbstractIntegrationTest` | Postgres, Kafka, a JDK `HttpServer` standing in for order-service (with a delay knob); resets the circuit breakers before each test |
 | shipping-service | `AbstractIntegrationTest` | Postgres, Kafka |
 | product-service | `PostgresIntegrationTestSupport` | Postgres |
 | review-service | `PostgresIntegrationTestSupport` | Postgres, WireMock (product-service) |
@@ -132,6 +133,37 @@ Patterns worth copying:
   has an Awaitility limit, a class `@Timeout` and `@DirtiesContext`. Do the same for anything that can loop.
 - **catalog-service component scan.** The app's scan would pick up the Pact test's `FeignOnlyConfig` and register
   the Feign client twice; `AbstractCatalogIT` excludes it with a test-only filter.
+
+### Testing failure behaviour
+
+The resilience fixes ([resilience-fix-spec.md](resilience-fix-spec.md)) are pinned by tests that break a
+dependency on purpose and then count what the service does. The patterns:
+
+- **Count log lines, not just status codes.** Attach a Logback `ListAppender` to the root logger, send for
+  example 100 failing requests, and assert at most one or two lines and no stack trace. Log volume is a
+  behaviour: the 992 GB incident was a test-invisible logging loop.
+- **Break the dependency for real.**
+  - Kafka: `docker pause` on a broker the test class started for itself (`*OutboxKafkaOutageIT`), never the
+    shared one.
+  - Database outage: hold the only pooled connection (`maximum-pool-size=1`), or `ALTER ROLE ... NOLOGIN` plus a
+    Hikari soft-evict.
+  - Killed connection: `pg_terminate_backend` in the middle of a request.
+  - Lock waits: a second connection holding `SELECT ... FOR UPDATE`.
+  - Slow or failing peers: WireMock fixed delays (a 2.5 s answer must still succeed), `503`, and
+    `CONNECTION_RESET_BY_PEER` faults.
+- **Count requests with the JDK `HttpClient`.** The Apache client behind `RestTestClient` re-sends a 503 and
+  honours `Retry-After` by itself, so it hides what the service under test did.
+- **Reset the circuit breakers** between tests (`CircuitBreakerRegistry.getAllCircuitBreakers()` →
+  `reset()`), or test order leaks an open breaker.
+- **Dead letters.** Publish a record too large to dead-letter, followed by a normal one, and assert that the normal
+  one is still processed and that only a bounded number of lines was logged.
+- **Prove the test can fail.** Remove the fix temporarily and watch the test go red before restoring it. Every
+  resilience test was checked this way.
+- **Outside the services:** `promtool test rules` runs the alert-rule unit tests in
+  `ecommerce-monitoring/prometheus/tests/`, CI validates the Loki, Promtail and Tempo configs, and
+  `k8s/check-promtail-parity.sh` and `k8s/check-frontend-nginx-parity.sh` compare the k8s copies with their
+  compose sources. Check the frontend's `nginx.conf` with
+  `docker run --rm -v "$PWD/nginx.conf:/etc/nginx/conf.d/default.conf:ro" nginx:1.27-alpine nginx -t`.
 
 ## Writing a contract test
 

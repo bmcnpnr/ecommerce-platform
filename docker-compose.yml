@@ -23,6 +23,7 @@ volumes:
   loki-data:
   tempo-data:
   alertmanager-data:
+  promtail-data:
 
 # ─── Shared fragments ──────────────────────────────────────────────────
 #
@@ -37,10 +38,16 @@ x-java-env: &java-env
   EUREKA_CLIENT_SERVICEURL_DEFAULTZONE: http://${EUREKA_USERNAME:-eureka}:${EUREKA_PASSWORD:?run ./init-secrets.sh to create .env}@service-discovery:8761/eureka/
   OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
   ENVIRONMENT: development
+  # ExitOnOutOfMemoryError: a JVM that hit OutOfMemoryError is not trusted to carry
+  # on; exit so `restart: unless-stopped` replaces it. HeapDumpOnOutOfMemoryError
+  # is off by default and stated here so no base image or JAVA_TOOL_OPTIONS can
+  # turn it on: a dump is as big as the heap (~420 MB) and would be written into
+  # the container's filesystem on every crash of a restart loop.
   JAVA_OPTS: >-
     -XX:MaxRAMPercentage=55
     -XX:ActiveProcessorCount=2
     -XX:+ExitOnOutOfMemoryError
+    -XX:-HeapDumpOnOutOfMemoryError
 
 # Spring Boot cold start under contention (10 JVMs booting at once) can exceed
 # a minute, so the grace period is generous. Failures during start_period do
@@ -61,11 +68,23 @@ x-db-healthcheck: &db-healthcheck
 # against a poison-pill record on shipment.created and reached 992GB in one
 # run, filling the Docker VM disk. 50m x 3 caps any single container at 150MB.
 # (Kubernetes needs no equivalent: kubelet rotates at 10MB x 5 by default.)
+#
+# non-blocking: in the default (blocking) mode an application thread that writes to
+# stdout waits for the log driver, so a slow or full disk freezes request threads
+# inside the logger. Non-blocking buffers up to 8m per container in the daemon and
+# drops lines beyond that, which is the right trade for a flood.
 x-default-logging: &default-logging
   driver: json-file
   options:
     max-size: "50m"
     max-file: "3"
+    mode: non-blocking
+    max-buffer-size: "8m"
+
+# Boot shuts down gracefully (up to 30 s for in-flight requests), then the scheduler lets an
+# outbox relay batch finish (up to 20 s). Docker's default stop timeout of 10 s would kill both
+# midway, so the Java services get 60 s. (Kubernetes: terminationGracePeriodSeconds 90.)
+x-java-stop-grace-period: &java-stop-grace-period 60s
 
 services:
 
@@ -94,6 +113,21 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_HEAP_OPTS: -Xmx640m -Xms320m
+      # A broker that hits OutOfMemoryError stays up but half-dead; exit instead
+      # so `restart: unless-stopped` replaces it (the JVM services do the same).
+      KAFKA_OPTS: -XX:+ExitOnOutOfMemoryError
+      # Disk bound. log.retention.bytes is per partition (every topic here has
+      # one) and only closed segments are deleted, so the 1 GiB default segment
+      # would let a topic reach 1 GiB before retention could act. 128 MiB of
+      # retention + 32 MiB segments caps a runaway producer (or an outbox relay
+      # republishing in a loop) at ~160 MiB per topic; the 7 source topics, their
+      # 7 .DLT topics and the 50 compacted __consumer_offsets partitions stay well
+      # under the 5 GiB k8s PVC. Time retention stays at the 7 day default.
+      KAFKA_LOG_RETENTION_BYTES: "134217728"
+      KAFKA_LOG_SEGMENT_BYTES: "33554432"
+      KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: "60000"
+      # cp-kafka defaults kafka.controller and state.change.logger to TRACE.
+      KAFKA_LOG4J_LOGGERS: kafka.controller=WARN,state.change.logger=WARN,kafka.log.LogCleaner=WARN
       # An already-formatted kafka-data volume keeps its own cluster id; this
       # value only applies on a first, empty format.
       CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
@@ -167,7 +201,14 @@ services:
     # cache is pinned to its minimum explicitly. 512m leaves headroom for the
     # journal, connections and mongosh healthchecks on top of that cache.
     mem_limit: 512m
-    command: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]
+    # --quiet drops mongod's "Connection accepted", "client metadata" and
+    # "Connection ended" lines. The mongosh healthcheck alone opens ~5 connections
+    # every 10 s and wrote 23 JSON lines (~7 KB) per run; --quiet removes 15 of
+    # them, about two thirds of the lines per connection, so a client that
+    # reconnects in a loop is that much cheaper. --slowms 1000 logs only
+    # operations slower than a second instead of 100 ms, so a degraded disk does
+    # not turn every query into a log line.
+    command: ["mongod", "--wiredTigerCacheSizeGB", "0.25", "--quiet", "--slowms", "1000"]
     environment:
       # The root user lives in the admin database; clients authenticate with
       # authSource=admin (spring.mongodb.authentication-database in the service).
@@ -279,6 +320,7 @@ services:
     container_name: service-discovery
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: *java-stop-grace-period
     mem_limit: 640m
     ports:
       - "8761:8761"
@@ -300,6 +342,7 @@ services:
     container_name: user-service
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: *java-stop-grace-period
     mem_limit: 768m
     ports:
       - "8081:8081"
@@ -329,6 +372,7 @@ services:
     container_name: product-service
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: *java-stop-grace-period
     mem_limit: 768m
     ports:
       - "8082:8082"
@@ -355,6 +399,7 @@ services:
     container_name: catalog-service
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: *java-stop-grace-period
     mem_limit: 768m
     ports:
       - "8083:8083"
@@ -385,6 +430,7 @@ services:
     container_name: order-service
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: *java-stop-grace-period
     mem_limit: 768m
     ports:
       - "8084:8084"
@@ -414,6 +460,7 @@ services:
     container_name: payment-service
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: *java-stop-grace-period
     mem_limit: 768m
     ports:
       - "8085:8085"
@@ -443,6 +490,7 @@ services:
     container_name: shipping-service
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: *java-stop-grace-period
     mem_limit: 768m
     ports:
       - "8086:8086"
@@ -472,6 +520,7 @@ services:
     container_name: review-service
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: *java-stop-grace-period
     mem_limit: 768m
     ports:
       - "8087:8087"
@@ -498,6 +547,7 @@ services:
     container_name: notification-service
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: *java-stop-grace-period
     mem_limit: 640m
     ports:
       - "8088:8088"
@@ -522,12 +572,25 @@ services:
     container_name: api-gateway
     restart: unless-stopped
     logging: *default-logging
+    stop_grace_period: *java-stop-grace-period
     mem_limit: 768m
     ports:
       - "8080:8080"
     environment:
       <<: *java-env
       JWT_SECRET: ${JWT_SECRET:?run ./init-secrets.sh to create .env}
+      # The gateway reads request bodies (up to 1 MB per in-flight POST, the RequestSize
+      # limit) into Netty direct memory. The JVM's default cap on direct memory is the
+      # maximum heap: 55 % of 768 MB = 424 MB (as the JVM rounds it), so heap + direct
+      # could reach 848 MB in a 768 MB container and the kernel would OOM-kill the whole
+      # gateway instead of one request failing. 128 MB (128 bodies in flight) makes the
+      # overflow a catchable OutOfMemoryError that fails that one request and keeps the
+      # JVM (ExitOnOutOfMemoryError does not fire for it; tested on JDK 25). Measured
+      # here: 424 MB max heap + 128 MB + about 145 MB non-heap (metaspace 64, code 33,
+      # symbols 15, CDS 13, the rest small) = ~700 MB of 768.
+      # The JVM reads JAVA_TOOL_OPTIONS in addition to the JAVA_OPTS on its command line,
+      # so the shared options stay in one place (x-java-env).
+      JAVA_TOOL_OPTIONS: -XX:MaxDirectMemorySize=128m
     depends_on:
       service-discovery:
         condition: service_healthy
@@ -549,6 +612,12 @@ services:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
       - --storage.tsdb.retention.time=15d
+      # Size is the bound, time is the target: whichever is reached first deletes
+      # the oldest block. Without it a cardinality or scrape-interval mistake
+      # grows the TSDB until the Docker VM disk is full. WAL and compaction
+      # headroom come on top; alert PrometheusTsdbNearSizeLimit warns before
+      # history is cut short.
+      - --storage.tsdb.retention.size=5GB
       - --web.console.libraries=/usr/share/prometheus/console_libraries
       - --web.console.templates=/usr/share/prometheus/consoles
       - --web.enable-lifecycle
@@ -630,6 +699,10 @@ services:
     volumes:
       - ../ecommerce-monitoring/promtail/promtail-config.yml:/etc/promtail/promtail-config.yml:ro
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Read positions. In the container's /tmp they die with the container, and a
+      # recreated promtail re-reads every container's whole json log (up to
+      # 150 MB each) from the start as one burst through the rate limits.
+      - promtail-data:/promtail
     networks:
       - ecommerce-network
     depends_on:
@@ -760,7 +833,8 @@ services:
       KAFKA_CLUSTERS_0_NAME: ecommerce
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
       DYNAMIC_CONFIG_ENABLED: "true"
-      JAVA_OPTS: -XX:MaxRAMPercentage=60 -XX:ActiveProcessorCount=2
+      # Same exit-on-OOM contract as x-java-env: a half-dead UI is worse than a restart.
+      JAVA_OPTS: -XX:MaxRAMPercentage=60 -XX:ActiveProcessorCount=2 -XX:+ExitOnOutOfMemoryError
     networks:
       - ecommerce-network
     depends_on:

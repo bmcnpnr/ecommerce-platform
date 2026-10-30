@@ -34,6 +34,22 @@ Negative:
 - No single place shows where a purchase stands. Following one means correlating by order ID across four services' logs and tables.
 - product-service is a shared dependency. Its outage blocks adding items, reviewing and syncing. Mitigations: connect-failure retries everywhere, and a circuit breaker in order-service only.
 
+### Revision, 2026-10-30
+
+The decision stands; several of its costs were paid down by the security fixes (2026-10-29) and the
+resilience fixes ([resilience-fix-spec.md](../resilience-fix-spec.md)):
+
+- **Dual writes** are replaced by a transactional outbox in every producer ([ADR-013](ADR-013-transactional-outbox.md)).
+- **Compensations, partly.** A declined payment cancels the order and returns its stock, and the
+  payment can't be retried for that order (409), so the customer starts a new one. Abandoned `PENDING`
+  carts are cancelled after 24 h. Refunds and shipment cancellation are still missing.
+- **The client in the saga.** payment-service verifies the order (`CONFIRMED`, owned by the payer,
+  exact total) before taking money, and order-service applies `payment.completed` only to a
+  `CONFIRMED` order.
+- **The shared dependency.** Every Feign caller (order, catalog and review to product-service,
+  payment to order-service) has a working circuit breaker with typed fallbacks, so an outage answers
+  503 quickly instead of holding threads, and a 404 stays a 404.
+
 ## Related
 
 [Communication](../communication.md) · [Event catalog](../events.md) · [End-to-end flows](../flows.md) · [ADR-007](ADR-007-json-events-mirrored-classes.md)

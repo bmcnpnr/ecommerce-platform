@@ -22,13 +22,14 @@ sequenceDiagram
     participant DB as userdb
     B->>G: POST /api/v1/users/register (public)
     G->>U: forward
-    U->>U: validate (username 3-50 chars [a-zA-Z0-9_], email, password min 8)
+    U->>U: validate (username 3-50 chars [a-zA-Z0-9_], email, password 10-72 bytes, not containing the username, not a common password)
     U->>DB: username and email taken? (409 if so)
     U->>DB: INSERT app_users (BCrypt hash, role CUSTOMER, status ACTIVE)
     U-->>B: 201 UserDTO
     B->>G: POST /api/v1/users/login (public)
     G->>U: forward
-    U->>DB: load user. 401 if unknown, not ACTIVE, or wrong password
+    U->>U: 429 with Retry-After if this username failed 5 logins in the last 15 minutes (unknown names count too)
+    U->>DB: load user. The same 401 for an unknown user, an account that is not ACTIVE and a wrong password
     U->>U: sign JWT (sub=username, userId, role, exp=1h)
     U-->>B: 200 token, expiresIn=3600, username, role
     Note over B: token, username and role persisted in localStorage (auth-storage)
@@ -39,13 +40,14 @@ sequenceDiagram
     U-->>B: 200 UserDTO
 ```
 
-- The SPA takes the role from the login response. It never decodes the token. Admin pages are hidden client-side only (see [Security](security.md)).
+- The SPA takes the role from the login response. It never decodes the token. It hides the admin pages from other roles, and the backend enforces the role on every admin endpoint (flow 10, [Security](security.md)).
+- The lockout counter is in memory, per user-service instance. A password longer than 72 bytes is refused at registration, because BCrypt rejects anything beyond that.
 - The admin account is seeded from `ADMIN_USERNAME` / `ADMIN_PASSWORD` (generated into `.env`), and it is the only way an `ADMIN` exists.
 - Tokens can't be revoked. Deactivating a user (`DELETE /api/v1/users/{id}`) leaves their token valid until it expires.
 
 ## 2. Browsing and product detail
 
-All reads are public.
+The reads on this page are public.
 
 ```mermaid
 sequenceDiagram
@@ -54,18 +56,18 @@ sequenceDiagram
     participant G as api-gateway
     participant P as product-service
     participant R as review-service
-    B->>G: GET /api/v1/products?page=0&size=12 (public)
+    B->>G: GET /api/v1/products?page=0&size=12 (public, size at most 100)
     G->>P: forward
     P-->>B: Page of ACTIVE products
     B->>G: GET /api/v1/categories (public)
     G->>P: forward
-    P-->>B: all categories
+    P-->>B: categories (at most 1000)
     B->>G: GET /api/v1/products/{id} (public)
     G->>P: forward
-    P-->>B: ProductDTO, any status
-    B->>G: GET /api/v1/reviews/product/{id} (public, approvedOnly=true by default)
+    P-->>B: ProductDTO. An OUT_OF_STOCK product shows, an INACTIVE (soft-deleted) one is 404 unless the caller is an admin
+    B->>G: GET /api/v1/reviews/product/{id} (public, page and size at most 100, approvedOnly=true by default)
     G->>R: forward
-    R-->>B: APPROVED reviews with vote counts
+    R-->>B: APPROVED reviews with vote counts, oldest first (approvedOnly=false is honoured for admins only)
     B->>G: GET /api/v1/reviews/product/{id}/summary (public)
     G->>R: forward
     R-->>B: average (APPROVED only), distribution, totalReviews (all statuses)
@@ -81,17 +83,17 @@ catalog-service holds one MongoDB document per product, filled on demand.
 ```mermaid
 sequenceDiagram
     autonumber
-    participant C as Caller (any JWT)
+    participant C as Caller (ADMIN)
     participant G as api-gateway
     participant CS as catalog-service
     participant P as product-service
     participant M as catalogdb (MongoDB)
-    C->>G: POST /api/v1/catalog/sync/{productId} (JWT)
+    C->>G: POST /api/v1/catalog/sync/{productId} (ADMIN JWT, 403 for any other role)
     G->>CS: forward
     CS->>P: Feign GET /api/v1/products/{productId}
-    CS->>P: Feign GET /api/v1/categories (a failure here becomes an empty list)
+    CS->>P: Feign GET /api/v1/categories (a failure here keeps the category name already stored)
     CS->>CS: derive stockStatus (0 OUT_OF_STOCK, below 10 LOW_STOCK, else AVAILABLE)
-    CS->>M: upsert catalog_entries _id=productId (optimistic lock, up to 5 retries)
+    CS->>M: upsert catalog_entries _id=productId (optimistic lock, up to 5 attempts)
     CS-->>C: 200 CatalogEntryDTO
     C->>G: GET /api/v1/catalog/search?q=... (public)
     G->>CS: forward
@@ -99,9 +101,9 @@ sequenceDiagram
     CS-->>C: Page of entries
 ```
 
-- **Nothing triggers a sync automatically.** There is no Kafka consumer and no scheduler. A product change reaches the catalog only when someone calls `sync` for that product, and a deleted product's entry is never removed.
+- **Nothing triggers a sync automatically.** There is no Kafka consumer and no scheduler. A product change reaches the catalog only when an admin calls `sync` for that product, and a deleted product's entry is never removed.
 - A re-sync keeps the catalog-only `featured` and `imageUrl`, but **overwrites `price`** with product-service's price, so a price set through `PATCH /api/v1/catalog/product/{id}` lasts only until the next sync.
-- Any product-service failure, including a 404, surfaces as a 500. The Feign circuit breaker and fallback are configured but not enabled.
+- A product-service failure goes through the `product-service` circuit breaker and a fallback factory, and the sync answers by what it means: an unknown product is 404, no answer from product-service or an open breaker is 503, and any other bad answer (a 5xx, an undecodable body, an implausible price) is 502. A 404 does not count against the breaker.
 
 ## 4. Building a cart
 
@@ -124,22 +126,29 @@ sequenceDiagram
     B->>G: POST /api/v1/orders/{orderId}/items with productId and quantity (JWT)
     G->>O: forward
     O->>P: Feign GET /api/v1/products/{productId} (404 if unknown)
-    O->>O: stockQuantity >= quantity? (400 if not)
-    O->>P: Feign PATCH /api/v1/products/{productId}/stock with delta = -quantity
-    P->>P: read, check, write stock (no lock). Status OUT_OF_STOCK at 0
-    O->>ODB: INSERT order_items (snapshot of name and price), total += price x qty
+    O->>O: at most 200 lines, total within NUMERIC(19,4), stockQuantity >= quantity? (400 if not)
+    O->>P: Feign PATCH /internal/v1/products/{productId}/stock with delta = -quantity
+    P->>P: lock the row, check, write stock. Status OUT_OF_STOCK at 0
+    O->>ODB: short transaction: re-read the order, INSERT order_items (snapshot of name and price), total += price x qty
+    Note over O,P: if the line cannot be saved, the reservation is released (delta = +quantity)
     O-->>B: 200 OrderDTO
 ```
 
-- `customerId` is whatever the client sends. The SPA sends the username, while the smoke test sends `1`. order-service never compares it with the caller's identity.
+- No database transaction is open during the two Feign calls. Two writers on one order are told apart by its version: the later one gets 409, and its reservation is released.
+- `customerId` defaults to the caller's `X-Username`. A non-admin who names someone else gets 403. The SPA sends the username.
 - There is no endpoint to remove a line. The SPA cancels the whole order and rebuilds it (flow 6), and every rebuild leaves a cancelled order in the history.
-- Stock is reserved per line and released only by an explicit cancel. An abandoned cart, a logout or a second browser keeps the reservation forever.
-- product-service's stock update is a read-modify-write with no locking, so two concurrent reservations can both succeed against the same last unit.
+- Stock is reserved per line and given back by a cancel, by a declined payment (flow 5) or when the cart is abandoned: a `PENDING` order that nobody has changed for 24 hours is cancelled and its stock returned (flow 6). A logout or a second browser does not release it.
+- product-service locks the product row while it changes the stock, so two concurrent reservations of the last unit run one after the other, and the second one is refused with 400.
 
 ## 5. Checkout and payment
 
 The client orchestrates the purchase with three calls in sequence. Kafka
-carries the outcome to the other services.
+carries the outcome to the other services. Every event leaves its producer
+through a transactional outbox ([ADR-013](adr/ADR-013-transactional-outbox.md)):
+the service writes the event row in the same transaction as the state change,
+and a relay publishes it about half a second after the commit. An event
+therefore exists exactly when its change committed, and a Kafka outage delays
+events without failing the request.
 
 ```mermaid
 sequenceDiagram
@@ -147,6 +156,7 @@ sequenceDiagram
     participant B as Browser
     participant G as api-gateway
     participant O as order-service
+    participant P as product-service
     participant PS as payment-service
     participant K as Kafka
     participant S as shipping-service
@@ -154,30 +164,36 @@ sequenceDiagram
     B->>G: POST /api/v1/orders/{id}/confirm (JWT)
     G->>O: forward
     O->>O: must be PENDING with at least one item (400 otherwise)
-    O->>K: order.placed (sent inside the DB transaction)
+    O->>O: one transaction: status CONFIRMED and an outbox row for order.placed
     O-->>B: 200 OrderDTO status CONFIRMED with totalAmount
+    O->>K: the relay publishes order.placed
     K-->>N: order.placed, logged
     B->>G: POST /api/v1/payments with orderId, customerId, amount=totalAmount, method, cardLastFour (JWT)
     G->>PS: forward
-    PS->>PS: 409 only if this order already has a COMPLETED payment
+    PS->>O: GET /internal/v1/orders/{id}: must be CONFIRMED, owned by the payer, total equal to the amount
+    Note over PS,O: no answer from order-service means 503, a payment is never accepted blind
+    PS->>PS: 409 if the order already has a COMPLETED, FAILED or REFUNDED payment, only a PENDING row is reused
     PS-->>B: 201 PaymentDTO status PENDING
     B->>G: POST /api/v1/payments/{paymentId}/process (JWT)
     G->>PS: forward
     PS->>PS: random draw, 80 percent approve
     alt approved
-        PS->>K: payment.completed
+        PS->>PS: one transaction: status COMPLETED and an outbox row for payment.completed
         PS-->>B: 200 PaymentDTO status COMPLETED
-        K-->>O: order status PAID
+        PS->>K: the relay publishes payment.completed
+        K-->>O: order status PAID (only a CONFIRMED order, and only for the same amount)
         K-->>S: create shipment (PENDING, DHL, ETA +5 days, placeholder addresses)
-        S->>K: shipment.created
+        S->>K: shipment.created, through shipping-service's own outbox
         K-->>N: payment.completed and shipment.created, logged
     else declined
-        PS->>K: payment.failed
+        PS->>PS: one transaction: status FAILED and an outbox row for payment.failed
         PS-->>B: 200 PaymentDTO status FAILED
-        K-->>O: order status CANCELLED (stock stays reserved)
+        PS->>K: the relay publishes payment.failed
+        K-->>O: order status CANCELLED, committed first, no order.cancelled
+        O->>P: Feign PATCH /internal/v1/products/{productId}/stock with delta = +quantity per line
         K-->>N: payment.failed, logged
     end
-    Note over B: the SPA reports success in both cases (A-1) and clears cartOrderId
+    Note over B: after a decline the SPA shows Payment declined and offers to put the items into a new cart
 ```
 
 What a successful purchase leaves behind:
@@ -190,13 +206,52 @@ What a successful purchase leaves behind:
 | shipping-service | `shipments` + one `shipment_events` row | `PENDING`. Origin `Warehouse, 123 Storage St`, destination `Customer Address`. |
 | notification-service | — | three log lines (`order.placed`, `payment.completed`, `shipment.created`) |
 
+Each producer's outbox row is deleted once Kafka has acknowledged it, so after the flow the three `outbox_event` tables are empty again.
+
+### A declined payment
+
+A decline is final for the order. In order:
+
+1. `POST /api/v1/payments/{id}/process` answers **200** with `status` `FAILED`, so the caller has to read `status`. The row and the `payment.failed` outbox row commit together.
+2. order-service consumes `payment.failed`, normally within a second. It commits `CANCELLED` first, then returns the stock of every line to product-service, outside any transaction. It publishes no `order.cancelled`, because `payment.failed` already said it. A replayed event finds the order `CANCELLED` and does nothing, so the stock goes back once. If product-service does not answer, the order is cancelled anyway and one WARN names the lines whose stock was not returned.
+3. A retry for that order is refused with **409** and charges nothing. Until order-service has consumed the event the order still reads `CONFIRMED`, so the order check passes and payment-service refuses on its own `FAILED` row with the fixed message "The payment for this order was declined and the order is cancelled. Place a new order to try again." Once the order is `CANCELLED`, the order check answers first: `Order {id} is not awaiting payment`.
+4. The SPA shows "Payment declined" and offers to put the same items into a new cart: a new order, then one add per line. Each add reserves stock again, so a line can be refused if the stock is gone meanwhile.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant B as Browser
+    participant PS as payment-service
+    participant K as Kafka
+    participant O as order-service
+    participant P as product-service
+    B->>PS: POST /api/v1/payments/{id}/process
+    PS-->>B: 200 PaymentDTO status FAILED (payment.failed waits in the outbox)
+    alt a retry before order-service has consumed payment.failed
+        B->>PS: POST /api/v1/payments for the same order
+        PS->>O: GET /internal/v1/orders/{id}: still CONFIRMED, the check passes
+        PS-->>B: 409 The payment for this order was declined and the order is cancelled. Place a new order to try again.
+    end
+    PS->>K: the relay publishes payment.failed
+    K-->>O: payment.failed
+    O->>O: commit status CANCELLED, no order.cancelled
+    O->>P: PATCH /internal/v1/products/{id}/stock with delta = +quantity per line
+    alt a retry after that
+        B->>PS: POST /api/v1/payments for the same order
+        PS->>O: GET /internal/v1/orders/{id}: CANCELLED
+        PS-->>B: 409 Order {id} is not awaiting payment
+    end
+    Note over B: the SPA shows Payment declined and offers to put the items into a new cart
+```
+
+The two events of one order travel on different topics, so nothing orders them against each other. That is why the `FAILED` row is terminal instead of reusable (see [payment-service](services/payment-service.md#business-rules)).
+
 Known gaps in this flow:
 
-- **The amount is the client's word.** payment-service never checks that the order exists, is `CONFIRMED`, belongs to the caller, or costs `amount`. order-service marks the order `PAID` on any `payment.completed`, whatever its current status. One cent "pays" for any order, including an unconfirmed or cancelled one.
-- **A declined payment cancels the order but keeps its stock reserved**, and it publishes no `order.cancelled`. With an 80 % success rate, about one checkout in five leaks stock.
-- The SPA never reads the payment status, so a decline is shown as success.
+- **A payment can still arrive for an order that was cancelled meanwhile.** payment-service checks the order when the payment is created. If the customer cancels the `CONFIRMED` order before `/process` runs, `payment.completed` finds it `CANCELLED`: order-service does not apply it and logs one WARN that the payment may need a refund. Nothing refunds it automatically.
+- **If `payment.failed` never reaches order-service**, for example because the record ended on the dead-letter topic, the order stays `CONFIRMED` and cannot be paid (payment-service refuses another attempt). It holds its stock until somebody cancels it. `CONFIRMED` orders do not expire.
 - The order never moves past `PAID` by itself. Shipment events are not consumed by order-service (flow 8).
-- If any call after `confirm` fails, the cart order is stuck in `CONFIRMED`, and retrying fails with 400. See [Frontend](frontend.md#cart-checkout-order-creation-and-payment).
+- If a call after `confirm` fails (the payment request times out, for example), the order stays `CONFIRMED` and holds its stock until it is paid, declined or cancelled. Confirming it again is a 400, so the client has to continue from the payment step; the SPA reads the order's status first and does. See [Frontend](frontend.md#cart-checkout-order-creation-and-payment).
 
 ## 6. Cancellation
 
@@ -211,35 +266,68 @@ sequenceDiagram
     participant N as notification-service
     B->>G: DELETE /api/v1/orders/{id} (JWT)
     G->>O: forward
-    O->>O: 400 if SHIPPED or DELIVERED (any other status is accepted, CANCELLED too)
-    loop each order item
-        O->>P: Feign PATCH /api/v1/products/{productId}/stock with delta = +quantity
-        Note over O,P: failures are logged and swallowed
+    O->>O: 400 if CANCELLED, SHIPPED or DELIVERED, 403 for someone else's order
+    O->>O: one transaction: status CANCELLED and an outbox row for order.cancelled, COMMIT
+    loop each order item, after the commit and outside any transaction
+        O->>P: Feign PATCH /internal/v1/products/{productId}/stock with delta = +quantity
+        Note over O,P: the first no-answer from product-service ends the loop and one WARN names the lines not returned
     end
-    O->>O: status CANCELLED
-    O->>K: order.cancelled
     O-->>B: 204
+    O->>K: the relay publishes order.cancelled
     K-->>N: order.cancelled, logged
 ```
 
+- The cancellation commits first and the stock follows, so a slow or dead product-service can neither hold a database connection nor undo the cancellation. The order is `CANCELLED` either way.
 - Cancelling a **paid** order neither refunds the payment nor stops the shipment. Nothing listens to `order.cancelled` except notification-service.
-- Cancelling an **already cancelled** order is accepted. It releases the stock again and republishes the event, so repeated cancels inflate stock.
-- A stock release that fails (product-service down) is lost. The order still ends up `CANCELLED`.
+- Cancelling an **already cancelled** order is a 400 (`Cannot cancel order in status: CANCELLED`) and publishes nothing, so stock goes back once. Two cancels at the same moment cannot both succeed: the later commit fails on the order's version (409) and never reaches the stock.
+- A stock release that fails is not retried, and a call that timed out has an unknown outcome, so it is not repeated either. A crash between the commit and the restore leaves the stock reserved. The residual risks are listed on [order-service](services/order-service.md#known-issues-and-limitations).
+- A declined payment cancels the order the same way (flow 5), except that it publishes no `order.cancelled`. An admin `PATCH /api/v1/orders/{id}/status` to `CANCELLED` runs this same code, event included.
+
+### Abandoned carts
+
+A cart is a `PENDING` order, and it reserves stock from the first item. `ReservationExpiryJob` in order-service cancels the carts nobody comes back to, so their stock returns to the shop.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant J as ReservationExpiryJob
+    participant ODB as orderdb
+    participant P as product-service
+    participant K as Kafka
+    participant N as notification-service
+    loop every 10 minutes, the first run 60 s after the start
+        J->>ODB: PENDING orders with updated_at older than 24 h, idle longest first, at most 100
+        loop each candidate
+            J->>P: cart with lines: does product-service answer? (GET of the first line's product)
+            J->>ODB: one transaction: still PENDING and still idle? status CANCELLED and an outbox row for order.cancelled
+            Note over J,ODB: another replica or the customer got there first (version conflict), the cart is skipped silently
+            J->>P: PATCH /internal/v1/products/{productId}/stock with delta = +quantity per line
+        end
+    end
+    J->>K: the relay publishes order.cancelled
+    K-->>N: order.cancelled, logged
+```
+
+- Only `PENDING` carts expire, after `orders.reservation.pending-ttl` (24 hours) without a change. Adding an item counts as a change. `CONFIRMED` and `PAID` orders never expire: a `payment.completed` can wait in payment-service's outbox during a Kafka outage, so age alone could cancel an order that has already been paid.
+- A cart with lines is cancelled only while product-service answers, because stock that cannot be returned is lost. If it does not answer, the run stops with one WARN (at most one a minute) and the cart waits for the next run. An empty cart holds nothing and always expires.
+- With several replicas, whoever commits first cancels the cart and returns its stock. The others skip it without a log line.
+- A run that expired nothing writes no log line; one that did writes one INFO. `orders_reservations_expired_total` counts the carts. Existing orders got `updated_at` = the time of the migration, so the first expiry comes 24 hours after the deploy at the earliest.
+- The SPA drops a cart id whose order has become `CANCELLED`, and the next Add to Cart starts a new cart.
 
 ## 7. Refund
 
 `POST /api/v1/payments/{id}/refund` (JWT) moves a `COMPLETED` payment to
-`REFUNDED` for its full amount and publishes `payment.refunded`. Only
-notification-service consumes it: the order stays `PAID`, the shipment carries
-on, and stock is untouched. No page in the SPA calls this endpoint, and nothing
-checks who is asking.
+`REFUNDED` for its full amount and publishes `payment.refunded` (through
+payment-service's outbox). Only notification-service consumes it: the order stays
+`PAID`, the shipment carries on, and stock is untouched. The endpoint is
+admin-only (403 for anyone else), and no page in the SPA calls it.
 
 ## 8. Shipping progress and tracking
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant A as Operator (any JWT)
+    participant A as Operator (ADMIN)
     participant V as Visitor
     participant G as api-gateway
     participant S as shipping-service
@@ -247,20 +335,20 @@ sequenceDiagram
     participant N as notification-service
     A->>G: PATCH /api/v1/shipments/{id}/status with status, location, description (JWT)
     G->>S: forward
-    S->>S: 400 if already DELIVERED or RETURNED. Any other jump is allowed
-    S->>S: update status, append shipment_events row, set actualDelivery when DELIVERED
-    S->>K: shipment.updated
+    S->>S: 409 unless the move is in the transition table (PENDING, PROCESSING, SHIPPED, OUT_FOR_DELIVERY, DELIVERED, and RETURNED from SHIPPED or OUT_FOR_DELIVERY)
+    S->>S: update status, append shipment_events row, set actualDelivery when DELIVERED, store shipment.updated in the outbox (one transaction)
     S-->>A: 200 ShipmentDTO
+    S->>K: the relay publishes shipment.updated
     K-->>N: shipment.updated, logged
     V->>G: GET /api/v1/shipments/tracking/{trackingNumber} (public)
     G->>S: forward
-    S-->>V: ShipmentDTO (includes orderId, customerId, both addresses)
+    S-->>V: tracking number, status, carrier, estimated delivery and events only (no order id, customer or addresses)
     V->>G: GET /api/v1/shipments/{id}/history (JWT required)
     G-->>V: 401 for an anonymous visitor. The SPA then redirects to login
 ```
 
 - Nothing advances a shipment automatically: no scheduler, no carrier integration, and no page in the SPA. Statuses change only through this PATCH.
-- order-service never hears about shipment progress, so orders stay `PAID`. `SHIPPED` and `DELIVERED` are reachable only through `PATCH /api/v1/orders/{id}/status`, which applies any status without checks or side effects.
+- order-service never hears about shipment progress, so orders stay `PAID`. `SHIPPED` and `DELIVERED` are reachable only through `PATCH /api/v1/orders/{id}/status`, which is admin-only and follows the transition table (`PAID` to `SHIPPED` to `DELIVERED`; any other move is 409). It publishes nothing for those two statuses.
 
 ## 9. Reviews
 
@@ -274,30 +362,32 @@ sequenceDiagram
     B->>G: POST /api/v1/reviews with productId, rating 1-5, title, body (JWT)
     G->>R: forward with X-Username
     R->>P: Feign GET /api/v1/products/{productId} (existence check)
-    Note over R,P: a 404 or an outage both become 500
+    Note over R,P: a 404 stays 404, no answer or an open breaker is 503, any other bad answer is 502
     R->>R: one review per (product, X-Username), 409 otherwise
     R-->>B: 201 ReviewDTO status PENDING
-    B->>G: PATCH /api/v1/reviews/{id}/moderate?status=APPROVED (JWT)
+    B->>G: PATCH /api/v1/reviews/{id}/moderate?status=APPROVED (ADMIN JWT)
     G->>R: forward
-    R-->>B: 200 (no role check: any user can approve or reject any review)
+    R-->>B: 200 for ADMIN, 403 for any other caller
     B->>G: POST /api/v1/reviews/{id}/vote with helpful true or false (JWT)
     G->>R: forward
-    R-->>B: 200 (one vote per user, re-voting flips it, voting on your own review is allowed)
+    R-->>B: 200 (one vote per user, re-voting flips it), 403 on your own review, 404 on a review that is not APPROVED
 ```
 
 - Editing a review (`PUT`, author only) sends it back to `PENDING`. Deleting is allowed for the author or a caller with `X-User-Role: ADMIN`.
-- The product page loads approved reviews only, so authors don't see their own pending review. Submitting again returns 409.
+- The product page loads approved reviews only, so authors don't see their own pending review there. Submitting again returns 409. Unapproved reviews are readable only by their author (`GET /api/v1/reviews/customer/{username}` or `GET /api/v1/reviews/{id}`) and by admins.
 - There is no verified-purchase check. review-service never asks order-service whether the author bought the product.
 
 ## 10. Administration
 
 The SPA's admin area (`/admin/**`) manages products, categories, orders and
-reviews. The backend has **no role checks** on any of the endpoints it uses:
-product and category writes, `PATCH /api/v1/orders/{id}/status`, review
-moderation, catalog writes, shipment status and refunds all accept any valid
-token. "Admin" is a UI convention, not a permission. Some admin screens also
+reviews. The backend enforces the role on the endpoints it uses: product and
+category writes, `PATCH /api/v1/orders/{id}/status`, review moderation, catalog
+writes, shipment creation and status changes, and refunds need the exact role
+`ADMIN` (403 for any other caller, 401 without an identity). Hiding the admin
+pages in the SPA is a convenience, not the control. Some admin screens also
 have no backing endpoint (listing all orders, listing pending reviews). See
-[Frontend: admin flows](frontend.md#admin-flows) and [Findings](findings.md).
+[Frontend: admin flows](frontend.md#admin-flows), [Security](security.md) and
+[Findings](findings.md).
 
 ## Status models side by side
 
@@ -308,7 +398,7 @@ stateDiagram-v2
         PENDING --> CONFIRMED: confirm
         CONFIRMED --> PAID: payment.completed
         CONFIRMED --> CANCELLED: payment.failed or DELETE
-        PENDING --> CANCELLED: DELETE
+        PENDING --> CANCELLED: DELETE or idle for 24 h
         PAID --> CANCELLED: DELETE
         PAID --> SHIPPED: PATCH status
         SHIPPED --> DELIVERED: PATCH status
@@ -317,9 +407,9 @@ stateDiagram-v2
 
 | Entity | Statuses | Changed by |
 |---|---|---|
-| Order | `PENDING`, `CONFIRMED`, `PAID`, `SHIPPED`, `DELIVERED`, `CANCELLED` | REST (create, confirm, cancel, PATCH status) and Kafka (`payment.*`). The diagram shows the intended paths: the Kafka handlers and `PATCH status` apply their status from **any** state. |
-| Payment | `PENDING`, `PROCESSING` (never persisted), `COMPLETED`, `FAILED`, `REFUNDED` | REST only |
-| Shipment | `PENDING`, `PROCESSING`, `SHIPPED`, `OUT_FOR_DELIVERY`, `DELIVERED`, `RETURNED` | created by Kafka (`payment.completed`) or REST, then REST only. Any jump is allowed except out of `DELIVERED` or `RETURNED`. |
+| Order | `PENDING`, `CONFIRMED`, `PAID`, `SHIPPED`, `DELIVERED`, `CANCELLED` | REST (create, confirm, cancel, PATCH status), Kafka (`payment.*`) and the abandoned-cart job. Every change is checked against the current status: the Kafka handlers apply only the moves in the diagram (a late event for another status is ignored), and `PATCH status` is admin-only and follows the transition table (409 otherwise). |
+| Payment | `PENDING`, `PROCESSING` (never committed), `COMPLETED`, `FAILED`, `REFUNDED` | REST only. `FAILED` is final: a new payment for the order is refused (409). |
+| Shipment | `PENDING`, `PROCESSING`, `SHIPPED`, `OUT_FOR_DELIVERY`, `DELIVERED`, `RETURNED` | created by Kafka (`payment.completed`) or REST, then REST only (admin). Moves follow a transition table: `PENDING`, `PROCESSING`, `SHIPPED`, `OUT_FOR_DELIVERY`, `DELIVERED`, and `RETURNED` from `SHIPPED` or `OUT_FOR_DELIVERY`; `DELIVERED` and `RETURNED` are final (409 otherwise). |
 | Product | `ACTIVE`, `INACTIVE` (soft delete), `OUT_OF_STOCK` | REST. Stock reaching 0 forces `OUT_OF_STOCK`, and restocking makes it `ACTIVE` again, even after a soft delete. |
 | Review | `PENDING`, `APPROVED`, `REJECTED` | create and edit set `PENDING`; moderation sets any |
 | User | `ACTIVE`, `INACTIVE` (soft delete), `SUSPENDED` (never set by any code) | REST |

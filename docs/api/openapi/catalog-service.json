@@ -39,6 +39,22 @@
               "type": "integer",
               "format": "int64"
             }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -107,6 +123,22 @@
               "type": "integer",
               "format": "int64"
             }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "requestBody": {
@@ -153,7 +185,8 @@
             "schema": {
               "type": "integer",
               "format": "int32",
-              "default": 0
+              "default": 0,
+              "minimum": 0
             }
           },
           {
@@ -163,7 +196,9 @@
             "schema": {
               "type": "integer",
               "format": "int32",
-              "default": 20
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1
             }
           }
         ],
@@ -205,7 +240,8 @@
             "schema": {
               "type": "integer",
               "format": "int32",
-              "default": 0
+              "default": 0,
+              "minimum": 0
             }
           },
           {
@@ -215,7 +251,9 @@
             "schema": {
               "type": "integer",
               "format": "int32",
-              "default": 20
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1
             }
           }
         ],
@@ -238,8 +276,33 @@
         "tags": [
           "Catalog"
         ],
-        "summary": "Get featured products",
+        "summary": "Get featured products (first page of at most 100; use page and size for more)",
         "operationId": "getFeatured",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 0,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "OK",
@@ -262,7 +325,7 @@
         "tags": [
           "Catalog"
         ],
-        "summary": "Get catalog entries by category",
+        "summary": "Get catalog entries by category (first page of at most 100; use page and size for more)",
         "operationId": "getByCategory",
         "parameters": [
           {
@@ -272,6 +335,29 @@
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 0,
+              "minimum": 0
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 100,
+              "maximum": 100,
+              "minimum": 1
             }
           }
         ],
@@ -359,10 +445,14 @@
             "type": "boolean"
           },
           "imageUrl": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 2048,
+            "minLength": 0,
+            "pattern": "^$|^(?i:https?)://[^\\s/?#]+\\S*$"
           },
           "price": {
-            "type": "number"
+            "type": "number",
+            "minimum": 0
           }
         }
       },

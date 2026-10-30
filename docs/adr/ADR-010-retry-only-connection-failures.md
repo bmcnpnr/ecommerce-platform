@@ -29,6 +29,14 @@ Negative:
 - A transient read failure or a 503 from an overloaded instance is surfaced to the caller rather than hidden.
 - Retry behaviour lives in two places, the gateway YAML and the Java `FeignConfig` in each caller, and has to be kept consistent by hand.
 
+## Update (2026-10-30)
+
+The decision stands. Three details of how it is applied changed:
+
+- **One retry layer.** Apache HttpClient 5, the HTTP client under the Feign callers, also retried on its own: once on a reset connection (idempotent requests) and once more, after a pause, on a 503. That second layer contradicted the rule above, so order-, review- and catalog-service switch the client's automatic retries off (an `HttpClientBuilderCustomizer` that calls `disableAutomaticRetries()`, in each `FeignConfig`). `ConnectionFailureRetryer`, which retries connection failures only, is now the only retry in those three services. payment-service has no retryer: its Feign client uses the JDK `HttpURLConnection` and Feign's default of no retry.
+- **The Feign timeouts govern.** Enabling the Feign circuit breaker also enabled a worker thread per call behind a 1 s time limiter and a thread-pool bulkhead of one thread per CPU. order-, review-, catalog- and payment-service turn the thread pool, the time limiter and the bulkhead off, so a call runs on the request thread and is bounded by its Feign connect timeout (2 s) and read timeout.
+- **The timeouts nest.** Feign read timeouts (10 s in order-, review- and catalog-service, 5 s in payment-service) are shorter than the gateway's `httpclient.response-timeout` of 20 s. When that expires the gateway answers 504 and does not retry, because its `Retry` filter stays limited to `ConnectException`. The SPA's axios timeout is 30 s and the frontend nginx `proxy_read_timeout` is 35 s, so each outer layer waits longer than the one inside it.
+
 ## Related
 
 [Communication](../communication.md#client-configuration) · [api-gateway](../services/api-gateway.md#resilience)

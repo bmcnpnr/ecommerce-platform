@@ -32,7 +32,13 @@ data:
   # the pod's resources.limits.memory — same contract as compose's mem_limit.
   # ActiveProcessorCount caps GC/ForkJoin/Netty pool sizing: the node reports
   # 32 CPUs, so ten unconstrained JVMs would each start ~23 GC threads.
+  # ExitOnOutOfMemoryError: a JVM that hit OutOfMemoryError is not trusted to carry
+  # on; exit so the kubelet restarts the container. HeapDumpOnOutOfMemoryError is
+  # off by default and stated here so no base image or JAVA_TOOL_OPTIONS can turn
+  # it on: a dump is as big as the heap and would be written into the container's
+  # filesystem on every crash of a restart loop.
   JAVA_OPTS: >-
     -XX:MaxRAMPercentage=55
     -XX:ActiveProcessorCount=2
     -XX:+ExitOnOutOfMemoryError
+    -XX:-HeapDumpOnOutOfMemoryError

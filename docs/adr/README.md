@@ -14,12 +14,13 @@ time.
 | [ADR-004](ADR-004-jwt-at-the-gateway.md) | Authenticate at the gateway, pass identity as headers | Accepted; authorization incomplete |
 | [ADR-005](ADR-005-eureka-client-side-discovery.md) | Client-side discovery with Eureka, also on Kubernetes | Accepted |
 | [ADR-006](ADR-006-sync-queries-async-state-changes.md) | Synchronous calls for lookups and stock, Kafka events for state changes | Accepted |
-| [ADR-007](ADR-007-json-events-mirrored-classes.md) | JSON events with mirrored classes, no schema registry | Accepted; error handling missing |
+| [ADR-007](ADR-007-json-events-mirrored-classes.md) | JSON events with mirrored classes, no schema registry | Accepted; dead-letter topics since 2026-10-30 |
 | [ADR-008](ADR-008-pact-without-broker.md) | Consumer-driven contract tests with Pact, without a broker | Accepted |
 | [ADR-009](ADR-009-runtime-only-images-prebuilt-jars.md) | Runtime-only images built from prebuilt jars | Accepted |
 | [ADR-010](ADR-010-retry-only-connection-failures.md) | Retry only on connection failures | Accepted |
 | [ADR-011](ADR-011-observability-stack.md) | Prometheus, Loki and Tempo behind Grafana, with OpenTelemetry tracing | Accepted |
 | [ADR-012](ADR-012-kubernetes-mirrors-compose.md) | Kubernetes manifests mirror the compose stack one-to-one | Accepted |
+| [ADR-013](ADR-013-transactional-outbox.md) | Publish events through a transactional outbox | Accepted (2026-10-30) |
 
 ## Writing a new one
 

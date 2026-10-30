@@ -58,7 +58,11 @@ Every client uses the same tuning, all well below the Eureka defaults:
 | `spring.cloud.loadbalancer.cache.ttl` | 5s | 35s | set only in callers: gateway, catalog-, order- and review-service |
 
 With the server settings below, a crashed instance disappears from callers'
-view within about 20 s. A **graceful** stop doesn't wait for expiry. Under
+view within about 20 s. Eureka evicts at most 15 % of the registry per sweep,
+rounded up (`eureka.server.renewal-percent-threshold` is left at its default of
+0.85; 2 of 9 instances, for example), so when several instances fail together
+the later ones are evicted in later sweeps and stay in the registry longer than
+that. A **graceful** stop doesn't wait for expiry. Under
 Kubernetes the pod's `preStop` hook POSTs `{"status":"OUT_OF_SERVICE"}` to its
 own `/actuator/serviceregistry` and keeps serving for 15 s, so every caller
 drops it before shutdown starts. Then Boot's graceful shutdown deregisters it.
@@ -80,7 +84,8 @@ See [k8s/README.md, "Rollouts are hitless"](../../k8s/README.md#notes).
 | `management.endpoints.web.exposure.include` | `health,info,metrics,prometheus,circuitbreakers` | `circuitbreakers` has nothing to report here. `health` shows no details (`show-details: never`). |
 | `management.tracing.sampling.probability` | `TRACING_SAMPLING_PROBABILITY`, default 1.0 | |
 | OTLP endpoint | `OTEL_EXPORTER_OTLP_ENDPOINT` + `/v1/traces`, default `http://tempo:4318` | |
-| `logging.pattern.console` | `%d [%thread] %-5level %logger{36} - %msg%n` | no correlation ID |
+| `logging.pattern.console` | `%d{yyyy-MM-dd HH:mm:ss} [%thread] [%X{correlationId:-}] [%X{traceId:-}] %-5level %logger{36} - %msg%n` | The format every Java service shares. The registry sets no correlation ID, so that bracket is empty; the trace ID is filled in on lines written while a request is handled, not on the eviction timer's. |
+| `logging.level.com.ecommerce` | `INFO` | The shared default. Eureka's own lines come from its `com.netflix` loggers at their default levels; see [Observability](#observability). |
 
 ## Deployment
 
@@ -93,8 +98,9 @@ See [k8s/README.md, "Rollouts are hitless"](../../k8s/README.md#notes).
 
 Restarting Eureka empties the registry. Clients re-register on their next
 heartbeat (≤ 5 s), and callers see them after their next fetch (≤ 5 s). Until
-then, gateway calls fail with `503 Load balancer does not contain an
-instance`. This is the "Eureka warm-up" every runbook entry mentions.
+then, gateway calls fail with `503` (logged as
+`503 SERVICE_UNAVAILABLE "Unable to find instance for <service>"`). This is the
+"Eureka warm-up" every runbook entry mentions.
 
 ## Useful REST calls
 
@@ -117,9 +123,27 @@ Prometheus scrapes `/actuator/prometheus`. The common tags are
 metrics are not specifically dashboarded. The quickest health view is the
 dashboard at `:8761`, which lists every registered instance and its status.
 
+Logs go to the console in the shared format (see the table above). What the
+registry writes follows instances coming and going, never request rate or
+anonymous traffic (`EurekaServerLogVolumeIT`):
+
+| Event | Lines written |
+|---|---|
+| Registration, cancellation, status change | 1 `INFO` each: `Registered instance ...`, `Cancelled instance ...`, `Status updated: ...` |
+| Heartbeat, registry fetch (full or delta) | none |
+| Request without credentials or with a wrong password (`401`), health probe, Prometheus scrape | none |
+| Heartbeat for an instance the registry does not know | 2 `WARN`: `lease doesn't exist, registering resource ...` and `Not Found (Renew) ...` |
+| Eviction of an expired lease | per evicted instance 1 `WARN` (`expired lease for ...`) and 1 `INFO` (`Cancelled instance ...`), plus one `INFO` `Evicting N items` for a sweep that evicts |
+| Eviction sweep, every 5 s | 1 `INFO` (`Running the evict task ...`): about 17,000 lines a day, however quiet the registry is |
+
+When the registry is down, the clients are the noisy side: each one's Eureka
+library (`com.netflix.discovery` loggers) logs its failed heartbeat and failed
+registry fetch, with stack traces, on every 5 s tick. That volume is bounded by
+the tick, not by request rate, and nothing throttles it.
+
 ## Testing and CI
 
-There are no unit tests. `integration/EurekaServerIT` (7 tests, no Docker) boots the registry on a random port and drives it over HTTP: actuator health is `UP`, `/eureka/apps` answers in JSON and in XML for legacy clients, a registered instance shows up immediately, heartbeat, status override and cancel work, a heartbeat for an unknown instance is a 404 (so a client re-registers), and the dashboard is served. It runs in `mvn verify`. CI is the GitHub Actions workflow
+29 unit and slice tests (`mvn test`) and 40 integration tests (`mvn verify`; no Docker needed). `integration/EurekaServerIT` (7 tests) boots the registry on a random port and drives it over HTTP: actuator health is `UP`, `/eureka/apps` answers in JSON and in XML for legacy clients, a registered instance shows up immediately, heartbeat, status override and cancel work, a heartbeat for an unknown instance is a 404 (so a client re-registers), and the dashboard is served. `integration/EurekaServerLogVolumeIT` (4 tests) counts what the registry writes to its log: hundreds of heartbeats and registry fetches, of requests without credentials or with a wrong password, and of health probes and metric scrapes write nothing, and a registration and its cancellation cost one `INFO` line each. The other tests are the `@Tag("security")` classes (`integration/EurekaServerSecurityIT`, `security/ActuatorExposureSecurityTest`, `security/SecurityConfigTest`) and `security/LoggingConfigTest`, which checks the log pattern and level in the committed `application.yaml`. CI is the GitHub Actions workflow
 `.github/workflows/ci-cd.yml` (verify, then validate-image, then
 publish-image to Docker Hub). It replaced the repository's CircleCI pipeline;
 see [Architecture: CI/CD](../architecture.md#build-and-delivery).
@@ -139,4 +163,3 @@ see [Architecture: CI/CD](../architecture.md#build-and-delivery).
 | ~~The registry API is unauthenticated~~ | fixed | HTTP Basic is required (S-10); port 8761 is still published on the host. | — |
 | Single instance. | compose, `30-service-discovery.yaml` | When Eureka is down, clients keep routing with their last cached registry, but new or moved instances are not discovered until it returns. | Low (dev) |
 | Self-preservation is disabled. | `enable-self-preservation: false` | Right for a single-node dev registry. Across a real network partition it would evict healthy instances. | Low |
-| No README in the repository. | repo root | The repo doesn't explain itself; this page fills the gap. | Low |

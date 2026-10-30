@@ -75,6 +75,7 @@ header and in every error body.
 | Exception | Status | `error` | `message` |
 |---|---|---|---|
 | `ReviewNotFoundException` | 404 | `Not Found` | `Review not found with id: <id>` |
+| `ProductNotFoundException` (`POST /api/v1/reviews`: product-service answered 404) | 404 | `Not Found` | `Product not found with id: <productId>` |
 | `DuplicateReviewException` | 409 | `Conflict` | `Customer <username> has already reviewed product <productId>` |
 | `UnauthenticatedException` | 401 | `Unauthorized` | `Authentication required` |
 | `UnauthorizedReviewAccessException` | 403 | `Forbidden` | `Access denied` (a read, moderate) or the specific text: `Only the review author can update this review`, `Only the review author or an admin can delete this review`, `Authors cannot vote on their own review` |
@@ -82,20 +83,33 @@ header and in every error body.
 | `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | `Method not allowed` |
 | `HttpMessageNotReadableException` (missing or malformed JSON) | 400 | `Bad Request` | `Malformed request body` |
 | `MethodArgumentTypeMismatchException` (e.g. a non-numeric ID or an unknown `status` value) | 400 | `Bad Request` | `Invalid value for parameter '<name>'` |
+| `InvalidRequestException` (a `page` below 0, a `size` outside 1 to 100, an offset beyond the `int` range, an invalid `X-Username`) | 400 | `Bad Request` | `Page size must be between 1 and 100`, `Page out of range`, `Invalid X-Username header` |
 | `MissingServletRequestParameterException`, `ServletRequestBindingException` | 400 | `Bad Request` | `Missing or invalid request parameter` |
 | not acceptable / unsupported `Content-Type` / unmapped path | 406 / 415 / 404 | | `Not acceptable` / `Unsupported media type` / `Resource not found` |
 | unique-constraint race (duplicate review, first vote) | 409 | `Conflict` | `Resource already exists or violates a constraint` |
-| anything else | 500 | `Internal Server Error` | `An unexpected error occurred` (the exception is logged at ERROR) |
+| request body above 1 MB | 413 | `Payload Too Large` | `Request body too large` |
+| `ProductServiceErrorException` (`POST /api/v1/reviews`: product-service answered with something unusable) | 502 | `Bad Gateway` | `Upstream service error` |
+| `ProductServiceUnavailableException` (`POST /api/v1/reviews`: product-service gave no answer), or the database did not answer | 503 | `Service Unavailable` | `Service temporarily unavailable` |
+| anything else | 500 | `Internal Server Error` | `An unexpected error occurred` (logged at ERROR with the stack trace, at most once per failure site and 10 s) |
 
-"Anything else" includes product-service saying the product does not exist, or product-service being unreachable (`POST /api/v1/reviews`).
+For `POST /api/v1/reviews`, a failing product-service call ends in one of three errors. A `404` from product-service is a `404` here. A product-service that gives no answer (no registered instance, connection failures after three attempts, a read timeout after 10 s, a 503 or 504, or a circuit breaker that is open) is a `503`. Another 4xx, a 5xx other than 503 and 504, or a body that cannot be decoded is a `502`. The `503` also covers any request that needs the database while it does not answer (no connection within 5 s, a lock or query timeout, a dead or frozen connection, a rollback or commit that failed because the connection died). Each of the two is logged as one throttled WARN line without a stack trace. "Anything else" is a bug.
+
+The `413` is written by `filter/RequestSizeLimitFilter` before the request reaches a controller, for a request that declares a `Content-Length` above 1 MB (`http.max-request-body-bytes`); its body has only `status`, `error` and `message`: `{"status":413,"error":"Payload Too Large","message":"Request body too large"}`. A body that declares no length (chunked) is cut off at 1 MB and answered `400` `Malformed request body`.
 
 Validation messages are Hibernate Validator's English defaults: `must not be
 null`, `must not be blank`, `must be greater than or equal to 1`, `must be less
 than or equal to 5`, `size must be between 3 and 255`, `size must be between 10
 and 2000`. The order of `fieldErrors` is not fixed.
 
-**Pagination.** None. List endpoints return a plain JSON array of everything that
-matches, in no defined order (the queries have no `ORDER BY`).
+**Pagination.** `GET /api/v1/reviews/product/{productId}` and
+`GET /api/v1/reviews/customer/{customerId}` take two optional integer parameters,
+`page` (default `0`, zero-based) and `size` (default `100`, 1 to 100), and return
+one page as a plain JSON array (not a `Page` object), oldest first (`ORDER BY id`),
+so page boundaries are stable. A client that wants more than 100 reviews asks for
+`page=1`, `page=2` and so on until a page comes back shorter than `size`. A `page`
+below 0, a `size` outside 1 to 100, an offset beyond the `int` range or a
+non-numeric value is `400`. The summary and the single-review endpoints are not
+paged.
 
 **Formats.** `LocalDateTime` fields are ISO-8601 strings without an offset, for
 example `2026-10-29T14:30:15.123456` (Boot 4's Jackson 3 default). They are
@@ -108,9 +122,9 @@ in the JVM's default zone; the images set no `TZ`. `rating` is an integer.
 |---|---|---|---|---|
 | `POST` | `/api/v1/reviews` | Bearer JWT | `X-Username` required (401); the author is `X-Username` | create a review |
 | `GET` | `/api/v1/reviews/{id}` | Bearer JWT | unapproved: author or `ADMIN` | get one review |
-| `GET` | `/api/v1/reviews/product/{productId}` | public | none | list a product's reviews |
+| `GET` | `/api/v1/reviews/product/{productId}` | public | none | one page of a product's reviews |
 | `GET` | `/api/v1/reviews/product/{productId}/summary` | public | none | a product's rating summary |
-| `GET` | `/api/v1/reviews/customer/{customerId}` | Bearer JWT | unapproved ones only for that user or `ADMIN` | list one user's reviews |
+| `GET` | `/api/v1/reviews/customer/{customerId}` | Bearer JWT | unapproved ones only for that user or `ADMIN` | one page of one user's reviews |
 | `PUT` | `/api/v1/reviews/{id}` | Bearer JWT | `X-Username` must be the author | edit a review |
 | `DELETE` | `/api/v1/reviews/{id}` | Bearer JWT | author, or `X-User-Role` `ADMIN` | delete a review |
 | `PATCH` | `/api/v1/reviews/{id}/moderate` | `ADMIN` | `ADMIN` | set the moderation status |
@@ -165,11 +179,16 @@ the same user.
   ```
 
 - **400** validation failure (with `fieldErrors`), or a missing or unparsable body.
+- **404** `Product not found with id: <productId>`: product-service answered 404.
 - **409** this username already reviewed this product.
-- **500** the product does not exist, **or** product-service is unavailable (no instance, connection refused after 3 attempts, 10 s read timeout, any HTTP error). The body only says `An unexpected error occurred`.
+- **413** `Request body too large` above 1 MB.
+- **502** `Upstream service error`: product-service answered with another 4xx, a 5xx other than 503 and 504, or a body that cannot be decoded.
+- **503** `Service temporarily unavailable`: product-service gave no answer (no instance, connection refused after 3 attempts, a read timeout after 10 s, a 503 or 504, or the circuit breaker is open), or the database did not answer.
 
 **Side effects:** one Feign call `GET /api/v1/products/{productId}` to
-product-service (body discarded); one `INSERT` into `reviews`. No events.
+product-service (body discarded), made before any database work and outside a
+transaction; then one duplicate lookup and one `INSERT` into `reviews`, each in
+its own short transaction. Nothing is stored when product-service fails. No events.
 
 **Example**
 
@@ -211,9 +230,9 @@ curl -s http://localhost:8080/api/v1/reviews/11 -H "Authorization: Bearer $TOKEN
 
 ## GET /api/v1/reviews/product/{productId}
 
-Lists a product's reviews. By default only `APPROVED` ones, which is what the
+Lists one page of a product's reviews, oldest first. By default only `APPROVED` ones, which is what the
 product page shows. With `approvedOnly=false` an `ADMIN` gets every status; anyone else still gets only approved reviews. The
-admin moderation page uses that.
+admin moderation page uses that. Without `page` and `size` that is the first 100 reviews; a product with more needs `page=1`, `page=2` and so on.
 
 **Auth:** Public at the gateway. `approvedOnly=false` is honoured for `ADMIN` only.
 
@@ -223,10 +242,12 @@ admin moderation page uses that.
 |---|---|---|---|---|---|
 | `productId` | path | integer (int64) | yes | — | not checked against product-service; an unknown ID returns `[]` |
 | `approvedOnly` | query | boolean | no | `true` | `false` includes `PENDING` and `REJECTED`, for `ADMIN` only |
+| `page` | query | integer | no | `0` | at least 0, otherwise 400 |
+| `size` | query | integer | no | `100` | 1 to 100, otherwise 400 |
 
 **Responses**
 
-- **200** array of [`ReviewDTO`](#reviewdto), possibly empty, unordered, not paginated.
+- **200** array of at most `size` [`ReviewDTO`](#reviewdto), possibly empty, oldest first (ordered by `id`).
 
   ```json
   [
@@ -246,15 +267,17 @@ admin moderation page uses that.
   ]
   ```
 
-- **400** non-numeric `productId` or non-boolean `approvedOnly`.
+- **400** non-numeric `productId` or non-boolean `approvedOnly`, or a `page` or `size` out of range or not a number.
+- **503** `Service temporarily unavailable` when the database does not answer.
 
-**Side effects:** none. Each review's votes are loaded with a separate query.
+**Side effects:** none. The page costs a constant number of queries: one for the reviews and one for the vote counts of all of them.
 
 **Example**
 
 ```bash
 curl -s 'http://localhost:8080/api/v1/reviews/product/1'
 curl -s 'http://localhost:8080/api/v1/reviews/product/1?approvedOnly=false'
+curl -s 'http://localhost:8080/api/v1/reviews/product/1?page=1&size=100'
 ```
 
 ---
@@ -288,8 +311,9 @@ The rating summary for a product's page.
   Here three approved reviews rated 4, 4 and 5 average 4.33, shown as 4.3; the fourth review is pending, so it counts only in `totalReviews`.
 
 - **400** non-numeric `productId`.
+- **503** `Service temporarily unavailable` when the database does not answer.
 
-**Side effects:** none.
+**Side effects:** none. Three count queries (the `APPROVED` reviews per rating, the `APPROVED` total and the total); the reviews themselves are not loaded, however many there are.
 
 **Example**
 
@@ -301,19 +325,23 @@ curl -s http://localhost:8080/api/v1/reviews/product/1/summary
 
 ## GET /api/v1/reviews/customer/{customerId}
 
-Lists the reviews one user wrote. `PENDING` and `REJECTED` ones are included only when the caller is that user or `ADMIN`; they are filtered out otherwise.
+Lists one page of the reviews one user wrote, oldest first. `PENDING` and `REJECTED` ones are included only when the caller is that user or `ADMIN`; every other caller gets the `APPROVED` ones only. The database does the filtering, so a page is always a full page. Without `page` and `size` that is the first 100 reviews.
 
 **Auth:** Bearer JWT at the gateway.
 
-**Path parameters**
+**Path / query parameters**
 
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
 | `customerId` | path | string | yes | — | the author's **username** (what `X-Username` carried at creation), not the numeric user ID |
+| `page` | query | integer | no | `0` | at least 0, otherwise 400 |
+| `size` | query | integer | no | `100` | 1 to 100, otherwise 400 |
 
 **Responses**
 
-- **200** array of [`ReviewDTO`](#reviewdto), possibly empty, unordered, not paginated.
+- **200** array of at most `size` [`ReviewDTO`](#reviewdto), possibly empty, oldest first (ordered by `id`).
+- **400** a `page` or `size` out of range or not a number.
+- **503** `Service temporarily unavailable` when the database does not answer.
 
 **Side effects:** none.
 
@@ -357,6 +385,7 @@ successful edit puts the review back to `PENDING` for re-moderation and sets
 - **400** validation failure, or a missing or unparsable body. `{}` is valid and only resets the status.
 - **403** `Only the review author can update this review`.
 - **404** unknown `id`.
+- **413** `Request body too large` above 1 MB.
 
 **Side effects:** one `UPDATE` of `reviews`. The review leaves the default product listing until it is approved again.
 
@@ -465,6 +494,7 @@ An author cannot vote on their own review, and only `APPROVED` reviews take vote
 - **403** `Authors cannot vote on their own review`.
 - **404** unknown `id`, or a review that is not `APPROVED`.
 - **409** two first votes by the same user on the same review raced into the unique constraint.
+- **413** `Request body too large` above 1 MB.
 
 **Side effects:** an `INSERT` into, or an `UPDATE` of, `review_votes`. The review's `updatedAt` does not change.
 
@@ -504,7 +534,7 @@ curl -s -X POST http://localhost:8080/api/v1/reviews/11/vote \
 | Field | JSON type | Java type | Notes |
 |---|---|---|---|
 | `productId` | integer | `Long` | echoes the path |
-| `averageRating` | number | `double` | mean of `APPROVED` ratings, rounded half-up to one decimal; `0.0` if none |
+| `averageRating` | number | `double` | mean of `APPROVED` ratings, computed exactly from the per-rating counts and rounded half-up to one decimal; `0.0` if none |
 | `totalReviews` | integer | `long` | reviews of the product in **any** status |
 | `approvedReviews` | integer | `long` | `APPROVED` reviews |
 | `ratingDistribution` | object | `Map<Integer, Long>` | keys `"1"` to `"5"`, always all present; values count `APPROVED` reviews per rating |

@@ -12,6 +12,14 @@ data:
       scrape_interval: 15s
       evaluation_interval: 15s
       scrape_timeout: 10s
+      # A scrape that returns more samples than this fails (up == 0, counted in
+      # prometheus_target_scrapes_exceeded_sample_limit_total, alert
+      # PrometheusSampleLimitExceeded) instead of being ingested. The largest target
+      # normally returns a few thousand samples (a Spring service ~3-8k, cAdvisor under
+      # compose ~5k); a metric whose labels start carrying ids would otherwise grow
+      # the TSDB and Prometheus' 640 MB of memory until it is OOM-killed on every
+      # start while it replays the WAL.
+      sample_limit: 50000
       external_labels:
         cluster: ecommerce-local
         environment: development
@@ -205,6 +213,33 @@ data:
               service: frontend-nginx
               group: frontend
 
+      # ─── The logging and tracing pipeline itself ─────────────────────────
+      # Without these a dead Promtail, Loki or Tempo is silent: logs and traces just
+      # stop. They also carry the metrics behind rules/logging-alerts.yml: the
+      # per-container log volume (promtail_custom_log_*), what Promtail and Loki
+      # dropped, and what Tempo discarded. In Kubernetes `promtail` is a Service in
+      # front of the DaemonSet (one node, so one pod).
+      - job_name: loki
+        static_configs:
+          - targets: ['loki:3100']
+            labels:
+              service: loki
+              group: monitoring
+
+      - job_name: promtail
+        static_configs:
+          - targets: ['promtail:9080']
+            labels:
+              service: promtail
+              group: monitoring
+
+      - job_name: tempo
+        static_configs:
+          - targets: ['tempo:3200']
+            labels:
+              service: tempo
+              group: monitoring
+
       - job_name: blackbox-http
         metrics_path: /probe
         params:
@@ -268,13 +303,16 @@ data:
               description: "Connection usage is {{ $value | humanizePercentage }} of max_connections."
 
           - alert: PostgresDeadlocks
-            expr: rate(pg_stat_database_deadlocks{datname!~"template.*|postgres"}[5m]) > 0
-            for: 5m
+            # Was `rate(...[5m]) > 0` with `for: 5m`: one deadlock keeps a 5-minute rate above
+            # zero for less than 5 minutes, so an isolated deadlock could never fire; only a
+            # sustained series did. increase() with no `for` reports the first one.
+            expr: increase(pg_stat_database_deadlocks{datname!~"template.*|postgres"}[10m]) > 0
+            for: 0m
             labels:
               severity: warning
             annotations:
               summary: "PostgreSQL deadlocks detected on {{ $labels.datname }}"
-              description: "Deadlock rate: {{ $value }} per second on database {{ $labels.datname }}."
+              description: "{{ $value | printf \"%.0f\" }} deadlock(s) on database {{ $labels.datname }} in the last 10 minutes. Postgres logs both statements (`docker logs {{ $labels.datname }}`)."
 
           - alert: PostgresSlowQueries
             # Two fixes: the custom query in queries.yml emits
@@ -289,6 +327,27 @@ data:
             annotations:
               summary: "Long-running queries on {{ $labels.datname }}"
               description: "There are queries running for more than 60 seconds on {{ $labels.datname }}."
+
+          # The services' side of the same database trouble: a request waited the whole Hikari
+          # connection-timeout (5 s) for a pooled connection and was answered 503. Hikari registers
+          # its counters at pool start, so increase() sees the first timeout.
+          - alert: DatabasePoolTimeouts
+            expr: sum by (application) (increase(hikaricp_connections_timeout_total[5m])) > 0
+            for: 0m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.application }} ran out of database connections"
+              description: "{{ $value | printf \"%.0f\" }} request(s) waited 5 s for a database connection in the last 5 minutes and got 503. The pool is exhausted (slow statements, a held row lock) or the database stopped answering: check PostgresDown, PostgresSlowQueries and hikaricp_connections_active against hikaricp_connections_max."
+
+          - alert: DatabasePoolSaturated
+            expr: max by (application) (hikaricp_connections_pending) > 0
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.application }} has requests queuing for database connections"
+              description: "Threads have been waiting for a pooled connection for 2 minutes; requests slow down by up to 5 s and then fail with 503."
 
       # catalogdb is MongoDB (catalog-service's read model), scraped through
       # percona/mongodb_exporter; see prometheus.yml job mongodb-exporter-catalogdb.
@@ -359,16 +418,75 @@ data:
     < 0.10\r\n        for: 5m\r\n        labels:\r\n          severity: critical\r\n
     \       annotations:\r\n          summary: \"Host is running out of memory\"\r\n
     \         description: \"Only {{ $value | humanizePercentage }} of host memory
-    is available.\"\r\n\r\n      - alert: HostDiskSpaceLow\r\n        expr: |\r\n
-    \         (node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"})
-    < 0.15\r\n        for: 5m\r\n        labels:\r\n          severity: warning\r\n
-    \       annotations:\r\n          summary: \"Disk space low on host\"\r\n          description:
-    \"Only {{ $value | humanizePercentage }} disk space remaining on /.\"\r\n\r\n
-    \     - alert: HostDiskSpaceCritical\r\n        expr: |\r\n          (node_filesystem_avail_bytes{mountpoint=\"/\"}
-    / node_filesystem_size_bytes{mountpoint=\"/\"}) < 0.05\r\n        for: 2m\r\n
-    \       labels:\r\n          severity: critical\r\n        annotations:\r\n          summary:
-    \"Disk space critically low on host\"\r\n          description: \"Less than 5%
-    disk space remaining on /. Immediate action required.\"\r\n"
+    is available.\"\r\n\r\n      # The three disk rules below select real filesystems
+    by type, not\r\n      # mountpoint=\"/\". On Docker Desktop `/` of the VM is not
+    necessarily the disk that\r\n      # holds /var/lib/docker (the one the 992 GB
+    incident filled), and a selector that\r\n      # matches nothing never fires.
+    tmpfs/ramfs are small by design; overlay, squashfs\r\n      # and nsfs are already
+    excluded by node-exporter. min by (device) folds the\r\n      # several mountpoints
+    of one device (/, /var/lib/docker, /etc/hosts ...) into one\r\n      # alert.\r\n
+    \     - alert: HostDiskSpaceLow\r\n        expr: |\r\n          min by (instance,
+    device) (\r\n            node_filesystem_avail_bytes{fstype!~\"tmpfs|ramfs|squashfs|iso9660|overlay|nsfs\"}\r\n
+    \           / node_filesystem_size_bytes{fstype!~\"tmpfs|ramfs|squashfs|iso9660|overlay|nsfs\"}\r\n
+    \         ) < 0.15\r\n        for: 5m\r\n        labels:\r\n          severity:
+    warning\r\n        annotations:\r\n          summary: \"Disk space low on {{ $labels.device
+    }}\"\r\n          description: \"Only {{ $value | humanizePercentage }} of {{
+    $labels.device }} is free. `docker system df` shows what Docker holds; large log
+    or volume growth shows on the Logging & Reliability dashboard.\"\r\n\r\n      -
+    alert: HostDiskSpaceCritical\r\n        expr: |\r\n          min by (instance,
+    device) (\r\n            node_filesystem_avail_bytes{fstype!~\"tmpfs|ramfs|squashfs|iso9660|overlay|nsfs\"}\r\n
+    \           / node_filesystem_size_bytes{fstype!~\"tmpfs|ramfs|squashfs|iso9660|overlay|nsfs\"}\r\n
+    \         ) < 0.05\r\n        for: 2m\r\n        labels:\r\n          severity:
+    critical\r\n        annotations:\r\n          summary: \"Disk space critically
+    low on {{ $labels.device }}\"\r\n          description: \"Less than 5% of {{ $labels.device
+    }} is free. Immediate action required: a full disk stops every container (and
+    Docker Desktop's WSL2 disk never shrinks again).\"\r\n\r\n      # Rate-based,
+    because a runaway fills a disk faster than a percentage threshold\r\n      # can
+    warn: 992 GB in 17 h is 58 GB/h, so a 1 TB disk goes from 15 % free to full\r\n
+    \     # in under 3 h. The window must be long enough to ignore a `docker build`.\r\n
+    \     - alert: HostDiskWillFillWithin24h\r\n        expr: |\r\n          min by
+    (instance, device) (\r\n            predict_linear(node_filesystem_avail_bytes{fstype!~\"tmpfs|ramfs|squashfs|iso9660|overlay|nsfs\"}[6h],
+    24 * 3600)\r\n          ) < 0\r\n        for: 30m\r\n        labels:\r\n          severity:
+    warning\r\n        annotations:\r\n          summary: \"{{ $labels.device }} will
+    run out of space within 24 hours\"\r\n          description: \"At the rate of
+    the last 6 hours {{ $labels.device }} is full within a day. Look for runaway logs
+    (ServiceLogRateHigh, ContainerLogVolumeHigh), Kafka or Loki growth.\"\r\n\r\n
+    \     - alert: HostDiskWillFillWithin4h\r\n        expr: |\r\n          min by
+    (instance, device) (\r\n            predict_linear(node_filesystem_avail_bytes{fstype!~\"tmpfs|ramfs|squashfs|iso9660|overlay|nsfs\"}[1h],
+    4 * 3600)\r\n          ) < 0\r\n        for: 10m\r\n        labels:\r\n          severity:
+    critical\r\n        annotations:\r\n          summary: \"{{ $labels.device }}
+    will run out of space within 4 hours\"\r\n          description: \"At the rate
+    of the last hour {{ $labels.device }} is full within 4 hours. This is what a log
+    explosion looks like before the disk is full: find the container writing the most
+    (promtail_custom_log_bytes_total, `docker ps -s`) and stop it.\"\r\n\r\n  # The
+    metrics stores can outgrow their volumes too; each has a size or rate bound\r\n
+    \ # (prometheus --storage.tsdb.retention.size, Loki and Tempo ingestion limits),
+    and\r\n  # these rules say when a bound is doing the work.\r\n  - name: infrastructure.monitoring\r\n
+    \   interval: 30s\r\n    rules:\r\n      - alert: PrometheusTsdbNearSizeLimit\r\n
+    \       # prometheus_tsdb_retention_limit_bytes is 0 when no size limit is set,
+    hence the guard.\r\n        expr: |\r\n          prometheus_tsdb_storage_blocks_bytes
+    / prometheus_tsdb_retention_limit_bytes > 0.9\r\n          and prometheus_tsdb_retention_limit_bytes
+    > 0\r\n        for: 30m\r\n        labels:\r\n          severity: warning\r\n
+    \       annotations:\r\n          summary: \"Prometheus storage is at {{ $value
+    | humanizePercentage }} of its size limit\"\r\n          description: \"The TSDB
+    is within 10% of --storage.tsdb.retention.size, so the oldest blocks are about
+    to be deleted before the 15-day retention. Check for a cardinality increase (prometheus_tsdb_head_series)
+    or raise the limit.\"\r\n\r\n      - alert: PrometheusSampleLimitExceeded\r\n
+    \       expr: |\r\n          increase(prometheus_target_scrapes_exceeded_sample_limit_total[10m])
+    > 0\r\n        for: 0m\r\n        labels:\r\n          severity: warning\r\n        annotations:\r\n
+    \         summary: \"A scrape target exceeded the sample limit\"\r\n          description:
+    \"A target returned more than 50000 samples (global sample_limit in prometheus.yml),
+    so its scrape failed and the target shows up == 0. A metric label is probably
+    carrying an id; see Status → Targets for the failing job.\"\r\n\r\n      - alert:
+    ExporterDown\r\n        # ServiceDown only selects group=\"application\", and
+    the kafka_brokers, pg_up and\r\n        # mongodb_up alerts depend on their exporter:
+    if the exporter dies the series\r\n        # disappear and those rules stay silent.
+    This one watches the scrape itself.\r\n        expr: |\r\n          up{group=~\"infrastructure|messaging|database|frontend\"}
+    == 0\r\n        for: 3m\r\n        labels:\r\n          severity: warning\r\n
+    \       annotations:\r\n          summary: \"{{ $labels.service }} exporter is
+    down\"\r\n          description: \"Prometheus cannot scrape {{ $labels.service
+    }} ({{ $labels.instance }}) for 3 minutes, so the alerts that depend on it cannot
+    fire.\"\r\n"
   kafka-alerts.yml: "groups:\r\n  - name: kafka.health\r\n    interval: 30s\r\n    rules:\r\n
     \     - alert: KafkaBrokerDown\r\n        expr: kafka_brokers < 1\r\n        for:
     1m\r\n        labels:\r\n          severity: critical\r\n        annotations:\r\n
@@ -393,11 +511,344 @@ data:
     \         summary: \"Kafka has under-replicated partitions\"\r\n          description:
     \"{{ $value }} partition(s) are under-replicated; the broker may be unhealthy
     or a replica is offline.\"\r\n\r\n      - alert: KafkaPartitionHasNoLeader\r\n
-    \       expr: kafka_topic_partition_leader == -1\r\n        for: 5m\r\n        labels:\r\n
-    \         severity: critical\r\n        annotations:\r\n          summary: \"Kafka
-    partition {{ $labels.topic }}-{{ $labels.partition }} has no leader\"\r\n          description:
-    \"Producers and consumers for topic {{ $labels.topic }} will fail until a leader
-    is elected.\"\r\n"
+    \       # kafka-exporter v1.7.0 never emits kafka_topic_partition_leader == -1:
+    when it\r\n        # cannot find a leader it logs an error and emits no sample
+    for that partition,\r\n        # so the old `== -1` rule could not fire. A leaderless
+    partition shows up as a\r\n        # topic that has more partitions (kafka_topic_partitions,
+    from the metadata)\r\n        # than partitions with a leader.\r\n        expr:
+    |\r\n          (\r\n            kafka_topic_partitions\r\n            - on (topic)
+    count by (topic) (kafka_topic_partition_leader)\r\n            > 0\r\n          )\r\n
+    \         or\r\n          (kafka_topic_partitions unless on (topic) kafka_topic_partition_leader)\r\n
+    \       for: 5m\r\n        labels:\r\n          severity: critical\r\n        annotations:\r\n
+    \         summary: \"Kafka topic {{ $labels.topic }} has partitions without a
+    leader\"\r\n          description: \"{{ $value }} partition(s) of topic {{ $labels.topic
+    }} report no leader. Producers and consumers of the topic fail until one is elected.\"\r\n\r\n
+    \     - alert: KafkaConsumerGroupNoMembers\r\n        # The three groups are the
+    application names. A group with no member has no\r\n        # live consumer, so
+    its topics are not being read at all (the lag alerts only\r\n        # fire once
+    the lag is large).\r\n        expr: |\r\n          kafka_consumergroup_members{consumergroup=~\"(order|shipping|notification)-service\"}
+    == 0\r\n        for: 5m\r\n        labels:\r\n          severity: warning\r\n
+    \       annotations:\r\n          summary: \"Kafka consumer group {{ $labels.consumergroup
+    }} has no members\"\r\n          description: \"No consumer of group {{ $labels.consumergroup
+    }} is connected for 5 minutes. Check that the service is running and not stuck
+    rebalancing (docker logs {{ $labels.consumergroup }}).\"\r\n\r\n      # A consumer
+    that stops committing while records wait is stuck: a hung listener\r\n      #
+    thread, a partition blocked on a record, a dead dependency. The lag alerts above\r\n
+    \     # use absolute thresholds (1000 / 10000) and never see this on a quiet topic:
+    the\r\n      # shipment.created poison pill sat at lag 1 while it wrote 992 GB
+    of logs. Lag > 0\r\n      # with a committed offset that has not moved for 10
+    minutes catches it at any size.\r\n      # (Dead-lettered records are committed,
+    so a bad record does not trip it; a\r\n      # database outage does, on purpose,
+    because the partition waits for the database.)\r\n      - alert: KafkaConsumerStuck\r\n
+    \       expr: |\r\n          (kafka_consumergroup_lag > 0)\r\n          and on
+    (consumergroup, topic, partition)\r\n          (changes(kafka_consumergroup_current_offset[10m])
+    == 0)\r\n        for: 5m\r\n        labels:\r\n          severity: warning\r\n
+    \       annotations:\r\n          summary: \"Kafka consumer {{ $labels.consumergroup
+    }} is stuck on {{ $labels.topic }}\"\r\n          description: \"Group {{ $labels.consumergroup
+    }} has {{ $value }} unread record(s) on {{ $labels.topic }}-{{ $labels.partition
+    }} and has not committed an offset for 15 minutes. Check its logs, then `kafka-consumer-groups
+    --describe --group {{ $labels.consumergroup }}`.\"\r\n\r\n      # Every consumer
+    dead-letters a record it cannot process to <topic>.DLT. The topics\r\n      #
+    are auto-created on the first dead letter, so a series exists only afterwards:\r\n
+    \     # the second branch catches a topic that appeared within the window, which\r\n
+    \     # increase() would miss (it needs two samples).\r\n      - alert: KafkaDeadLetterRecords\r\n
+    \       expr: |\r\n          (increase(kafka_topic_partition_current_offset{topic=~\".+\\\\.DLT\"}[15m])
+    > 0)\r\n          or\r\n          (\r\n            kafka_topic_partition_current_offset{topic=~\".+\\\\.DLT\"}
+    > 0\r\n            unless kafka_topic_partition_current_offset{topic=~\".+\\\\.DLT\"}
+    offset 15m\r\n          )\r\n        for: 0m\r\n        labels:\r\n          severity:
+    warning\r\n        annotations:\r\n          summary: \"Records were dead-lettered
+    to {{ $labels.topic }}\"\r\n          description: \"A consumer gave up on a record
+    and moved it to {{ $labels.topic }} in the last 15 minutes. Read it with `kafka-console-consumer
+    --topic {{ $labels.topic }} --from-beginning --property print.headers=true` (the
+    headers name the failing consumer and the exception), fix the cause, then replay
+    or drop it.\"\r\n\r\n      - alert: KafkaDeadLetterFlood\r\n        expr: |\r\n
+    \         sum by (topic) (increase(kafka_topic_partition_current_offset{topic=~\".+\\\\.DLT\"}[5m]))
+    > 100\r\n        for: 0m\r\n        labels:\r\n          severity: critical\r\n
+    \       annotations:\r\n          summary: \"{{ $value | printf \\\"%.0f\\\" }}
+    records dead-lettered to {{ $labels.topic }} in 5 minutes\"\r\n          description:
+    \"Far more than isolated bad records: a producer is sending something no consumer
+    can process (schema mismatch after a deploy?). Expect log and disk pressure; the
+    topic is capped by Kafka's retention.bytes.\"\r\n\r\n      # A record that could
+    not even be dead-lettered (the broker refuses its copy for good) is\r\n      #
+    skipped so the partition keeps moving: the event is lost, no topic holds it any
+    more. The\r\n      # services' dead-letter recoverer counts these as kafka_dlt_dropped_total{topic=<source
+    topic>}.\r\n      # Same two branches as KafkaDeadLetterRecords: the counter only
+    appears at its first increment.\r\n      - alert: KafkaDeadLetterDropped\r\n        expr:
+    |\r\n          (increase(kafka_dlt_dropped_total[15m]) > 0)\r\n          or\r\n
+    \         (\r\n            kafka_dlt_dropped_total > 0\r\n            unless kafka_dlt_dropped_total
+    offset 15m\r\n          )\r\n        for: 0m\r\n        labels:\r\n          severity:
+    critical\r\n        annotations:\r\n          summary: \"{{ $labels.application
+    }} dropped a {{ $labels.topic }} record it could not dead-letter\"\r\n          description:
+    \"The record was neither processed nor written to {{ $labels.topic }}.DLT, so
+    it is gone. `docker logs {{ $labels.application }}` has one ERROR naming the key
+    and the reason (usually a record too large for the broker); the original is still
+    on {{ $labels.topic }} until retention removes it, so replay it from there once
+    the cause is fixed.\"\r\n"
+  logging-alerts.yml: |
+    # Log-explosion and logging-pipeline alerts.
+    #
+    # The incident behind them: notification-service re-read one undeserializable
+    # Kafka record in a tight loop and logged a stack trace per poll, 992 GB in 17 h,
+    # which filled the Docker VM disk. Nothing in the platform noticed, because no
+    # rule looked at how much was being logged. Three independent signals now do:
+    #
+    #   logback_events_total   events each JVM logged, by level (counted in the app,
+    #                          so it works whatever Promtail does with the lines)
+    #   promtail_custom_log_*  entries and bytes each container wrote, JVM or not
+    #                          (Kafka, nginx), counted before Promtail drops anything
+    #   loki_discarded_*       what Loki refused, and tempo_discarded_spans_total
+    #
+    # Thresholds are sized against the platform's normal volume: an idle service logs
+    # a few lines a minute, the k6 `load` profile a few dozen a second; promtail sheds
+    # a container at 300 entries/s and Loki refuses a stream at 128 KB/s, so the
+    # "critical" levels sit just above what the pipeline would already be shedding.
+    groups:
+      - name: logging.volume
+        interval: 30s
+        rules:
+          - alert: ServiceLogRateHigh
+            # All levels: a DEBUG flood (LOGGING_LEVEL_COM_ECOMMERCE=DEBUG left on) fills the
+            # container's json log even though Promtail does not ship it.
+            expr: |
+              sum by (service) (rate(logback_events_total{group="application"}[5m])) > 100
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.service }} is logging {{ $value | printf \"%.0f\" }} events/s"
+              description: "{{ $labels.service }} has logged more than 100 events/s for 10 minutes (an idle service logs a few a minute). A retry loop or an unthrottled error path is the usual cause: Loki → {service=\"{{ $labels.service }}\"}, or the volume per level on the Logging & Reliability dashboard."
+
+          - alert: ServiceLogRateCritical
+            expr: |
+              sum by (service) (rate(logback_events_total{group="application"}[5m])) > 1000
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Log explosion in {{ $labels.service }}: {{ $value | printf \"%.0f\" }} events/s"
+              description: "{{ $labels.service }} is logging more than 1000 events/s, well past what Promtail ships (300/s per container). At this rate the Docker VM disk fills in hours (the 992 GB incident was ~100000/s). Find the loop with `docker logs --tail 50 {{ $labels.service }}`."
+
+          - alert: ServiceErrorLogRateHigh
+            # Stack traces are throttled to one per distinct failure per 10 s, so one
+            # failing call site logs at most 0.1 ERROR/s. Half an error a second for ten
+            # minutes is five failure sites at once, or an ERROR that is not throttled.
+            expr: |
+              sum by (service) (rate(logback_events_total{group="application", level="error"}[5m])) > 0.5
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.service }} keeps logging errors ({{ $value | printf \"%.2f\" }}/s)"
+              description: "{{ $labels.service }} has logged more than 0.5 ERROR events/s for 10 minutes. Loki: {service=\"{{ $labels.service }}\", level=\"ERROR\"}."
+
+          - alert: ServiceErrorLogRateCritical
+            expr: |
+              sum by (service) (rate(logback_events_total{group="application", level="error"}[5m])) > 10
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Error-log flood in {{ $labels.service }}: {{ $value | printf \"%.0f\" }} ERROR events/s"
+              description: "{{ $labels.service }} logs more than 10 ERROR events/s, so the exception handler is not throttling (LogThrottle). Expect disk and Loki pressure within minutes."
+
+          - alert: ContainerLogVolumeHigh
+            # Promtail counts every container, including Kafka and nginx that have no
+            # logback metric, and counts before it drops, so a runaway shows its real size.
+            expr: |
+              sum by (container) (rate(promtail_custom_log_bytes_total[5m])) > 102400
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Container {{ $labels.container }} is writing {{ $value | humanize1024 }}B/s of logs"
+              description: "{{ $labels.container }} has written more than 100 KB/s of log output for 5 minutes (8.6 GB/day). Docker keeps 150 MB of it, Loki refuses a stream above 128 KB/s."
+
+          - alert: ContainerLogVolumeCritical
+            expr: |
+              sum by (container) (rate(promtail_custom_log_bytes_total[5m])) > 1048576
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Log explosion in container {{ $labels.container }}: {{ $value | humanize1024 }}B/s"
+              description: "{{ $labels.container }} is writing more than 1 MB/s of logs (86 GB/day). Promtail is already dropping the excess; stop the cause."
+
+      - name: logging.pipeline
+        interval: 30s
+        rules:
+          - alert: PromtailDroppingLogs
+            # logentry_dropped_lines_by_label_total comes from the per-container rate limit
+            # in the pipeline (promtail-config.yml); reason debug_log_dropped is the normal
+            # DEBUG filter and is not counted here.
+            expr: |
+              sum by (label_value) (rate(logentry_dropped_lines_by_label_total{label_name="container"}[2m])) > 1
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Promtail is shedding logs from {{ $labels.label_value }}"
+              description: "Promtail drops {{ $value | printf \"%.0f\" }} lines/s from container {{ $labels.label_value }} (its limit is 300 entries/s), so Loki holds only part of what it logged. `docker logs` still has the rest."
+
+          - alert: PromtailDroppedEntries
+            # Entries lost after the retries ran out or Loki answered 4xx.
+            expr: |
+              sum by (reason) (rate(promtail_dropped_entries_total[5m])) > 0
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Promtail cannot deliver logs to Loki ({{ $labels.reason }})"
+              description: "Promtail gave up on {{ $value | printf \"%.1f\" }} entries/s, reason {{ $labels.reason }}. Check `docker logs promtail` and the Loki alerts."
+
+          - alert: LokiRateLimitingLogs
+            expr: |
+              sum by (reason) (rate(loki_discarded_samples_total{reason=~"rate_limited|per_stream_rate_limit"}[5m])) > 0
+            for: 2m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Loki is refusing log lines ({{ $labels.reason }})"
+              description: "Loki discards {{ $value | printf \"%.1f\" }} lines/s over its ingestion limit ({{ $labels.reason }}: 128 KB/s per stream, 512 KB/s for the whole stack). Something is logging far above normal: see ServiceLogRateHigh and ContainerLogVolumeHigh."
+
+          - alert: LokiRejectingLogs
+            # missing_labels / invalid_labels mean a Promtail pipeline is broken (the
+            # old docker discovery sent unlabelled lines); greater_than_max_sample_age
+            # and too_far_in_future mean a clock or timestamp problem.
+            expr: |
+              sum by (reason) (rate(loki_discarded_samples_total{reason!~"rate_limited|per_stream_rate_limit"}[10m])) > 0.1
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Loki rejects log lines ({{ $labels.reason }})"
+              description: "Loki discards {{ $value | printf \"%.2f\" }} lines/s for reason {{ $labels.reason }}. The Promtail configuration or a client clock is wrong."
+
+          - alert: PromtailNoActiveTargets
+            # On Kubernetes a missing __host__ relabel or HOSTNAME discards every target
+            # silently; under compose it means no application container is running.
+            expr: |
+              promtail_targets_active_total == 0
+            for: 10m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Promtail is tailing no containers"
+              description: "promtail_targets_active_total has been 0 for 10 minutes, so no logs reach Loki. Under Kubernetes check the __host__ relabel and HOSTNAME in k8s/60-monitoring.yaml."
+
+          - alert: TempoDiscardingSpans
+            expr: |
+              sum by (reason) (rate(tempo_discarded_spans_total[5m])) > 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Tempo is discarding spans ({{ $labels.reason }})"
+              description: "Tempo drops {{ $value | printf \"%.1f\" }} spans/s, reason {{ $labels.reason }} (ingestion limit 1 MB/s, 2 MB per trace). A request storm is being traced at 100 %; traces of that period are incomplete."
+
+          - alert: MonitoringStackDown
+            # ServiceDown only covers group="application"; without this a dead Promtail,
+            # Loki or Tempo is silent: logs and traces just stop.
+            expr: |
+              up{group="monitoring"} == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "{{ $labels.service }} is down"
+              description: "Prometheus cannot scrape {{ $labels.service }} ({{ $labels.instance }}). Logs or traces are not being collected."
+  outbox-alerts.yml: |
+    # Transactional outbox (order-, payment- and shipping-service).
+    #
+    # A state change and the event that announces it are written in one database
+    # transaction; a relay publishes the rows to Kafka and deletes them. While Kafka is
+    # unreachable the rows pile up and the relay retries with back-off (1 s up to 30 s),
+    # logging at most one WARN a minute. The metrics below are the only way to see that
+    # state from outside:
+    #   outbox_events_pending           gauge, rows waiting to be published
+    #   outbox_events_parked            gauge, rows that failed permanently and need a
+    #                                   person (UPDATE outbox_event SET parked_at = NULL ...)
+    #   outbox_events_published_total   counter, rows acknowledged by Kafka
+    #   outbox_publish_failures_total   counter, failed publish attempts
+    groups:
+      - name: service.outbox
+        interval: 30s
+        rules:
+          - alert: OutboxBacklog
+            # Rows normally live for one relay tick (500 ms). Fifty waiting for five
+            # minutes means the relay is not getting them out.
+            expr: |
+              outbox_events_pending > 50
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.application }} has {{ $value | printf \"%.0f\" }} events waiting in its outbox"
+              description: "Events written by {{ $labels.application }} are not reaching Kafka. Downstream services (shipping, notification) do not see those orders and payments until the relay catches up. Check Kafka and `docker logs {{ $labels.application }}`."
+
+          - alert: OutboxBacklogGrowing
+            # The level alerts need a backlog of 50; a relay that publishes slower than the
+            # service writes shows as a backlog that keeps growing long before that: 20 more
+            # rows than 15 minutes ago and still rising.
+            expr: |
+              (outbox_events_pending - outbox_events_pending offset 15m) > 20
+              and
+              deriv(outbox_events_pending[15m]) > 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "The outbox of {{ $labels.application }} keeps growing (+{{ $value | printf \"%.0f\" }} in 15 minutes)"
+              description: "{{ $labels.application }} writes outbox events faster than its relay publishes them, or Kafka is slow. The backlog is {{ $value | printf \"%.0f\" }} rows larger than 15 minutes ago and still rising."
+
+          - alert: OutboxBacklogCritical
+            expr: |
+              outbox_events_pending > 1000
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "{{ $labels.application }} outbox holds {{ $value | printf \"%.0f\" }} unpublished events"
+              description: "More than 1000 events wait in the outbox of {{ $labels.application }}. The database table grows with every request until Kafka is back."
+
+          - alert: OutboxEventsParked
+            # Parked rows are never retried by the relay: they hit a permanent error
+            # (record too large, invalid topic, serialization). The relay logged the id and
+            # the SQL to unpark it.
+            expr: |
+              outbox_events_parked > 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.application }} has {{ $value | printf \"%.0f\" }} parked outbox event(s)"
+              description: "The relay of {{ $labels.application }} gave up on {{ $value | printf \"%.0f\" }} event(s) after a permanent publish error; they are never retried. The ERROR log line has the row id, the cause and the UPDATE that unparks it."
+
+          - alert: OutboxPublishFailing
+            expr: |
+              sum by (application) (rate(outbox_publish_failures_total[5m])) > 0
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "{{ $labels.application }} cannot publish to Kafka"
+              description: "The outbox relay of {{ $labels.application }} has been failing to publish for 5 minutes ({{ $value | printf \"%.2f\" }} failures/s, with back-off). Kafka is down or unreachable; requests still succeed and the events wait in the outbox."
+
+          - alert: OutboxRelayStalled
+            # Pending rows but not one acknowledged in ten minutes, and no failed attempts
+            # to explain it (a Kafka outage is OutboxPublishFailing): the relay thread
+            # itself is not running.
+            expr: |
+              outbox_events_pending > 0
+              unless on (instance)
+              (increase(outbox_events_published_total[10m]) > 0)
+              unless on (instance)
+              (increase(outbox_publish_failures_total[10m]) > 0)
+            for: 5m
+            labels:
+              severity: critical
+            annotations:
+              summary: "The outbox relay of {{ $labels.application }} is stalled"
+              description: "{{ $labels.application }} has {{ $value | printf \"%.0f\" }} pending outbox event(s) and has published none for 10 minutes. The relay (@Scheduled) is not running or is stuck; restart the service."
   service-alerts.yml: "groups:\r\n  - name: service.availability\r\n    interval:
     30s\r\n    rules:\r\n      - alert: ServiceDown\r\n        expr: up{group=\"application\"}
     == 0\r\n        for: 1m\r\n        labels:\r\n          severity: critical\r\n
@@ -449,11 +900,21 @@ data:
     \         summary: \"High GC pause time on {{ $labels.application }}\"\r\n          description:
     \"Average GC pause on {{ $labels.application }} is {{ $value | humanizeDuration
     }}.\"\r\n\r\n  - name: service.circuitbreaker\r\n    interval: 30s\r\n    rules:\r\n
-    \     - alert: CircuitBreakerOpen\r\n        expr: resilience4j_circuitbreaker_state{state=\"open\"}
-    == 1\r\n        for: 1m\r\n        labels:\r\n          severity: warning\r\n
-    \       annotations:\r\n          summary: \"Circuit breaker OPEN on {{ $labels.application
-    }}\"\r\n          description: \"Circuit breaker '{{ $labels.name }}' is OPEN
-    on {{ $labels.application }}.\"\r\n"
+    \     - alert: CircuitBreakerOpen\r\n        # A breaker that cannot close cycles
+    open -> half_open (a few trial calls) -> open\r\n        # every wait-duration,
+    and resilience4j exports one 0/1 series per state. The old\r\n        # rule watched
+    state=\"open\" alone, so every half-open phase reset its `for` clock\r\n        #
+    and a breaker that stayed broken could drop out of firing. Open, half-open and\r\n
+    \       # forced-open count together, and the breaker has to be in one of them
+    for three\r\n        # minutes: a single trip that closes again on its first trial
+    call does not alert.\r\n        # Breakers: product-service in catalog-, order-
+    and review-service, order-service\r\n        # in payment-service.\r\n        expr:
+    |\r\n          max by (service, application, name) (\r\n            resilience4j_circuitbreaker_state{state=~\"open|half_open|forced_open\"}\r\n
+    \         ) == 1\r\n        for: 3m\r\n        labels:\r\n          severity:
+    warning\r\n        annotations:\r\n          summary: \"Circuit breaker '{{ $labels.name
+    }}' is not closed on {{ $labels.application }}\"\r\n          description: \"Circuit
+    breaker '{{ $labels.name }}' on {{ $labels.application }} has been open or half-open
+    for 3 minutes: calls to the dependency it protects are failing or being short-circuited.\"\r\n"
 kind: ConfigMap
 metadata:
   name: prometheus-rules
@@ -575,10 +1036,45 @@ data:
     ruler:
       alertmanager_url: http://alertmanager:9093
 
+    # A restart after a log flood replays the write-ahead log into memory. The
+    # default ceiling is 4 GB, far above this container's 512 MB limit, so a large
+    # WAL would be OOM-killed on every start (restart loop); past this ceiling the
+    # replay flushes to disk instead of growing.
+    ingester:
+      wal:
+        enabled: true
+        dir: /loki/wal
+        flush_on_shutdown: true
+        replay_memory_ceiling: 192MB
+
+    # The limits below are the disk bound for logs: Loki has no size-based
+    # retention, so what is accepted per second times retention_period is the most
+    # that can be stored. They are sized from what the platform writes: roughly
+    # 1 KB/s idle, about 40 KB/s for the whole stack under the k6 checkout load, one
+    # JVM start about 60 KB in a few seconds. Anything above is a runaway, and is
+    # refused with HTTP 429 and counted in loki_discarded_samples_total{reason}
+    # (alert LokiDiscardingLogs). Promtail already sheds line floods per container
+    # (300 entries/s), so these catch what it cannot: few but huge entries, and any
+    # other client.
+    #   per stream  128 KB/s sustained  = at most ~11 GB/day (raw) for one container
+    #   whole stack 512 KB/s sustained  = at most ~44 GB/day (raw), ~9 GB compressed
+    # The earlier 16 MB/s per tenant (32 MB burst) would have stored the 992 GB
+    # incident in full: one stream at 16 MB/s is 1.4 TB/day.
     limits_config:
       retention_period: 744h
-      ingestion_rate_mb: 16
-      ingestion_burst_size_mb: 32
+      ingestion_rate_mb: 0.5
+      # Must stay above promtail's batchsize (512 KiB), or a full batch is refused
+      # whatever the rate.
+      ingestion_burst_size_mb: 4
+      per_stream_rate_limit: 128KB
+      per_stream_rate_limit_burst: 2MB
+      # An entry is a log line plus its stack trace (promtail multiline, at most 128
+      # lines). Longer entries are cut instead of refused.
+      max_line_size: 64KB
+      max_line_size_truncate: true
+      # About 12 services x 3 levels x stdout/stderr, plus pods under Kubernetes.
+      # Bounds memory (every open stream holds a chunk) if a bad label ever appears.
+      max_global_streams_per_user: 1000
       max_query_series: 10000
       # Must be >= retention_period, otherwise the oldest retained logs are kept on
       # disk but rejected by every query.
@@ -646,9 +1142,29 @@ data:
         local:
           path: /var/tempo/blocks
 
+    # Disk bound for traces. Every request is traced at 100 % (about 4 spans of
+    # ~0.4 KB each: gateway server and client, the service, a Feign hop) and the
+    # actuator scrapes and probes add ~140 traces a minute, so a request storm
+    # becomes a span storm. The k6 `load` profile (50 browse VUs) writes roughly
+    # 300 KB/s; the Tempo default of 15 MB/s would store a storm for the whole 48 h
+    # retention (2.6 TB). Over the limit the distributor answers RESOURCE_EXHAUSTED
+    # (429), the OTLP exporters drop the batch, and tempo_discarded_spans_total{reason}
+    # counts it (alert TempoDiscardingSpans). Worst case kept: 1 MB/s x 48 h = 172 GB
+    # raw, about 35 GB compressed, and only if nobody reacts to the alert; the `stress`
+    # profile (4x load) is clipped at the limit on purpose.
     overrides:
       defaults:
+        ingestion:
+          rate_strategy: local
+          rate_limit_bytes: 1000000
+          burst_size_bytes: 4000000
+        global:
+          max_bytes_per_trace: 2000000
         metrics_generator:
+          # Series the generator may write to Prometheus (span-metrics and
+          # service-graphs). Expected: a few thousand. Bounds Prometheus' memory if a
+          # span name ever carries an id.
+          max_active_series: 50000
           processors: [service-graphs, span-metrics]
 kind: ConfigMap
 metadata:
@@ -665,15 +1181,21 @@ data:
     false\r\n    jsonData:\r\n      timeInterval: 15s\r\n      exemplarTraceIdDestinations:\r\n
     \       - name: traceID\r\n          datasourceUid: tempo\r\n\r\n  - name: Loki\r\n
     \   type: loki\r\n    uid: loki\r\n    access: proxy\r\n    url: http://loki:3100\r\n
-    \   editable: false\r\n    jsonData:\r\n      derivedFields:\r\n        - datasourceUid:
-    tempo\r\n          matcherRegex: '\"traceId\":\"(\\w+)\"'\r\n          name: TraceID\r\n
-    \         url: '$${__value.raw}'\r\n\r\n  - name: Tempo\r\n    type: tempo\r\n
-    \   access: proxy\r\n    url: http://tempo:3200\r\n    editable: false\r\n    uid:
-    tempo\r\n    jsonData:\r\n      tracesToLogsV2:\r\n        datasourceUid: loki\r\n
-    \       spanStartTimeShift: '-1h'\r\n        spanEndTimeShift: '1h'\r\n        filterByTraceID:
-    true\r\n        filterBySpanID: false\r\n      serviceMap:\r\n        datasourceUid:
-    prometheus\r\n      search:\r\n        hide: false\r\n      nodeGraph:\r\n        enabled:
-    true\r\n"
+    \   editable: false\r\n    jsonData:\r\n      derivedFields:\r\n        # Every
+    service logs \"... [correlationId] [traceId] LEVEL ...\" (32 hex\r\n        #
+    characters between the second pair of brackets, empty outside a trace).\r\n        #
+    A correlation id is a UUID with dashes, so this cannot match one.\r\n        -
+    datasourceUid: tempo\r\n          matcherRegex: '\\[([0-9a-f]{32})\\]'\r\n          name:
+    TraceID\r\n          url: '$${__value.raw}'\r\n\r\n  - name: Tempo\r\n    type:
+    tempo\r\n    access: proxy\r\n    url: http://tempo:3200\r\n    editable: false\r\n
+    \   uid: tempo\r\n    jsonData:\r\n      tracesToLogsV2:\r\n        datasourceUid:
+    loki\r\n        # The span's service.name is the `service` stream label promtail
+    sets.\r\n        tags:\r\n          - key: service.name\r\n            value:
+    service\r\n        spanStartTimeShift: '-1h'\r\n        spanEndTimeShift: '1h'\r\n
+    \       # Adds |= \"<traceId>\" to the query; the id is in every log line.\r\n
+    \       filterByTraceID: true\r\n        filterBySpanID: false\r\n      serviceMap:\r\n
+    \       datasourceUid: prometheus\r\n      search:\r\n        hide: false\r\n
+    \     nodeGraph:\r\n        enabled: true\r\n"
 kind: ConfigMap
 metadata:
   name: grafana-datasources
@@ -1463,6 +1985,261 @@ data:
     \"resilience4j_circuitbreaker_state{state=\\\"half_open\\\"}\", \"legendFormat\":
     \"HALF_OPEN - {{application}} {{name}}\" }\r\n      ],\r\n      \"datasource\":
     \"Prometheus\"\r\n    }\r\n  ]\r\n}\r\n"
+  09-logging-reliability.json: |
+    {
+      "title": "Logging & Reliability",
+      "uid": "ecommerce-logging",
+      "tags": ["ecommerce", "logging", "kafka", "reliability"],
+      "description": "Where a log explosion, a stuck consumer or a filling disk shows first: log volume per service and container, what Promtail, Loki and Tempo shed, dead-letter topics, consumer progress, outbox backlog and disk headroom. Alerts: logging-alerts.yml, kafka-alerts.yml, outbox-alerts.yml, infrastructure-alerts.yml.",
+      "timezone": "browser",
+      "schemaVersion": 38,
+      "refresh": "30s",
+      "time": { "from": "now-3h", "to": "now" },
+      "panels": [
+        {
+          "id": 1, "type": "stat", "title": "Log Events/s (all services)",
+          "description": "logback_events_total, all levels. Warning above 100/s per service, critical above 1000/s.",
+          "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short", "decimals": 1,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }] }
+            }
+          },
+          "targets": [{ "expr": "sum(rate(logback_events_total{group=\"application\"}[5m]))", "legendFormat": "events/s" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 2, "type": "stat", "title": "ERROR Events/s",
+          "description": "Throttled exception handlers log at most 0.1/s per failure site; sustained above 0.5/s warns.",
+          "gridPos": { "x": 4, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short", "decimals": 2,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "red", "value": 10 }] }
+            }
+          },
+          "targets": [{ "expr": "sum(rate(logback_events_total{group=\"application\", level=\"error\"}[5m]))", "legendFormat": "errors/s" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 3, "type": "stat", "title": "Container Logs per Day at This Rate",
+          "description": "All containers Promtail reads (JVMs, Kafka, nginx), extrapolated from the last 5 minutes.",
+          "gridPos": { "x": 8, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "bytes",
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1000000000 }, { "color": "red", "value": 10000000000 }] }
+            }
+          },
+          "targets": [{ "expr": "sum(rate(promtail_custom_log_bytes_total[5m])) * 86400", "legendFormat": "per day" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 4, "type": "stat", "title": "Lines Shed by Promtail/s",
+          "description": "Dropped by the per-container limit (300 entries/s). Non-zero means a container is logging far above normal.",
+          "gridPos": { "x": 12, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short", "decimals": 1,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+            }
+          },
+          "targets": [{ "expr": "sum(rate(logentry_dropped_lines_by_label_total{label_name=\"container\"}[5m])) or vector(0)", "legendFormat": "lines/s" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 5, "type": "stat", "title": "Lines Refused by Loki/s",
+          "description": "loki_discarded_samples_total: rate limits (128 KB/s per stream, 512 KB/s total) and rejected entries.",
+          "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short", "decimals": 1,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.1 }] }
+            }
+          },
+          "targets": [{ "expr": "sum(rate(loki_discarded_samples_total[5m])) or vector(0)", "legendFormat": "lines/s" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 6, "type": "stat", "title": "Dead-Letter Records Retained",
+          "description": "Records in the <topic>.DLT topics that nobody has handled (newest offset minus oldest retained offset).",
+          "gridPos": { "x": 20, "y": 0, "w": 4, "h": 4 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 100 }] }
+            }
+          },
+          "targets": [{ "expr": "sum(kafka_topic_partition_current_offset{topic=~\".+\\\\.DLT\"} - kafka_topic_partition_oldest_offset{topic=~\".+\\\\.DLT\"}) or vector(0)", "legendFormat": "records" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 7, "type": "timeseries", "title": "Log Events/s by Service",
+          "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short", "custom": { "fillOpacity": 10 } } },
+          "targets": [{
+            "expr": "sum by (service) (rate(logback_events_total{group=\"application\"}[1m]))",
+            "legendFormat": "{{service}}"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 8, "type": "timeseries", "title": "ERROR and WARN Events/s by Service",
+          "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short", "custom": { "fillOpacity": 10 } } },
+          "targets": [
+            { "expr": "sum by (service) (rate(logback_events_total{group=\"application\", level=\"error\"}[1m]))", "legendFormat": "ERROR {{service}}" },
+            { "expr": "sum by (service) (rate(logback_events_total{group=\"application\", level=\"warn\"}[1m]))", "legendFormat": "WARN {{service}}" }
+          ],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 9, "type": "timeseries", "title": "Container Log Volume (Promtail, bytes/s)",
+          "description": "Counted before anything is dropped; includes Kafka and nginx.",
+          "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 10 } } },
+          "targets": [{
+            "expr": "sum by (container) (rate(promtail_custom_log_bytes_total[1m]))",
+            "legendFormat": "{{container}}"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 10, "type": "timeseries", "title": "Lines Shed by Promtail, per Container",
+          "gridPos": { "x": 12, "y": 12, "w": 12, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            { "expr": "sum by (label_value) (rate(logentry_dropped_lines_by_label_total{label_name=\"container\"}[1m]))", "legendFormat": "{{label_value}}" },
+            { "expr": "sum by (reason) (rate(promtail_dropped_entries_total[1m]))", "legendFormat": "undeliverable ({{reason}})" }
+          ],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 11, "type": "timeseries", "title": "Loki: Lines Refused by Reason",
+          "gridPos": { "x": 0, "y": 20, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [{
+            "expr": "sum by (reason) (rate(loki_discarded_samples_total[1m]))",
+            "legendFormat": "{{reason}}"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 12, "type": "timeseries", "title": "Loki: Bytes Received/s (limit 512 KB/s)",
+          "gridPos": { "x": 8, "y": 20, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "fillOpacity": 10 } } },
+          "targets": [{ "expr": "sum(rate(loki_distributor_bytes_received_total[1m]))", "legendFormat": "received" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 13, "type": "timeseries", "title": "Tempo: Spans Discarded by Reason",
+          "gridPos": { "x": 16, "y": 20, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [{
+            "expr": "sum by (reason) (rate(tempo_discarded_spans_total[1m]))",
+            "legendFormat": "{{reason}}"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 14, "type": "timeseries", "title": "Dead-Letter Records Retained, per Topic",
+          "gridPos": { "x": 0, "y": 28, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [{
+            "expr": "sum by (topic) (kafka_topic_partition_current_offset{topic=~\".+\\\\.DLT\"} - kafka_topic_partition_oldest_offset{topic=~\".+\\\\.DLT\"})",
+            "legendFormat": "{{topic}}"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 15, "type": "timeseries", "title": "Consumer Lag (a stuck consumer: lag with no commits)",
+          "gridPos": { "x": 8, "y": 28, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [{
+            "expr": "sum by (consumergroup, topic) (kafka_consumergroup_lag)",
+            "legendFormat": "{{consumergroup}} / {{topic}}"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 16, "type": "timeseries", "title": "Consumer Commit Rate (records/s)",
+          "description": "Flat at 0 while the lag next to it is above 0 = stuck (alert KafkaConsumerStuck).",
+          "gridPos": { "x": 16, "y": 28, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [{
+            "expr": "sum by (consumergroup, topic) (rate(kafka_consumergroup_current_offset[5m]))",
+            "legendFormat": "{{consumergroup}} / {{topic}}"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 17, "type": "timeseries", "title": "Outbox: Events Waiting",
+          "description": "Rows written in the request transaction and not yet acknowledged by Kafka.",
+          "gridPos": { "x": 0, "y": 36, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [{ "expr": "outbox_events_pending", "legendFormat": "{{application}}" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 18, "type": "timeseries", "title": "Outbox: Parked Rows and Publish Failures/s",
+          "gridPos": { "x": 8, "y": 36, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [
+            { "expr": "outbox_events_parked", "legendFormat": "parked {{application}}" },
+            { "expr": "sum by (application) (rate(outbox_publish_failures_total[1m]))", "legendFormat": "failures/s {{application}}" }
+          ],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 19, "type": "timeseries", "title": "Outbox: Events Published/s",
+          "gridPos": { "x": 16, "y": 36, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "short" } },
+          "targets": [{ "expr": "sum by (application) (rate(outbox_events_published_total[1m]))", "legendFormat": "{{application}}" }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 20, "type": "timeseries", "title": "Free Space per Disk (%)",
+          "description": "Real filesystems only (tmpfs, overlay, squashfs excluded); mountpoints of one device are folded together.",
+          "gridPos": { "x": 0, "y": 44, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 } },
+          "targets": [{
+            "expr": "100 * min by (device) (node_filesystem_avail_bytes{fstype!~\"tmpfs|ramfs|squashfs|iso9660|overlay|nsfs\"} / node_filesystem_size_bytes{fstype!~\"tmpfs|ramfs|squashfs|iso9660|overlay|nsfs\"})",
+            "legendFormat": "{{device}}"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 21, "type": "timeseries", "title": "Free Space Predicted in 24 h (trend of the last 6 h)",
+          "description": "Below zero = the disk fills within a day (alert HostDiskWillFillWithin24h).",
+          "gridPos": { "x": 8, "y": 44, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "bytes" } },
+          "targets": [{
+            "expr": "min by (device) (predict_linear(node_filesystem_avail_bytes{fstype!~\"tmpfs|ramfs|squashfs|iso9660|overlay|nsfs\"}[6h], 24 * 3600))",
+            "legendFormat": "{{device}}"
+          }],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 22, "type": "timeseries", "title": "Prometheus TSDB Size vs Limit",
+          "gridPos": { "x": 16, "y": 44, "w": 8, "h": 8 },
+          "fieldConfig": { "defaults": { "unit": "bytes" } },
+          "targets": [
+            { "expr": "prometheus_tsdb_storage_blocks_bytes", "legendFormat": "blocks" },
+            { "expr": "prometheus_tsdb_retention_limit_bytes", "legendFormat": "limit" }
+          ],
+          "datasource": "Prometheus"
+        },
+        {
+          "id": 23, "type": "logs", "title": "Recent ERROR Log Lines (Loki)",
+          "description": "Stack traces are one entry each. Click a line for its correlationId, traceId and thread; the traceId opens the trace in Tempo.",
+          "gridPos": { "x": 0, "y": 52, "w": 24, "h": 10 },
+          "options": { "showTime": true, "wrapLogMessage": true, "sortOrder": "Descending", "enableLogDetails": true },
+          "targets": [{ "expr": "{service=~\".+\", level=\"ERROR\"}", "refId": "A" }],
+          "datasource": "Loki"
+        }
+      ]
+    }
 kind: ConfigMap
 metadata:
   name: grafana-dashboards

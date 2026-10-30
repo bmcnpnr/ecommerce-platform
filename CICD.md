@@ -19,7 +19,7 @@ an independent CI project. Ten repositories own their pipeline in
 |---|---|---|
 | Ten Java 25 / Spring Boot services | Maven verify on a Docker-enabled VM (unit tests, Testcontainers integration tests, Pact), JAR and Docker build | Docker Hub image |
 | React / TypeScript frontend | Vitest (391 tests), TypeScript/Vite and Docker build. Playwright e2e on demand (pipeline parameters `run-e2e`, `e2e-base-url`), against an environment that is already running | nginx Docker Hub image |
-| Monitoring configuration | YAML/JSON, Prometheus, Alertmanager validation | Versioned config bundle |
+| Monitoring configuration | YAML/JSON, Prometheus (config and rules), Alertmanager, Loki, Promtail and Tempo validation, and `promtool test rules` unit tests for the alert rules | Versioned config bundle |
 | Platform orchestration | Compose, ShellCheck, PowerShell parser | Versioned deployment bundle |
 
 CI runs for every branch, pull request branch, and Git tag. Docker publishing

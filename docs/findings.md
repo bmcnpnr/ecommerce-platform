@@ -14,7 +14,159 @@ user can act as any other. **Medium** means a real defect or exposure with a
 workaround or a limited blast radius. **Low** means a quality or maintainability
 issue.
 
-## Resolved on 2026-10-30
+## Resilience findings (2026-10-30)
+
+A second pass, on branch `feature/resilience-hardening` across all 13 repositories, looked for
+points of failure: paths where one fault (a dead database, a slow peer, a bad record, a flood of
+requests) grows into a log explosion, a stuck consumer, an exhausted pool, a full disk or a blank
+page. The bar was the 2026-08-15 incident, in which one undeserializable record made
+notification-service write 992 GB of logs in 17 hours. Every finding below was reproduced or
+measured first, then fixed with a test that asserts the correct behaviour, following the
+[resilience fix spec](resilience-fix-spec.md). All ten Java builds pass `mvn verify` with nothing
+skipped: 2,290 unit, slice and pact tests and 898 integration tests against real Postgres, Kafka and
+MongoDB containers. The frontend passes 860 Vitest tests and 40 pact tests with the pact files
+unchanged. The alert rules pass their `promtool` unit tests, and the frontend's nginx config passed
+`nginx -t` and a live test with the gateway missing. On the live compose stack built from the branch,
+`smoke-test.sh` passed 28 of 28, the Playwright suite 25 of 26 functional tests (see the review
+moderation item under "Still open") and 104 of 106 penetration tests (the two misses probed host
+ports held by a stale Kubernetes deployment on the test machine), with no alert firing and an empty
+outbox afterwards.
+
+ID prefixes name the repository: GW api-gateway, DSC service-discovery, USR user, PRD product,
+CAT catalog, REV review, ORD order, PAY payment, SHP shipping, NTF notification, FE frontend,
+MON ecommerce-monitoring, PLT ecommerce-platform. The service pages describe each fix.
+
+### Log explosions
+
+| Point of failure | Measured before the fix | Fix | Findings |
+|---|---|---|---|
+| A dead letter that can't be written (the copy with its exception headers exceeds `max.request.size`) is re-published forever | about 2 rounds/s and 100 stack-trace lines/s, partition blocked: the shape of the 992 GB incident | one `DeadLetterRecoverer` in every consumer: no stack-trace header, a bare copy when still too large, otherwise skip with one ERROR, `kafka_dlt_dropped_total` and the `KafkaDeadLetterDropped` alert | NTF-1, ORD-3 |
+| Catch-all handlers log a stack trace per failed request | gateway: 2,011 lines per 100 requests to a service refusing connections | `LogThrottle`: one ERROR with trace per failure site per 10 s, the rest counted | GW-1, USR-1, PRD-3, REV-6, CAT-8, ORD-10, PAY-3, SHP-4 |
+| A dead dependency is handled as a bug: a 500 and a trace per request | user-service with Postgres stopped: 4 WARN lines per request, and a ~560-line trace per broken transaction | 503 `Service temporarily unavailable` with one WARN without trace per cause and 10 s; Hibernate's JDBC error logger and `TransactionInterceptor` off; a failed rollback with a connection cause is a 503 | USR-1, PRD-3, PRD-4, REV-6, CAT-1, ORD-11, ORD-17, PAY-3, PAY-9, SHP-8 |
+| Lines anyone can trigger at request or consumer rate | bad JWTs: 200 lines for 200 requests; failed logins; unknown ids; duplicate or forged events (Kafka is unauthenticated) | throttled per key | GW-3, USR-4, CAT-8, ORD-13, SHP-5 |
+| Third-party loggers per request | a WARN per request while a route has no instance; a reactor-netty trace per reset connection | muted; the gateway handler writes one line per route and 10 s | GW-1, GW-2 |
+| DEBUG by default, per-event INFO | `com.ecommerce: DEBUG` in the main configs | INFO by default, per-read lines DEBUG | ORD-12, PAY-7, PRD-3, SHP-5, USR-6, DSC-1 |
+| Failures nobody sees | dead-lettering wrote 0 lines; a failed login wrote nothing | one WARN per dead letter per topic and 10 s; throttled failure lines | NTF-2, USR-4 |
+| Every `@Scheduled` run is traced | about 170k traces a day per service for a 500 ms relay | scheduled-task observations excluded | ORD-15, SHP-9 |
+| Promtail ships dropped containers without labels | Loki answered 400, and Promtail logged an error about once a second for as long as it ran | the allow-list is a `docker_sd` filter | MON-4 |
+| Chatty infrastructure | mongod: ~23 lines per healthcheck run; Kafka controller loggers at TRACE | mongod `--quiet`, Kafka loggers at WARN | PLT-7 |
+
+### Lost, duplicated or stuck events
+
+| Point of failure | Effect | Fix | Findings |
+|---|---|---|---|
+| Dual write: events sent inside or after the database transaction | broker down: a request held a connection and a thread for 60 s, then 500; a failed commit published a phantom event, a failed send lost one; ~10 concurrent writes drained the pool | transactional outbox ([ADR-013](adr/ADR-013-transactional-outbox.md)) | ORD-1, PAY-1, SHP-1, SHP-3 |
+| No dead-letter topic in order and shipping | a database blip gave 10 immediate attempts, then the record was dropped: a paid order never got its shipment | infrastructure failures back off from 1 s to 30 s for as long as needed; anything else is retried twice, then goes to `<topic>.DLT` | ORD-2, SHP-2 |
+| Kafka client defaults | a dead broker blocked each send for 60 s; consumers reconnected every 50 ms with 3 lines each | bounded producer and reconnect settings (rule K3) | NTF-3, ORD-1, SHP-3 |
+| A transient dead-letter failure | 3 stack traces per round in order-service | the shared recoverer and a silent producer listener | ORD-18 |
+| Consumers that weren't race-safe | duplicate history rows and events | state guards; a lost unique-key race counts as done | SHP-1, SHP-7, ORD-13 |
+| Dead-letter producers never closed | threads and connections leaked on context close | closed on shutdown | NTF-4 |
+
+### Exhausted threads, connections and memory
+
+| Point of failure | Effect | Fix | Findings |
+|---|---|---|---|
+| Remote calls or BCrypt inside a database transaction; `open-in-view` | a slow product-service plus 10 concurrent requests drained the pool and stalled every endpoint; a connection was held across 40 ms of BCrypt | remote and CPU work outside transactions, short programmatic transactions, `open-in-view: false` | ORD-4, REV-1, USR-2, SHP-11 |
+| Spring Cloud CircuitBreaker defaults | a 1 s TimeLimiter and one thread per CPU: slower calls failed, 2 concurrent calls in a 2-CPU container, 404 checks stopped matching | thread pool, TimeLimiter and bulkhead disabled; one breaker per client; slow-call opening | ORD-8, REV-2, CAT-3 |
+| Breakers that never ran | fallbacks unused; an open breaker became a 500 with a trace; payment's order lookup had no breaker | breakers enabled with typed fallbacks (503, 502, 404) | ORD-7, REV-3, CAT-3, PAY-2 |
+| Hidden HTTP retries (R-6) | Apache HttpClient 5 re-sent on a 503 or a reset, doubling the load on a struggling peer | automatic retries disabled | ORD-9, REV-4 |
+| Unbounded waits | Hikari 30 s per request; no pgjdbc socket timeout (a frozen database held threads for minutes); a stock row lock without timeout; MongoDB 30 s server selection with no socket timeout | Hikari 5 s; pgjdbc connect 5 s, socket 30 s, keepalive; lock timeout 5 s → 503; MongoDB 3/2/5/2 s and `maxTimeMS` 4 s | USR-5, PRD-1, PRD-2, PRD-9, REV-8, CAT-1, SHP-6, SHP-7, ORD-19, PAY-9 |
+| A gateway without limits | an upstream that never answered held the connection forever; pooled connections the service had closed failed; an anonymous POST declaring 300 MB was buffered before authentication and got no answer | response timeout 20 s → 504; pool idle 20 s and life 5 m; a 1 MB `WebFilter` → 413; idle timeout 2 m | GW-4, GW-5, GW-6, GW-8 |
+| Netty direct memory sized like the heap | heap plus direct memory could reach 848 MiB in a 768 MiB container | `-XX:MaxDirectMemorySize=128m` | PLT-9 |
+| Unbounded BCrypt | 42 ms of CPU per attempt: ~47/s saturates a 2-CPU pod, and the health probe starves | one hash per CPU, 32 waiting, then 503 with `Retry-After` | USR-3 |
+| No body limit in the services | | 413 above 1 MB | PRD-6, REV-7, CAT-7 |
+
+### Data integrity under failure
+
+| Point of failure | Effect | Fix | Findings |
+|---|---|---|---|
+| A declined payment kept its stock reserved (I-4) | the simulated gateway declines 20 % of payments | the cancellation commits, then the stock is returned once, also on replay | I-4 |
+| Abandoned carts | every cart holds reserved stock forever | `PENDING` carts expire after 24 h through the normal cancel path | ORD-16 |
+| A retry of a declined payment | a retry before order-service consumed `payment.failed` was charged, and the order was then cancelled and its stock returned | a `FAILED` payment is final for its order: 409 | PAY-8, FE-20 |
+| No optimistic locking on orders | two concurrent cancels returned the stock twice; totals overwritten | `@Version` → 409 | ORD-5 |
+| No compensation inside a request | stock leaked when a line couldn't be saved; a cancel returned stock before its commit | release on a failed save; commit first, then return | ORD-6 |
+| Concurrent shipment status changes | duplicate history and events; a terminal state overwritten | row lock with a 5 s timeout | SHP-7 |
+| Catalog sync during an outage | category names overwritten with null; implausible prices (`1E+999999999`) stored or crashing the sync | keep the stored name; validate peer data → 502 | CAT-4, CAT-5 |
+| 32-bit transaction ids | a collision after ~10⁴–10⁵ payments failed an approved payment's commit | 64 bits | PAY-4 |
+| Two replicas seeding the admin | the loser failed startup | the race is tolerated | USR-7 |
+| `int` stock arithmetic | an overflow gave a misleading 409 | `long`, 400 when out of range | PRD-7 |
+
+### Unbounded input and results
+
+| Point of failure | Effect | Fix | Findings |
+|---|---|---|---|
+| Unpaged lists | every product of a category; every review with a query per review (10,000 reviews: over 10,000 queries); every catalog entry; every order and payment of a customer | `page`/`size`, default and maximum 100, still JSON arrays; the SPA asks for the next page on "Show more" | PRD-5, REV-5, CAT-6, ORD-14, PAY-5, FE-15, FE-19 |
+| Unbounded fields | `q` unbounded (a NUL gave 500); descriptions unbounded; 200+ lines pushed `order.placed` past 1 MB; totals overflowing `NUMERIC(19,4)` | caps → 400 | PRD-6, CAT-6, ORD-14, FE-16 |
+| Log forging through input | a SKU with CR/LF forged log lines | sanitized | PRD-8 |
+
+### Startup, health and shutdown
+
+| Point of failure | Effect | Fix | Findings |
+|---|---|---|---|
+| The catalog initializer blocked startup on MongoDB | a crash loop while MongoDB was down; an index conflict never healed | background retries from 1 s to 30 s; the service starts without MongoDB | CAT-2 |
+| Health `UP` with the broker down | | readiness includes the listeners; in k8s the startup probe uses liveness, and a NotReady pod is still scraped | NTF-5, PLT-10 |
+| Loki's 4 GB WAL replay ceiling in a 512 MB container | OOM-killed on every restart after a flood | 192 MB ceiling, startup probe | MON-2 |
+| 1 s probe timeouts in k8s | a stall on a busy node restarted healthy JVMs | 5 s | PLT-4 |
+| Kafka and kafka-ui kept running after an OOM | half-dead containers | exit on OOM | PLT-5 |
+| The blocking Docker log driver | a slow disk froze application threads inside the logger | non-blocking with an 8 MB buffer | PLT-6 |
+| Shutdown cut short | compose killed JVMs after Docker's 10 s default; k8s's 60 s was below drain + graceful phase + relay (65 s) | `stop_grace_period` 60 s; `terminationGracePeriodSeconds` 90 | PLT-11 |
+| Startup arguments (A-5) | user-service ignored them | passed through | USR-8 |
+
+### Storage and monitoring
+
+| Point of failure | Effect | Fix | Findings |
+|---|---|---|---|
+| Storage bounded by time only | Loki accepted 16 MB/s for 31 days, so the 992 GB flood was stored in full; Tempo's worst case was 2.6 TB; Prometheus and Kafka had no size limit | Loki 0.5 MB/s and 128 KB/s per stream, Tempo 1 MB/s, Prometheus 5 GB, Kafka 128 MiB per partition, Promtail 300 lines/s per container | MON-1, MON-3, PLT-1, PLT-2, MON-5 |
+| A fragile Promtail | two log layouts (O-3); stack traces split into one entry per line; positions in `/tmp`, so a recreate re-read every log; 8.5 minutes of retries stalling all shipping | one parser for the single log pattern in compose and k8s (parity-checked), multiline, a positions volume, 85 s of retries | MON-5, MON-6, MON-7, PLT-3 |
+| No alerts for these failure modes | nothing alerted on log volume, discards, dead letters, stuck consumers, the outbox, pool timeouts or filling disks | 31 new rules (58 in total), with `promtool` unit tests in CI | MON-8, MON-12 |
+| Alerts that could not fire (O-4) | isolated deadlocks, leaderless partitions, the Docker disk, half-open breakers | rewritten and tested | MON-9 |
+| The k8s frontend nginx config | none of S-6, S-7 or the timeouts applied on k8s | synced to the compose image, parity-checked | PLT-8 |
+| Log and trace links | Grafana couldn't jump from a log line to its trace | derived field and tags fixed, a logging dashboard | MON-10 |
+| CI | nothing validated Loki, Promtail, Tempo or the manifests | validation stages | MON-11 |
+
+### Frontend
+
+| Point of failure | Effect | Fix | Findings |
+|---|---|---|---|
+| No error boundary | any render error blanked the whole app | a top-level boundary and one per routed page | FE-1 |
+| Stale chunks after a redeploy | a white page | one reload per 30 s, `index.html` revalidated | FE-2, FE-12 |
+| Retries and redirects | 4xx retried (a 404 sent twice); a reload loop on `/login`; an expired session broke login | one jittered retry for network and 5xx errors only; no redirect from `/login` | FE-3, FE-13, FE-14 |
+| Double submits | Place Order, Clear Cart and stock changes ran twice; two quick adds made two carts | single-flight | FE-4 |
+| Trusted browser storage | a corrupt saved session crashed every start; blocked storage broke every API call | validated, migrated and guarded | FE-5, FE-17 |
+| Data the types don't promise | crashes on null fields, `$NaN` | null-safe rendering | FE-6 |
+| A dead saved cart | every Add to Cart failed forever | heals on 404, 403 or a closed status | FE-7, FE-8 |
+| An outage shown as "empty" | "Your cart is empty", "No orders yet" during an outage | error panel and Retry | FE-9, FE-10 |
+| nginx with the gateway down | an HTML 502 after 60 s; a timed-out GET replayed | 5 s connect, 35 s read, no replay, a JSON 503 | FE-11 |
+| Access log volume | dominated by successful asset hits | only failed asset requests logged | FE-18 |
+
+**Existing findings closed by this pass:** R-1, R-2, R-3, R-4, R-6, I-4 and O-3 are fixed, and so is
+A-5. O-2 is partly fixed: every log line carries its trace id, but traces still stop at Feign and
+Kafka hops. O-4 is partly fixed: the alerts can fire, but the gateway dashboard's route panels are
+unchanged. I-5's stock lock now waits at most 5 s.
+
+**Still open after this pass:**
+
+- Stock deltas aren't idempotent. A timed-out reservation or release has an unknown outcome, and a crash between a cancellation's commit and its stock release leaks stock. A fix needs an idempotency key in product-service, which is a contract change.
+- `CONFIRMED` orders that are never paid hold their stock until someone cancels them. If `payment.failed` is lost, the order stays `CONFIRMED` and can't be paid. Money taken for a cancelled order is only logged ("may need a refund"); refunds aren't automated (I-10).
+- The outbox keeps per-key order only with one relay per service. The relay holds a database connection while it waits for Kafka.
+- Alerts still notify no one (O-1).
+- Loki and Tempo are bounded by rate times retention, not by size: about 44 GB a day of raw logs at the cap, kept 31 days. Shortening the retention is a choice.
+- On Docker Desktop's kubeadm Kubernetes, node container logs grow without limit unless `daemon.json` sets `log-opts` ([k8s README](../k8s/README.md)). That was the 992 GB incident's path.
+- No per-client rate limiting anywhere (nginx sees one address for everyone; the gateway has none). Public tracking reads the database for anonymous callers.
+- user-, order-, payment- and shipping-service rely on the gateway's 1 MB body cap, and compose publishes their ports (S-5).
+- With Eureka down, every client logs about 4 lines a second (third-party, bounded by the heartbeat).
+- notification-service's seven consumers share one group, and `auto.offset.reset=earliest` replays retained events after offsets expire.
+- The SPA reports caught render errors nowhere, and removing a cart line is still cancel-and-recreate.
+- **Review moderation can't work through the gateway** (found by the live run; caused by the security fixes,
+  not by this pass). On public `GET` routes the gateway forwards no identity, even with a valid token, so
+  `GET /api/v1/reviews/product/{id}?approvedOnly=false` never sees `X-User-Role: ADMIN`. The admin Reviews page
+  lists no pending reviews (`admin.spec.ts` fails), and authors don't see their own pending review. Fix: on
+  public routes, validate a token if one is present and set the identity headers from it (anonymous
+  otherwise), then check what an admin identity changes on product and catalog reads.
+- Two Playwright penetration tests probe Eureka (`:8761`) and Grafana (`:3001`) directly, so they only mean
+  something where those ports belong to the stack under test.
+
+## Resolved on 2026-10-30 (security)
 
 The security fixes on branch `feature/security-hardening`, across all 13 repositories. The rules every
 service follows are in the [security fix spec](security-fix-spec.md), and [Security](security.md) describes the result.
@@ -71,7 +223,7 @@ Deprecation status after these changes:
 
 ## Overview
 
-The table is the state found in October 2026. For what has been fixed since, see [Resolved on 2026-10-30](#resolved-on-2026-10-30).
+The table is the state found in October 2026. For what has been fixed since, see [Resilience findings (2026-10-30)](#resilience-findings-2026-10-30), [Resolved on 2026-10-30 (security)](#resolved-on-2026-10-30-security) and [Resolved on 2026-10-29](#resolved-on-2026-10-29).
 
 | ID | Finding | Area | Severity | Verified |
 |---|---|---|---|---|
@@ -204,6 +356,10 @@ second time and publishes a duplicate `order.cancelled`. **Fix:**
 - Let payment-service refund on `order.cancelled`, and shipping-service cancel the shipment.
 - Expire stale `PENDING` carts with a scheduled job.
 
+**2026-10-30:** a declined payment cancels the order and returns its stock once (I-4 fixed), the
+payment can't be retried for that order (PAY-8), and `PENDING` carts expire after 24 h (ORD-16).
+Refunds and shipment cancellation (I-10) are still missing.
+
 **I-5. Oversell race.** Pinned by the disabled `ProductApiIT.concurrentDecrements_neverOversell`: 40 concurrent `-1` updates
 against stock 10 all succeed. **Fix:** make the update atomic, for example
 `UPDATE products SET stock_quantity = stock_quantity + :delta WHERE id = :id AND stock_quantity + :delta >= 0`
@@ -243,23 +399,30 @@ in 30 seconds, around 3.9 GB of logs a minute) and the partition stays blocked. 
 - Give every listener factory a `DefaultErrorHandler` with a `DeadLetterPublishingRecoverer` (topics `<topic>.DLT`) and a back-off.
 - Alert on DLT growth.
 
+**Fixed (2026-10-29 and 2026-10-30):** all three consumers dead-letter with back-off, the dead-letter write itself can no longer loop (NTF-1, ORD-3), and DLT growth, floods and drops are alerted on. See [Resilience findings](#resilience-findings-2026-10-30).
+
 **R-2. Dual writes.** **Fix:** a transactional outbox table polled or tailed by
 a relay. At minimum, send after commit (`TransactionSynchronization`) and log
-send failures loudly.
+send failures loudly. **Fixed 2026-10-30:** a transactional outbox in order-,
+payment- and shipping-service ([ADR-013](adr/ADR-013-transactional-outbox.md)).
 
 **R-3.** Guard consumers by state (see I-1) and record processed event IDs, or
-rely on the state machine, so that a replay is harmless.
+rely on the state machine, so that a replay is harmless. **Fixed:** order-service's
+consumer is state-guarded, and shipping-service creates one shipment per order and
+treats a replay or a lost unique-key race as already done.
 
 **R-4.** `spring.cloud.openfeign.circuitbreaker.enabled` is never set, so `ProductServiceClientFallback` and the resilience4j configuration are dead in order, review and catalog.
 Pinned by the disabled `ReviewApiIT.productClient_whenProductServiceFails_goesThroughTheFallback`. The 404 that becomes 500 is pinned by
 `ReviewApiIT.unknownProduct_isAClientError` and by the catalog's `ProductServiceFailureIT` test "syncing a product that does not exist upstream is a 404".
 **Fix:** either set `spring.cloud.openfeign.circuitbreaker.enabled=true`
 (catalog, review) or use resilience4j annotations as order-service does. Map
-product-service 404 to 404 instead of 500.
+product-service 404 to 404 instead of 500. **Fixed 2026-10-30:** every Feign caller
+runs through a Spring Cloud breaker with typed fallbacks (404 stays 404, no answer is
+503, a bad answer 502), with the default TimeLimiter and bulkhead disabled (ORD-8, REV-2, CAT-3).
 
 **R-6. Hidden GET retry.** The Feign clients run on Apache HttpClient 5, whose default retry strategy re-sends an idempotent `GET` once on a 503 or a reset connection, underneath
 Feign's own `Retryer`. The `FeignConfig` comments say only connect failures are retried. It shows up as two requests at the wire in
-`ReviewApiIT` and `ProductServiceFailureIT`. **Fix:** set the client's retry strategy explicitly (disable it, or keep it and fix the comments).
+`ReviewApiIT` and `ProductServiceFailureIT`. **Fix:** set the client's retry strategy explicitly (disable it, or keep it and fix the comments). **Fixed 2026-10-30:** automatic retries are disabled in order, review and catalog; ITs assert exactly one request per call.
 
 **R-5.** Declare topics with `NewTopic` beans and several partitions. The key
 is already the order ID, so per-order ordering survives.
@@ -270,12 +433,18 @@ is already the order ID, so per-order ordering survives.
 webhook) and fix the unreachable routes. See [Observability](observability.md#known-gaps).
 
 **O-2.** Add `feign-micrometer`, enable Kafka observation on templates and
-listeners, and print `traceId`/`spanId` in every log pattern.
+listeners, and print `traceId`/`spanId` in every log pattern. **Partly fixed
+2026-10-30:** every log line carries its trace id, and Grafana links logs and traces;
+Feign and Kafka hops still aren't traced.
 
 **O-3.** Use one log pattern everywhere, or JSON logs, and one promtail parser.
+**Fixed 2026-10-30:** one pattern in every service and one Promtail pipeline,
+parity-checked between compose and k8s.
 
 **O-4.** Remove or rewrite the alerts that can't fire, and base the gateway
-panels on `http_client_requests_seconds` by route ID.
+panels on `http_client_requests_seconds` by route ID. **Partly fixed 2026-10-30:**
+the alerts are rewritten and unit-tested with `promtool` (MON-9); the gateway's
+route panels are unchanged.
 
 ### Frontend and API
 
@@ -337,7 +506,7 @@ It found the holes below. Every one is pinned by a test that asserts the secure 
 `it.fails` in Vitest, `test.fail(true, 'S-<n>: ...')` in Playwright. Each was run enabled and seen failing for the stated reason.
 Ids that would duplicate an older finding reuse it (S-1, S-3, S-4, S-6 to S-11, I-1, I-2, I-6, I-8 are re-pinned at more levels).
 
-**Status:** all of these were fixed on 2026-10-30 except S-5, S-7 (token storage), S-15 and S-16; see [Resolved on 2026-10-30](#resolved-on-2026-10-30).
+**Status:** all of these were fixed on 2026-10-30 except S-5, S-7 (token storage), S-15 and S-16; see [Resolved on 2026-10-30 (security)](#resolved-on-2026-10-30-security).
 
 ### High and medium
 
@@ -449,6 +618,12 @@ flowchart LR
 3. **Messaging reliability.** Dead-letter topics first, because they are cheap and prevent the worst incident this platform has had. Then the outbox and the compensating events.
 4. **Operability.** Deliver alerts, connect traces end to end, and run the end-to-end suites in a pipeline.
 5. **Product completeness.** Addresses, catalog sync by events, admin endpoints, the SPA fixes, and a real notification channel.
+
+Status on 2026-10-30: steps 1 and 2 are done apart from the open security items (S-5, S-7, S-15,
+S-16). From step 3, the dead-letter topics, the outbox and the stock compensation are done; refunds
+and shipment cancellation (I-10) are not. From step 4, the alerts exist and are tested but nothing
+delivers them (O-1), traces still stop at Feign and Kafka hops, and no pipeline runs the end-to-end
+suites (T-2).
 
 Each fix that changes a contract between services needs a pact update
 (`ecommerce-platform/sync-pacts.sh`), and the [Event catalog](events.md) and

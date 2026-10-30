@@ -62,8 +62,10 @@ Kubernetes.
 
 | Document | Contents |
 |---|---|
-| [Architecture decisions](adr/README.md) | 12 ADRs reconstructed from the code: why the platform looks the way it does |
-| [Findings and roadmap](findings.md) | Prioritized bugs, security gaps and technical debt found while writing these docs, with suggested fixes |
+| [Architecture decisions](adr/README.md) | 13 ADRs: twelve reconstructed from the code, plus the transactional outbox (ADR-013) |
+| [Findings and roadmap](findings.md) | Prioritized bugs, security gaps, points of failure and technical debt, what was fixed when, and what is still open |
+| [Security fix spec](security-fix-spec.md) | The rules every service follows for identity, authorization, input and errors (2026-10-29) |
+| [Resilience fix spec](resilience-fix-spec.md) | The rules every service follows so that one fault stays one fault: logging budget, Kafka error handling and outbox, timeouts and breakers, bounded storage, frontend recovery (2026-10-30) |
 
 ## About these docs
 

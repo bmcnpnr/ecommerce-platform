@@ -139,6 +139,24 @@ spec:
               value: "1"
             - name: KAFKA_HEAP_OPTS
               value: -Xmx640m -Xms320m
+            # A broker that hits OutOfMemoryError stays up but half-dead; exit so
+            # the kubelet restarts it (the JVM services do the same).
+            - name: KAFKA_OPTS
+              value: -XX:+ExitOnOutOfMemoryError
+            # Disk bound, same values and reasoning as docker-compose.yml.
+            # log.retention.bytes is per partition (every topic has one) and only
+            # closed segments are deleted, hence the 32 MiB segments: a runaway
+            # producer is capped at ~160 MiB per topic, 14 topics (7 + their .DLT)
+            # stay far under the 5Gi PVC.
+            - name: KAFKA_LOG_RETENTION_BYTES
+              value: "134217728"
+            - name: KAFKA_LOG_SEGMENT_BYTES
+              value: "33554432"
+            - name: KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS
+              value: "60000"
+            # cp-kafka defaults kafka.controller and state.change.logger to TRACE.
+            - name: KAFKA_LOG4J_LOGGERS
+              value: kafka.controller=WARN,state.change.logger=WARN,kafka.log.LogCleaner=WARN
             # Only applied when formatting an empty data volume; an already
             # formatted volume keeps the cluster id written into meta.properties.
             - name: CLUSTER_ID

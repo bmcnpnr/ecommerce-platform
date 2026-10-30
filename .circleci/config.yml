@@ -23,6 +23,9 @@ jobs:
           name: Parse PowerShell automation
           command: docker build --target powershell-validation --file .circleci/validate.Dockerfile .
       - run:
+          name: Parse Kubernetes manifests
+          command: docker build --target manifest-validation --file .circleci/validate.Dockerfile .
+      - run:
           name: Package deployment manifests
           command: |
             mkdir -p artifacts

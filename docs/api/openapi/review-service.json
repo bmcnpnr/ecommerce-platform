@@ -28,7 +28,7 @@
         "tags": [
           "Reviews"
         ],
-        "summary": "Get review by ID",
+        "summary": "Get review by ID (unapproved reviews: author or admin only)",
         "operationId": "getById",
         "parameters": [
           {
@@ -38,6 +38,22 @@
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -75,8 +91,7 @@
             "in": "header",
             "required": false,
             "schema": {
-              "type": "string",
-              "default": "anonymous"
+              "type": "string"
             }
           }
         ],
@@ -129,8 +144,7 @@
             "in": "header",
             "required": false,
             "schema": {
-              "type": "string",
-              "default": "anonymous"
+              "type": "string"
             }
           },
           {
@@ -138,8 +152,7 @@
             "in": "header",
             "required": false,
             "schema": {
-              "type": "string",
-              "default": "CUSTOMER"
+              "type": "string"
             }
           }
         ],
@@ -168,8 +181,7 @@
             "in": "header",
             "required": false,
             "schema": {
-              "type": "string",
-              "default": "anonymous"
+              "type": "string"
             }
           }
         ],
@@ -224,8 +236,7 @@
             "in": "header",
             "required": false,
             "schema": {
-              "type": "string",
-              "default": "anonymous"
+              "type": "string"
             }
           }
         ],
@@ -287,6 +298,22 @@
                 "REJECTED"
               ]
             }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -313,7 +340,7 @@
         "tags": [
           "Reviews"
         ],
-        "summary": "Get reviews by product",
+        "summary": "Get reviews by product, one page of at most 100 (approvedOnly=false is honoured for admins only)",
         "operationId": "getByProduct",
         "parameters": [
           {
@@ -332,6 +359,34 @@
             "schema": {
               "type": "boolean",
               "default": true
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 0
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 100
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -389,13 +444,49 @@
         "tags": [
           "Reviews"
         ],
-        "summary": "Get reviews by customer",
+        "summary": "Get reviews by customer, one page of at most 100 (unapproved reviews: that customer or admin only)",
         "operationId": "getByCustomer",
         "parameters": [
           {
             "name": "customerId",
             "in": "path",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 0
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 100
+            }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -432,7 +523,8 @@
           "body": {
             "type": "string",
             "maxLength": 2000,
-            "minLength": 10
+            "minLength": 10,
+            "pattern": "^[^\\u0000]*$"
           },
           "rating": {
             "type": "integer",
@@ -443,7 +535,8 @@
           "title": {
             "type": "string",
             "maxLength": 255,
-            "minLength": 3
+            "minLength": 3,
+            "pattern": "^[^\\u0000]*$"
           }
         }
       },
@@ -503,7 +596,8 @@
           "body": {
             "type": "string",
             "maxLength": 2000,
-            "minLength": 10
+            "minLength": 10,
+            "pattern": "^[^\\u0000]*$"
           },
           "productId": {
             "type": "integer",
@@ -518,7 +612,8 @@
           "title": {
             "type": "string",
             "maxLength": 255,
-            "minLength": 3
+            "minLength": 3,
+            "pattern": "^[^\\u0000]*$"
           }
         },
         "required": [

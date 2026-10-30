@@ -49,21 +49,24 @@ are always present, and `fieldErrors` is `null` except on bean-validation failur
 | missing identity | 401 | `Unauthorized` | `Authentication required` |
 | not the owner / not `ADMIN` | 403 | `Forbidden` | `Access denied` |
 | `IllegalStatusTransitionException` (`PATCH /status`) | 409 | `Conflict` | `Cannot change order status from <A> to <B>` |
-| `BadRequestException` (`customerId`, `quantity`) | 400 | `Bad Request` | e.g. `quantity must be between 1 and 1000` |
+| `OptimisticLockingFailureException` (another request changed the same order first: add item, confirm, cancel, status) | 409 | `Conflict` | `The order was modified by another request` |
+| `BadRequestException` (`customerId`, `quantity`, `page`, `size`) | 400 | `Bad Request` | e.g. `quantity must be between 1 and 1000`, `page must be at least 0 and size between 1 and 100` |
 | `UpstreamDataException` (missing or non-positive product price) | 502 | `Bad Gateway` | `Product price is not available` |
-| `InvalidOrderStateException` (state rules, stock pre-check) | 400 | `Bad Request` | Rule-specific, listed per endpoint |
+| `InvalidOrderStateException` (state rules, line and total limits, stock pre-check) | 400 | `Bad Request` | Rule-specific, listed per endpoint |
 | `MethodArgumentNotValidException` (`@Valid` body) | 400 | `Bad Request` | `Validation failed`, plus `fieldErrors` |
 | `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | `Request method not supported` |
 | `HttpMediaTypeNotSupportedException` / not acceptable / unmapped path | 415 / 406 / 404 | | `Unsupported content type` / `Requested media type not acceptable` / `Resource not found` |
 | `MissingServletRequestParameterException`, other `ServletRequestBindingException`, `HttpMessageNotReadableException` (missing or malformed body), `MethodArgumentTypeMismatchException` (non-numeric id, unknown enum) | 400 | `Bad Request` | `Malformed request body`, `Invalid value for parameter '<name>'`, `Missing required parameter '<name>'` or `Invalid request` |
 | `FeignException` from product-service with status 404 / 400 / 409 | 404 / 400 / 409 | reason phrase | `Downstream service call failed: resource not found` / `request rejected` |
-| `FeignException` with status 503, or -1 (no response: connect failure after retries, read timeout) | 503 | `Service Unavailable` | `Downstream service call failed: service unavailable` |
+| `FeignException` with status 503, or -1 (no response: connect failure after retries, read timeout), and an open product-service circuit breaker (`CallNotPermittedException`) | 503 | `Service Unavailable` | `Downstream service call failed: service unavailable` |
 | `FeignException` with any other status (500, 401, 422, ...) | 502 | `Bad Gateway` | `Downstream service call failed` |
-| Other `RuntimeException` whose message contains `unavailable` | 503 | `Service Unavailable` | the exception message. Only the unwired Feign fallback throws such a message, so in practice this branch is not reached. |
-| Any other `RuntimeException`, including an open circuit breaker (`CallNotPermittedException`), `KafkaException` on publish, database errors | 500 | `Internal Server Error` | `An unexpected error occurred` |
+| A dependency of this service does not answer: the database (connection wait over 5 s, lock timeout, a connection lost during commit or rollback), a Kafka timeout | 503 | `Service Unavailable` | `Service temporarily unavailable` |
+| Any other `RuntimeException` | 500 | `Internal Server Error` | `An unexpected error occurred` |
 | Any other `Exception` | 500 | `Internal Server Error` | `An unexpected error occurred` |
 
-**Pagination.** None. The list endpoint returns a plain JSON array.
+A 503 writes one WARN per exception class per 10 s, with the root cause and no stack trace. A 500 writes one ERROR with its stack trace per failure site per 10 s.
+
+**Pagination.** Only the customer's order list is paged: optional `page` (from 0, default 0) and `size` (1 to 100, default 100), newest first (by order id, descending). It still returns a plain JSON array, so a client that sends no parameter gets the newest 100 orders. A `page` below 0 or a `size` outside 1 to 100 is 400, not clamped.
 
 **Formats.**
 - `LocalDateTime` values (`orderDate`, `timestamp`) are ISO-8601 strings with no offset, for example
@@ -92,12 +95,12 @@ ADMIN_AUTH="Authorization: Bearer $ADMIN_TOKEN"   # login as admin with ADMIN_PA
 | GET | `/api/v1/orders/hello` | Bearer JWT | authenticated | Greeting text |
 | POST | `/api/v1/orders` | Bearer JWT | `customerId` is the caller, or any for `ADMIN`; validated | Create a PENDING order |
 | GET | `/api/v1/orders/{orderId}` | Bearer JWT | owner or `ADMIN` | Get an order |
-| GET | `/api/v1/orders/customer/{customerId}` | Bearer JWT | that customer or `ADMIN` | List a customer's orders |
-| POST | `/api/v1/orders/{orderId}/items` | Bearer JWT | owner or `ADMIN`; status PENDING; quantity 1 to 1000; stock pre-check | Add a line, reserve stock |
+| GET | `/api/v1/orders/customer/{customerId}` | Bearer JWT | that customer or `ADMIN`; `page` at least 0, `size` 1 to 100 | List a customer's orders, newest first |
+| POST | `/api/v1/orders/{orderId}/items` | Bearer JWT | owner or `ADMIN`; status PENDING; quantity 1 to 1000; at most 200 lines; total at most 999999999999999.9999; stock pre-check | Add a line, reserve stock |
 | POST | `/api/v1/orders/{orderId}/products` | Bearer JWT | same as `/items` | Legacy add-line |
-| POST | `/api/v1/orders/{orderId}/confirm` | Bearer JWT | owner or `ADMIN`; status PENDING; at least one item | Confirm, publish `order.placed` |
+| POST | `/api/v1/orders/{orderId}/confirm` | Bearer JWT | owner or `ADMIN`; status PENDING; at least one item | Confirm, publish `order.placed` (through the outbox) |
 | PATCH | `/api/v1/orders/{orderId}/status` | `ADMIN` | `ADMIN`; transition table (409) | Set status |
-| DELETE | `/api/v1/orders/{orderId}` | Bearer JWT | owner or `ADMIN`; status not CANCELLED/SHIPPED/DELIVERED | Cancel, return stock, publish `order.cancelled` |
+| DELETE | `/api/v1/orders/{orderId}` | Bearer JWT | owner or `ADMIN`; status not CANCELLED/SHIPPED/DELIVERED | Cancel, publish `order.cancelled` (through the outbox), then return stock |
 | GET | `/internal/v1/orders/{orderId}` | not routed | none | The `OrderDTO`, for payment-service's order check |
 
 ## GET /api/v1/orders/hello
@@ -208,27 +211,33 @@ curl -s -H "$AUTH" "$GW/api/v1/orders/42"
 
 ## GET /api/v1/orders/customer/{customerId}
 
-Lists every order stored under `customerId`, in all statuses, including the CANCELLED orders the frontend leaves
-behind when it removes a cart item.
+Lists the orders stored under `customerId`, in all statuses, including the CANCELLED orders the frontend leaves
+behind when it removes a cart item and the carts the expiry job cancelled. Newest first, one page at a time.
 
-**Auth:** `{customerId}` must equal `X-Username`, or the caller is `ADMIN`; otherwise 403.
+**Auth:** `{customerId}` must equal `X-Username`, or the caller is `ADMIN`; otherwise 403. The check comes before the
+`page` and `size` validation.
 
 **Path / query parameters**
 
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
 | `customerId` | path | string | yes | — | Matched exactly against `orders.customer_id` |
+| `page` | query | integer (int32) | no | `0` | At least 0, else 400 |
+| `size` | query | integer (int32) | no | `100` | 1 to 100, else 400 (a larger value is rejected, not clamped) |
 
 **Responses**
-- `200 OK`: a JSON array of [`OrderDTO`](#orderdto). The array is empty if nothing matches (never 404), has no
-  pagination and comes in no defined order.
+- `200 OK`: a JSON array of [`OrderDTO`](#orderdto), at most `size` long, ordered by `orderId` descending (newest first).
+  The array is empty if nothing matches or the page is past the end (never 404). It is still a plain array: to read
+  further back, ask for `page=1`, `page=2` and so on until a page comes back shorter than `size`.
+- `400`: `page must be at least 0 and size between 1 and 100`, or a non-numeric `page` or `size` (`Invalid value for
+  parameter 'size'`).
 
 **Side effects:** none.
 
 **Example**
 
 ```bash
-curl -s -H "$AUTH" "$GW/api/v1/orders/customer/alice"
+curl -s -H "$AUTH" "$GW/api/v1/orders/customer/alice?page=0&size=20"
 ```
 
 ## POST /api/v1/orders/{orderId}/items
@@ -298,21 +307,32 @@ line or change its quantity.
 - `400`: body missing or malformed JSON.
 - `404`: `Order not found: <orderId>`.
 - `400`: `Cannot add items to order in status: <STATUS>`. Only PENDING orders accept items.
-- `502`: product-service returned a missing or non-positive price (`Product price is not available`); no stock moves.
-- `404`: product unknown to product-service (`Downstream service call failed: ...`). The smoke test asserts this.
+- `400`: `An order can have at most 200 lines`. Checked before any call to product-service.
+- `404`: product unknown to product-service (`Downstream service call failed: resource not found`). The smoke test
+  asserts this.
+- `503`: product-service gave no answer: unreachable after 3 connection attempts, read timeout (10 s), no instance
+  registered, or its circuit breaker is open (`Downstream service call failed: service unavailable`).
+- `502`: product-service answered 5xx or another unexpected status, or returned a missing or non-positive price
+  (`Product price is not available`); no stock moves.
+- `400`: `The order total is too large`. The line would take `totalAmount` above 999999999999999.9999 (the limit of
+  `NUMERIC(19,4)`); no stock moves.
 - `400`: `Insufficient stock for product <sku>. Available: <n>`, from order-service's own pre-check.
 - `400`: product-service refused the reservation because stock would go below zero
-  (`Downstream service call failed: ...Insufficient stock...`).
-- `503`: product-service unreachable after 3 connection attempts, read timeout (10 s), or no instance registered.
-- `502`: product-service answered 5xx or another unexpected status.
-- `415`: non-JSON `Content-Type`.
-- `500`: product-service circuit breaker OPEN or a database error.
+  (`Downstream service call failed: request rejected`).
+- `409`: `The order was modified by another request`. Another request changed the order between the read and the save;
+  the reservation is released again.
+- `503`: `Service temporarily unavailable`. The database did not answer when the line was saved; the reservation is
+  released again.
+- `415`: non-JSON `Content-Type` (answered before any of the above).
 
 **Side effects**
 - Feign `GET /api/v1/products/{productId}`, then `PATCH /internal/v1/products/{productId}/stock` with `{"delta": -quantity}`.
-- The reservation is **not** undone if a later step fails. A read timeout on a PATCH that product-service did apply
-  returns 503 with the stock still reserved.
-- INSERT into `order_items` and UPDATE of `orders`. No events.
+  No database transaction is open during either call.
+- The line is then saved in its own short transaction: INSERT into `order_items` and UPDATE of `orders` (which also moves
+  `updated_at`, so a cart in use does not expire). If that save fails, the reservation is released with
+  `{"delta": +quantity}`, once. If the PATCH itself times out, product-service may or may not have applied it: nothing
+  is released, the client gets 503 and a retry can reserve a second time.
+- No events.
 
 **Example**
 
@@ -369,14 +389,14 @@ processes the payment in payment-service. The payment result comes back over Kaf
 - `404`: `Order not found: <orderId>`.
 - `400`: `Can only confirm PENDING orders. Current status: <STATUS>`.
 - `400`: `Cannot confirm an order with no items`.
-- `500`: the Kafka publish failed immediately (`KafkaException`). For example, when the broker metadata is
-  unavailable the request blocks for up to 60 s (`max.block.ms`) first. The order stays PENDING because the
-  transaction rolls back.
+- `409`: `The order was modified by another request` (another request changed the order at the same moment).
+- `503`: `Service temporarily unavailable`, when the database does not answer. A Kafka outage does not reach this
+  endpoint: the event waits in the outbox.
 
 **Side effects**
-- UPDATE of `orders.status`.
-- Publishes `order.placed` (key `orderId`) **inside** the transaction, before commit. The payload is in the
-  [service doc](../services/order-service.md#orderplaced).
+- UPDATE of `orders.status`, and an INSERT into `outbox_event` for `order.placed` (key `orderId`) in the **same**
+  transaction. The relay publishes it to Kafka about half a second after the commit, at least once. If the transaction
+  rolls back, nothing is published. The payload is in the [service doc](../services/order-service.md#orderplaced).
 - No Feign calls.
 
 **Example**
@@ -406,10 +426,11 @@ CONFIRMED to PAID or CANCELLED; PAID to SHIPPED or CANCELLED; SHIPPED to DELIVER
 - `200 OK`: the updated [`OrderDTO`](#orderdto).
 - `404`: `Order not found: <orderId>`.
 - `400`: `status` missing or not an enum name.
-- `409`: `Cannot change order status from <A> to <B>`.
+- `409`: `Cannot change order status from <A> to <B>`, or `The order was modified by another request`.
 
 **Side effects:** UPDATE of `orders.status`. Setting CANCELLED or CONFIRMED runs the same code as the customer endpoints
-(stock restore and `order.cancelled`, or `order.placed`); setting PAID or SHIPPED publishes nothing.
+(`order.cancelled` through the outbox, then the stock goes back; or `order.placed` through the outbox); setting PAID or
+SHIPPED publishes nothing.
 
 **Example**
 
@@ -421,9 +442,11 @@ curl -s -X PATCH -H "$ADMIN_AUTH" "$GW/api/v1/orders/42/status?status=SHIPPED"
 ## DELETE /api/v1/orders/{orderId}
 
 Cancels the order; nothing is deleted. The service:
-1. sets CANCELLED;
-2. for every line, sends `PATCH /internal/v1/products/{productId}/stock` with `{"delta": +quantity}` to product-service;
-3. publishes `order.cancelled`.
+1. sets CANCELLED and writes `order.cancelled` to the outbox, in one transaction, and commits;
+2. after the commit, for every line, sends `PATCH /internal/v1/products/{productId}/stock` with `{"delta": +quantity}`
+   to product-service, outside any transaction. The first answer that means "product-service is not there" (no
+   connection, a timeout, 503, an open breaker) ends the loop;
+3. returns 204. The relay publishes `order.cancelled` to Kafka about half a second after the commit.
 
 The frontend shows the Cancel button only for PENDING and CONFIRMED orders, but the API also cancels PAID orders,
 without refunding them.
@@ -442,14 +465,16 @@ without refunding them.
 - `204 No Content`.
 - `404`: `Order not found: <orderId>`.
 - `400`: `Cannot cancel order in status: CANCELLED` (or `SHIPPED`, `DELIVERED`).
-- `500`: the Kafka publish failed immediately. The transaction rolls back, but the stock restores have already been
-  sent.
+- `409`: `The order was modified by another request`. Of two cancels at the same moment, the later commit fails on the
+  order's version and never reaches the stock.
+- `503`: `Service temporarily unavailable`, when the database does not answer. A product-service outage does **not**
+  fail the cancel (see below), and neither does a Kafka outage.
 
 **Side effects**
-- UPDATE of `orders.status`.
-- One Feign PATCH per line. Failures are logged and ignored, so stock may stay reserved while the cancel still
-  returns 204.
-- Publishes `order.cancelled` (key `orderId`) inside the transaction.
+- UPDATE of `orders.status` and an INSERT into `outbox_event` for `order.cancelled` (key `orderId`), in one transaction.
+- One Feign PATCH per line, after the commit. A failure never undoes the cancellation: the response is still 204, and
+  if product-service did not answer, one WARN (at most one per 10 s) names the lines whose stock was not returned. A call
+  that timed out has an unknown outcome and is not repeated.
 - Calling DELETE again on a CANCELLED order is `400`; stock is restored once.
 
 **Example**

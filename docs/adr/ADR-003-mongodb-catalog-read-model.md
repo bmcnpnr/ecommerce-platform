@@ -32,6 +32,15 @@ Negative:
 - A one-time migration hazard: a `catalogdb-data` volume left over from Postgres must be dropped by hand.
 - WiredTiger sizes its cache from the cgroup limit, so it must be pinned (`--wiredTigerCacheSizeGB 0.25`) to fit the 512 MB container.
 
+## Update (2026-10-30)
+
+The decision stands. Startup no longer depends on MongoDB being reachable. `CatalogCollectionInitializer` still creates the indexes and backfills documents written by earlier builds, but each step is now independent and the pending ones are retried in the background. A failure is classified as transient or permanent:
+
+- **Transient** (MongoDB does not answer: no server selected in time, socket errors, a cleared connection pool, a node that is not primary): the step stays pending and the service starts anyway. A background thread retries the pending steps with a delay that starts at 1 s and doubles up to 30 s. The log has one WARN when it first fails and at most one more per minute, without a stack trace, and one INFO when the last step has succeeded. Until MongoDB answers, every request that needs it is a 503, and the liveness probe stays up.
+- **Permanent** (MongoDB answers and refuses the step, for example an index whose definition conflicts with an existing index of the same name): retrying cannot help, so the step is dropped with one ERROR (with the stack trace) and the other steps still run. Only text search is affected, until the index is fixed by hand.
+
+Startup used to throw in both cases, so the container restarted in a loop until MongoDB was healthy or the index had been dropped.
+
 ## Related
 
 [catalog-service](../services/catalog-service.md) · [Data model](../data-model.md) · [ADR-002](ADR-002-database-per-service.md)

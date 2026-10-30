@@ -28,13 +28,29 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Create a new order",
+        "summary": "Create a new order (owner or admin; customerId defaults to the caller)",
         "operationId": "createOrder",
         "parameters": [
           {
             "name": "customerId",
             "in": "query",
-            "required": true,
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -89,6 +105,22 @@
               "format": "int32",
               "default": 1
             }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -110,7 +142,7 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Add item to order",
+        "summary": "Add item to order (owner or admin)",
         "operationId": "addItemToOrder",
         "parameters": [
           {
@@ -120,6 +152,22 @@
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -152,7 +200,7 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Confirm order and trigger payment flow",
+        "summary": "Confirm order and trigger payment flow (owner or admin)",
         "operationId": "confirmOrder",
         "parameters": [
           {
@@ -162,6 +210,22 @@
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -184,7 +248,7 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Update order status (admin/internal)",
+        "summary": "Update order status (admin only, legal transitions only)",
         "operationId": "updateStatus",
         "parameters": [
           {
@@ -211,6 +275,22 @@
                 "CANCELLED"
               ]
             }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -232,7 +312,7 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Get order by ID",
+        "summary": "Get order by ID (owner or admin)",
         "operationId": "getOrderById",
         "parameters": [
           {
@@ -242,6 +322,22 @@
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -262,7 +358,7 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Cancel an order",
+        "summary": "Cancel an order (owner or admin)",
         "operationId": "cancelOrder",
         "parameters": [
           {
@@ -272,6 +368,22 @@
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -308,13 +420,49 @@
         "tags": [
           "Orders"
         ],
-        "summary": "Get orders by customer ID",
+        "summary": "Get orders by customer ID, newest first (that customer or admin); at most 100 per page",
         "operationId": "getOrdersByCustomer",
         "parameters": [
           {
             "name": "customerId",
             "in": "path",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 0
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "default": 100
+            }
+          },
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -411,6 +559,7 @@
           "quantity": {
             "type": "integer",
             "format": "int32",
+            "maximum": 1000,
             "minimum": 1
           }
         },

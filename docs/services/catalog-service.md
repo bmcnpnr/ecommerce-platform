@@ -5,11 +5,11 @@ catalog-service is a read model of product-service for catalog browsing. It keep
 | | |
 |---|---|
 | Repository | `ecommerce-catalog-service` |
-| Stack | Kotlin 2.3.0 on Java 25 · Spring Boot 4.0.9 · Spring MVC · Spring Data MongoDB 5.0.1 · Spring Cloud OpenFeign 5.0.1 (Apache HttpClient 5) · Spring Cloud LoadBalancer + Eureka client · Jackson 3 · springdoc-openapi 2.8.5 · Micrometer + OpenTelemetry |
+| Stack | Kotlin 2.3.0 on Java 25 · Spring Boot 4.0.9 · Spring MVC · Spring Data MongoDB 5.0.8 · Spring Cloud OpenFeign 5.0.4 (Apache HttpClient 5) · Resilience4j circuit breaker · Spring Cloud LoadBalancer + Eureka client · Jackson 3 · springdoc-openapi 2.8.5 · Micrometer + OpenTelemetry |
 | Port | 8083 |
 | Eureka service ID | `catalog-service` |
 | Gateway routes | `/api/v1/catalog/**` (GET is public, POST and PATCH need an `ADMIN` JWT) |
-| Data store | MongoDB 8.0 `catalogdb`, collection `catalog_entries`; no migration tool, indexes and backfills run at startup (`CatalogCollectionInitializer`) |
+| Data store | MongoDB 8.0 `catalogdb`, collection `catalog_entries`; no migration tool, indexes and backfills run at startup and, while MongoDB is unreachable, in the background until they succeed (`CatalogCollectionInitializer`) |
 | Publishes | — |
 | Consumes | — |
 | Calls | product-service (Feign): `GET /api/v1/products/{id}`, `GET /api/v1/categories` |
@@ -18,11 +18,11 @@ catalog-service is a read model of product-service for catalog browsing. It keep
 ## Responsibilities
 
 - Pull one product, and the full category list, from product-service on request and create or refresh that product's catalog entry.
-- Serve reads: entry by product id, browse (paged), search (paged; MongoDB `$text` with a substring fallback), entries of one category, featured entries.
+- Serve reads: entry by product id, browse (paged), search (paged; MongoDB `$text` with a substring fallback), entries of one category and featured entries (both one page at a time, returned as lists).
 - Let callers set the catalog-owned fields `featured` and `imageUrl`, and the catalog price.
-- Bring the collection to the expected shape at startup: create the indexes and backfill documents written by earlier builds.
+- Bring the collection to the expected shape: create the indexes and backfill documents written by earlier builds, at startup and, if MongoDB does not answer then, in the background.
 
-Not present in the code: automatic refresh (no Kafka, no scheduler), bulk sync, deletion of entries, any use of the product's `status`, authorization.
+Not present in the code: automatic refresh (no Kafka, no scheduler), bulk sync, deletion of entries, any use of the product's `status`.
 
 ## Domain model
 
@@ -39,7 +39,7 @@ Not present in the code: automatic refresh (no Kafka, no scheduler), bulk sync, 
 | `price` | `BigDecimal` | Decimal128, scale 2 | product `price`, rounded to 2 decimals | yes (overwrites) | yes |
 | `brand` | `String?` | string | product `brand` | yes | — |
 | `categoryId` | `Long?` | Int64 | product `categoryId` | yes | — |
-| `categoryName` | `String?` | string | name of the category with that id, from `GET /api/v1/categories` | yes (`null` when the lookup fails) | — |
+| `categoryName` | `String?` | string | name of the category with that id, from `GET /api/v1/categories` | yes (when the lookup fails, an unchanged `categoryId` keeps the stored name) | — |
 | `featured` | `Boolean` | bool | catalog-owned | `false` on insert, then kept | yes |
 | `stockStatus` | `StockStatus` | string (enum name) | derived from product `stockQuantity` | yes | — |
 | `imageUrl` | `String?` | string | catalog-owned | `null` on insert, then kept | yes |
@@ -67,27 +67,32 @@ A sync overwrites every field that comes from product-service, including `price`
 
 1. **One entry per product.** The product id is the document `_id` (`CatalogEntry.productId` is the `@Id`), so a product can never have two entries. `CatalogEntryDTO.id` is kept for wire compatibility with the former relational model and always equals `productId`.
 2. **Sync is pull, project, then load-modify-save.** `CatalogService.syncFromProductService(productId)`:
-   1. calls `getProductById(productId)`; any failure (404, connection error, timeout) propagates;
-   2. calls `getAllCategories()` inside `try`/`catch`; any exception becomes an empty list;
-   3. picks the category whose `id` equals the product's `categoryId` (none when `categoryId` is `null` or the list is empty);
-   4. derives `stockStatus` (table above);
-   5. inside `retryingOnConcurrentWrite()`: loads the entry; if it exists, overwrites `productSku`, `productName`, `description`, `price`, `brand`, `categoryId`, `categoryName`, `stockStatus` and `updatedAt` on the loaded document; otherwise builds a new `CatalogEntry` (`featured = false`, `imageUrl = null`, `version = null`); then `save()`.
+   1. calls `getProductById(productId)`; a failure propagates as a typed exception (404, 503 or 502, see [Outbound calls](#outbound-calls));
+   2. checks the answer (`requireUsable()`): its `id` must equal the requested id, `sku` and `name` must not be blank, and `price` must be above 0 with at most 15 integer digits and a scale of at most 10; otherwise the sync is refused with 502 `Upstream service error` and nothing is written. The digit limits matter because a price like `1E+999999999` is a valid `BigDecimal` and rounding it would try to build a number with a billion digits;
+   3. calls `getAllCategories()` unless `categoryId` is `null`, inside `try`/`catch`; any exception, an open circuit breaker included, means "could not look it up", which is not the same as "there are no categories";
+   4. picks the category whose `id` equals the product's `categoryId` (none when `categoryId` is `null` or the list has no such category);
+   5. derives `stockStatus` (table above);
+   6. inside `retryingOnConcurrentWrite()`: loads the entry; if it exists, overwrites `productSku`, `productName`, `description`, `price`, `brand`, `categoryId`, `categoryName` (see rule 4), `stockStatus` and `updatedAt` on the loaded document; otherwise builds a new `CatalogEntry` (`featured = false`, `imageUrl = null`, `version = null`); then `save()`.
 
    Spring Data treats `version == null` as new and inserts, otherwise it updates with a version check. The product data is fetched once, so a retry only re-reads the document and re-applies the same projection; the operation is idempotent. The response is `200` with the saved entry, for a first sync as well as a refresh.
-3. **Stock band, not stock.** `stockStatus` follows the thresholds above. The product's `status` is decoded but ignored, so a soft-deleted (`INACTIVE`) product syncs like any other and is served with a band computed from its quantity.
-4. **The category name may be lost.** When the categories call fails, the sync still succeeds and writes `categoryName = null`, replacing a name an earlier sync had stored.
+3. **Stock band, not stock.** `stockStatus` follows the thresholds above. The product's `status` is decoded but ignored. product-service answers 404 for a soft-deleted (`INACTIVE`) product to a caller without the `ADMIN` role, and this service sends no identity, so such a product cannot be synced; an entry synced before the deletion stays as last synced, with the band computed from its quantity then.
+4. **A failed category lookup does not blank the name.** The categories call only turns `categoryId` into a name, so when it fails the sync still succeeds. An existing entry keeps its stored `categoryName` if its `categoryId` is unchanged, and gets `null` if the category changed (the stored name belongs to the old one); a new entry gets `null`. A product without a category skips the call and has `categoryName = null`. A lookup that works replaces the stored name, with `null` when the category is not in the list.
 5. **Prices are cents.** `toCatalogPrice()` rounds with `setScale(2, RoundingMode.HALF_UP)` on sync and on `PATCH` (product-service sends `NUMERIC(19,4)` values such as `19.9900`; `10.005` becomes `10.01`). The comment explains why: the former relational column was `DECIMAL(19,2)` and rounded on write, while Decimal128 keeps whatever scale it is given, so the rounding keeps the stored and served contract unchanged.
 6. **Concurrent writes.** Every write touches one document, so there is no transaction; concurrency is handled by `@Version`.
    - A sync that loses a race (`OptimisticLockingFailureException` when the version moved, `DuplicateKeyException` when two first-time syncs both inserted the same `_id`) is retried by `retryingOnConcurrentWrite()`: up to 5 attempts, sleeping a random 5 to 24 ms multiplied by the attempt number between attempts, because immediate retries under a burst of identical syncs tend to collide again. After the fifth loss the exception propagates and the API answers 409.
    - A `PATCH` that loses a race is not retried: `updateCatalogEntry()` lets the `OptimisticLockingFailureException` through and the API answers 409 so that the client re-reads and decides. The version check covers only the moment between the service's own read and its write; the version is not exposed in the DTO and the `PATCH` does not accept an expected version, so a client that read the entry earlier cannot be told that it changed since.
-7. **PATCH is a partial update of catalog-owned fields.** `updateCatalogEntry()` applies `featured`, `imageUrl` and `price` when they are non-null, sets `updatedAt`, and saves. `null` or absent means unchanged, so `imageUrl` cannot be cleared. There is no validation: a zero or negative price and any `imageUrl` string are stored. An unknown product id answers 404.
+7. **PATCH is a partial update of catalog-owned fields.** `updateCatalogEntry()` applies `featured`, `imageUrl` and `price` when they are non-null, sets `updatedAt`, and saves. `null` or absent means unchanged; an empty `imageUrl` clears the image. The body is validated before the service runs: `price` must be above 0 with at most 15 integer digits and 2 decimals, `imageUrl` must be empty or an absolute `http(s)` URL of at most 2048 characters; otherwise 400 `Validation Failed`. An unknown product id answers 404.
 8. **Search.** `CatalogService.searchCatalog(q, pageable)`:
-   1. if `q` is not blank, run `CatalogEntryRepositoryImpl.searchByText()`: `{ $text: { $search: q } }` against the text index, sorted by text score (best first), with skip and limit from the page request; the total comes from a separate count with the same criterion (skipped by `PageableExecutionUtils` when the first page is not full);
+   1. if `q` is not blank, run `CatalogEntryRepositoryImpl.searchByText()`: `{ $text: { $search: q } }` against the text index, sorted by text score (best first, ties in product id order), with skip and limit from the page request; the total comes from a separate count with the same criterion (skipped by `PageableExecutionUtils` when the first page is not full). The search and its count carry `maxTimeMS` 4000;
    2. if that result has `totalElements > 0`, return it;
-   3. otherwise (no text hit, or a blank `q`) run `findByProductNameContainingIgnoreCase(q, pageable)`: `{ productName: { $regex: ".*\Q<q>\E.*", $options: "i" } }`, a collection scan in natural order with `q` quoted so regex metacharacters match literally.
+   3. otherwise (no text hit, or a blank `q`) run `findByProductNameContainingIgnoreCase(q, pageable)`: `{ productName: { $regex: ".*\Q<q>\E.*", $options: "i" } }`, a collection scan in product id order with `q` quoted so regex metacharacters match literally, also with `maxTimeMS` 4000.
+
+   `q` must not contain a NUL byte and is at most 200 characters (product names are at most 200, so a longer text can only cost a scan); otherwise 400 `Invalid value for parameter 'q'`. A search that runs past `maxTimeMS` is aborted by MongoDB itself, so one pathological query cannot keep the single `mongod` busy after the client has given up, and it is answered 503.
 
    The choice depends on the total for the query string, so every page of one query uses the same mode. `$text` behaviour (`CatalogCollectionInitializer`, `TextCriteria.forDefaultLanguage()`): the index covers `productName` (weight 10), `brand` (5) and `description` (1) with English stemming and stop words; terms are ORed; matching is case-insensitive and stemmed (`keyboards` finds `keyboard`) but whole-word only (`wirel` does not find `wireless`, which is what the fallback is for). `q` is passed to `$search` unchanged, so MongoDB's `$text` syntax applies: a `"quoted phrase"` must match as a phrase and a `-term` excludes documents. A query made only of stop words has no text hit and falls back to the substring match. An empty `q` matches every entry; a whitespace-only `q` matches names that contain that exact whitespace, not every entry.
 9. **Entries are never removed.** There is no delete endpoint and no reaction to product deletion; a soft-deleted or renamed product stays as last synced.
+10. **Lists are paged and ordered.** Browse, search, category and featured take `page` (default 0) and `size` (1 to 100) and are ordered by `productId` (search by text score first), so page boundaries are stable and no endpoint answers with more than one page. The default size is 20 for browse and search and 100 for category and featured, which still return a plain JSON array. A `page` below 0, a `size` outside 1 to 100 or an offset beyond the `int` range is 400.
+11. **A dependency that does not answer is a 503, one that answers badly is a 502.** `exception/DependencyFailures` walks the cause chain and recognises the MongoDB failures that mean "the database did not answer": no server selected in time, socket errors, a pool wait that timed out, a cleared connection pool, a node that is not primary or is recovering, a server shutting down, and a query that hit its `maxTimeMS`. The exception handler answers these, and a product-service that gives no answer, with 503 `Service temporarily unavailable`, and writes one WARN per cause class per 10 s with no stack trace and the root cause in the line. A product-service answer that cannot be used (rule 2, step 2, and see [Outbound calls](#outbound-calls)) is 502 `Upstream service error`. A write conflict (`OptimisticLockingFailureException`, `DuplicateKeyException`) stays 409. Anything else is a 500 `An unexpected error occurred`, logged at ERROR with its stack trace at most once per failure site per 10 s. The WARNs for 404, 409 and an upstream 404 are throttled the same way (keys `catalog.notFound`, `catalog.conflict`, `catalog.upstreamNotFound`) and print sanitised values, because an anonymous client can trigger them at request rate.
 
 ### Sync sequence
 
@@ -100,11 +105,12 @@ sequenceDiagram
     participant PS as product-service
     participant DB as MongoDB catalog_entries
     C->>G: POST /api/v1/catalog/sync/42 with Bearer JWT
-    G->>CS: same request, identity headers added but never read
+    G->>CS: same request, identity headers added, ADMIN checked again
     CS->>PS: GET /api/v1/products/42 (Feign via Eureka)
     PS-->>CS: 200 ProductDTO
-    CS->>PS: GET /api/v1/categories
-    PS-->>CS: 200 list of CategoryDTO, any failure becomes an empty list
+    Note over CS: refuse unusable data with 502
+    CS->>PS: GET /api/v1/categories, skipped when the product has no category
+    PS-->>CS: 200 list of CategoryDTO, a failure keeps the stored categoryName
     Note over CS: derive stockStatus, look up categoryName, round price to 2 decimals
     loop up to 5 attempts while the write loses a race
         CS->>DB: findById(42)
@@ -124,13 +130,13 @@ sequenceDiagram
 |---|---|---|---|
 | GET | `/api/v1/catalog/search?q=` | Public | Search, paged |
 | GET | `/api/v1/catalog` | Public | Browse all entries, paged |
-| GET | `/api/v1/catalog/category/{categoryId}` | Public | Entries of one category (list) |
-| GET | `/api/v1/catalog/featured` | Public | Featured entries (list) |
+| GET | `/api/v1/catalog/category/{categoryId}` | Public | One page of the entries of one category (list) |
+| GET | `/api/v1/catalog/featured` | Public | One page of the featured entries (list) |
 | GET | `/api/v1/catalog/product/{productId}` | Public | Entry by product id |
 | POST | `/api/v1/catalog/sync/{productId}` | `ADMIN` | Pull the product from product-service and create or refresh its entry |
 | PATCH | `/api/v1/catalog/product/{productId}` | `ADMIN` | Set `featured`, `imageUrl`, `price` |
 
-No endpoint performs a service-side role or ownership check. Full reference: [API reference](../api/catalog-service.md).
+The two write endpoints check the role in the service as well (`Authorization.requireAdmin`); the reads need no identity. Full reference: [API reference](../api/catalog-service.md).
 
 ## Events
 
@@ -142,7 +148,7 @@ Nothing keeps the catalog in sync automatically: there is no Kafka consumer (pro
 
 ### product-service (Feign)
 
-Client `client/ProductServiceClient.kt`: `@FeignClient(name = "product-service", fallback = ProductServiceClientFallback::class)`, resolved through Eureka by Spring Cloud LoadBalancer, called only from `CatalogService.syncFromProductService()`.
+Client `client/ProductServiceClient.kt`: `@FeignClient(name = "product-service", fallbackFactory = ProductServiceClientFallbackFactory::class)`, resolved through Eureka by Spring Cloud LoadBalancer, called only from `CatalogService.syncFromProductService()`.
 
 | Client method | Request | Decoded into | Fields used |
 |---|---|---|---|
@@ -153,30 +159,33 @@ Client `client/ProductServiceClient.kt`: `@FeignClient(name = "product-service",
 
 | Setting | Value | Source and reason |
 |---|---|---|
-| HTTP client | Apache HttpClient 5 | `feign-hc5` dependency. |
+| HTTP client | Apache HttpClient 5, automatic retries off | `feign-hc5` dependency. `config/FeignConfig.kt` registers an `HttpClientBuilderCustomizer` that calls `disableAutomaticRetries()`. The client's own strategy re-sent an idempotent request once on a reset connection and again, after a pause, on a 503, a second retry layer under `ConnectionFailureRetryer`. |
 | Connect timeout | 2000 ms | `spring.cloud.openfeign.client.config.default.connect-timeout`. Fails fast on a peer that vanished mid-rollout (the default is 10 s) so the retryer can move on to another instance. |
-| Read timeout | 10000 ms | `...default.read-timeout`. Reads stay generous. |
-| Retries | `ConnectionFailureRetryer`: at most 3 attempts per call, sleeping 100 ms then 200 ms | `config/FeignConfig.kt`. Retries only when the cause is a `java.net.ConnectException` (which includes HttpClient's `HttpHostConnectException`) or HttpClient's `ConnectTimeoutException`: the peer was never reached, so repeating is safe for any method, and the load balancer picks an instance afresh on every attempt. A read timeout (`SocketTimeoutException`) and HTTP errors are not retried because the request may have been processed. Feign clones the retryer per call, so every call starts with a fresh counter. This bridges the seconds between a product-service pod disappearing and every registry cache dropping it. |
+| Read timeout | 10000 ms | `...default.read-timeout`. Reads stay generous. With the breaker's thread pool and time limiter off (below), the connect and read timeouts are what bound a call. |
+| Retries | `ConnectionFailureRetryer`: at most 3 attempts per call, sleeping 100 ms then 200 ms | `config/FeignConfig.kt`. Retries only when the cause is a `java.net.ConnectException` (which includes HttpClient's `HttpHostConnectException`) or HttpClient's `ConnectTimeoutException`: the peer was never reached, so repeating is safe for any method, and the load balancer picks an instance afresh on every attempt. A read timeout (`SocketTimeoutException`) and HTTP errors are not retried because the request may have been processed. Feign clones the retryer per call, so every call starts with a fresh counter. This bridges the seconds between a product-service pod disappearing and every registry cache dropping it. Nothing else repeats a call. |
 | Load balancing | eager-load for `product-service`; instance cache TTL 5 s; Eureka registry fetch every 5 s | `spring.cloud.loadbalancer.*`, `eureka.client.registry-fetch-interval-seconds`. Without eager-load the first call fails with "Load balancer does not contain an instance". The short caches let a replaced peer be seen quickly. |
 | Message converters | `ThreadSafeFeignHttpMessageConverters` | `config/FeignConfig.kt`. Spring Cloud OpenFeign 5.0.1's `FeignHttpMessageConverters` builds its converter list lazily without synchronisation: it publishes an empty `ArrayList` and fills it afterwards, so when the first Feign calls of a fresh JVM arrive concurrently a second thread can see the empty list and `SpringDecoder` fails with `DecodeException: 'messageConverters' must not be empty` (a 500 for that caller). The subclass makes the first initialisation mutually exclusive (double-checked on a `@Volatile` flag) and reads stay lock-free afterwards. The bean replaces the library's `@ConditionalOnMissingBean` bean; the per-client child contexts see the parent bean and skip their own. |
-| Circuit breaker | none active | See below. |
-| Fallback | `ProductServiceClientFallback`, never invoked | See below. |
-| Error mapping | `FeignException.NotFound` only | A product-service 404 becomes 404 `Product not found in product-service`; every other `FeignException` and exhausted retry reaches the catch-all handler: 500. |
+| Circuit breaker | Resilience4j breaker `product-service` | `spring.cloud.openfeign.circuitbreaker.enabled=true`. One breaker for the whole client: `FeignConfig.circuitBreakerNameResolver()` names it after the client, so `resilience4j.circuitbreaker.instances.product-service` configures it (the default name is derived from the interface and method, e.g. `ProductServiceClientgetProductByIdLong`). Sliding window of 10 calls, at least 5 before it can open; it opens at a 50 % failure rate, or when 80 % of the window is slower than 5 s; it stays open 10 s, moves to half-open by itself and lets 3 trial calls through. 4xx answers (400, 401, 403, 404, 405, 406, 409, 410, 415, 422) are ignored: the peer answered. Spring Cloud CircuitBreaker's worker thread pool, its 1 s time limiter and its thread-pool bulkhead are disabled (`spring.cloud.circuitbreaker.resilience4j.disable-thread-pool`, `disable-time-limiter`, `spring.cloud.circuitbreaker.bulkhead.resilience4j.enabled`), so a call runs on the request thread and Feign's timeouts govern. `config/CircuitBreakerTransitionLogger` logs WARN when the breaker opens and INFO when it closes, never one line per call. Metrics: `resilience4j_circuitbreaker_*{name="product-service"}`. |
+| Fallback | `ProductServiceClientFallbackFactory` | Typed, and silent (it runs once per call during an outage). It first unwraps `ExecutionException`, `CompletionException`, `UndeclaredThrowableException` and `InvocationTargetException`, then: a 404 is rethrown as it is; no answer (connection refused or timed out, no instance, 503 or 504, breaker open, any `IOException` or `TimeoutException`) becomes `ProductServiceUnavailableException` through `ProductServiceClientFallback`; any other `FeignException` (another 4xx, another 5xx, a body that cannot be decoded) becomes `ProductServiceErrorException`; anything else is rethrown. The fallback never returns data: not a product, and not an empty category list either, which would look like "there are no categories" and make the sync blank a stored name. |
+| Error mapping | 404, 503, 502 | A product-service 404 becomes 404 `Product not found in product-service`; no answer becomes 503 `Service temporarily unavailable`; an unusable answer becomes 502 `Upstream service error`, with one WARN `product-service answered with status <n> on <method> <uri>` per status per 10 s. |
 | Correlation id | not forwarded | There is no Feign `RequestInterceptor`; product-service logs the call under its own id. |
 | Tracing | Feign calls are not observed | `feign-micrometer` is not on the classpath, so Spring Cloud OpenFeign's Micrometer capability is inactive. |
 
-**The circuit breaker and the fallback are not wired.** Spring Cloud OpenFeign wraps a client in a circuit breaker, and honours `fallback`, only when `spring.cloud.openfeign.circuitbreaker.enabled=true` (`FeignAutoConfiguration.CircuitBreakerPresentFeignTargeterConfiguration`). The property is not set in `application.yaml`, docker-compose or the Kubernetes manifests. Consequently `ProductServiceClientFallback` (whose `getProductById()` throws `RuntimeException("Product service unavailable - circuit breaker open")` and whose `getAllCategories()` returns an empty list) is never called, and `resilience4j.circuitbreaker.instances.product-service` (sliding window 10, minimum 5 calls, 50 % failure rate, 10 s open) governs no call. Enabling the property alone would not apply those settings either: the breaker names are derived from the client interface and method (`Feign.configKey`, made alphanumeric by default), not `product-service`.
+**What goes through the breaker.** Only the two calls to product-service in `syncFromProductService()`; every read endpoint is answered from MongoDB. Both client methods share the one breaker, so failures of either count in the same window. A call that the open breaker rejects (`CallNotPermittedException`) reaches the fallback factory like any other failure; for the product call that ends as a 503 without a request being sent, and for the categories call the sync catches it (rule 2, step 3).
 
 **When product-service misbehaves**
 
 | Situation | What happens | Caller of the sync sees |
 |---|---|---|
-| No registered instance | The load balancer answers 503 itself; Feign throws `FeignException.ServiceUnavailable` | 500 |
-| Instance registered but refusing connections, or connect timeout | Up to 3 attempts, each choosing an instance again | 200 if a later attempt connects, otherwise 500 |
-| Slow response (over 10 s) | `SocketTimeoutException`, not retried | 500 after about 10 s |
-| `404` for the product | `FeignException.NotFound`, mapped by `GlobalExceptionHandler` | 404 |
-| Any other 4xx or 5xx | the matching `FeignException` | 500 |
-| Categories call fails | caught, treated as an empty list | 200, `categoryName` is `null` |
+| No registered instance | The load balancer answers 503 itself; Feign throws `FeignException.ServiceUnavailable`, which is "no answer" | 503 |
+| Instance registered but refusing connections, or connect timeout | Up to 3 attempts, each choosing an instance again | 200 if a later attempt connects, otherwise 503 |
+| Slow response (over 10 s) | `SocketTimeoutException`, not retried | 503 after about 10 s |
+| Slow responses (over 5 s) in 80 % of the last 10 calls, at least 5 | The breaker opens: calls are rejected without a request until it half-opens after 10 s and its 3 trial calls succeed | 503 at once while it is open |
+| Connection reset, or a 503 or 504 from product-service | Not a connect failure, so not retried; counts as a failure for the breaker | 503 |
+| `404` for the product | `FeignException.NotFound`, passed through by the fallback factory and mapped by `GlobalExceptionHandler`; the breaker ignores it | 404 |
+| Another 4xx, a 5xx other than 503 and 504, or a body that cannot be decoded | `ProductServiceErrorException` (5xx and decode errors count against the breaker, 4xx do not) | 502 |
+| A 200 whose data is unusable (rule 2, step 2) | Refused by `requireUsable()` | 502 |
+| Categories call fails | caught, treated as "unknown" | 200, the stored `categoryName` is kept (rule 4) |
 | Any read endpoint | never calls product-service | unaffected |
 
 ## Persistence
@@ -258,10 +267,20 @@ The substring fallback (`$regex` with a leading `.*`) and browse cannot use an i
 
 ### CatalogCollectionInitializer
 
-`config/CatalogCollectionInitializer.kt` does the job Flyway did for the relational schema. It is an `ApplicationRunner`, so it runs after the context starts and before `ApplicationReadyEvent`: the Kubernetes readiness probe passes only once it has finished, and if MongoDB is unreachable the exception fails startup (compose and Kubernetes restart the container once the database is healthy).
+`config/CatalogCollectionInitializer.kt` does the job Flyway did for the relational schema. It is an `ApplicationRunner`, so its first attempt runs after the context starts and before `ApplicationReadyEvent`. It never keeps the service down: the work is split into independent steps, and a step that cannot finish stays pending and is retried in the background. The service starts and stays up without MongoDB.
 
-1. `backfillLegacyDocuments()`: sets `version: 0` on documents that have no `version` (Spring Data reads a missing version as "new", so a later save would try to insert and fail on the duplicate `_id`), and unsets `_class`, which earlier builds wrote. Both updates address the collection by name rather than by entity class, because the entity-typed overloads add `$inc: {version: 1}` to any update that does not set the version and would bump every legacy document. Logs `Backfilled catalog_entries: ...` when anything changed.
-2. `ensureIndexes()`: `createIndex` for each definition in `INDEXES` and logs `Ensured index <name> on catalog_entries`. Creating an identical existing index is a no-op.
+The steps, in this order, are `backfill version`, `remove _class`, and one step per definition in `INDEXES`:
+
+1. `backfillVersion()`: sets `version: 0` on documents that have no `version` (Spring Data reads a missing version as "new", so a later save would try to insert and fail on the duplicate `_id`). Logs `Backfilled catalog_entries: version set on <n> document(s)` when anything changed.
+2. `removeTypeHint()`: unsets `_class`, which earlier builds wrote. Logs `Backfilled catalog_entries: _class removed from <n> document(s)` when anything changed. Both updates address the collection by name rather than by entity class, because the entity-typed overloads add `$inc: {version: 1}` to any update that does not set the version and would bump every legacy document.
+3. `ensureIndex()`: `createIndex` for one definition in `INDEXES`; logs `Ensured index <name> on catalog_entries`. Creating an identical existing index is a no-op.
+
+A failing step is classified with `exception/DependencyFailures`:
+
+- **Transient** (MongoDB does not answer: no server selected within 3 s, socket errors, a cleared pool, a node that is not primary, an execution timeout): the remaining steps of that attempt are not tried, because they would only wait too, and the pending steps are retried on a daemon thread (`catalog-collection-init`, created at the first retry) after 1 s, then 2 s, 4 s and so on up to 30 s, until all have succeeded. Until then every request that needs MongoDB is a 503. The log has one WARN, `Could not initialise catalog_entries (<n> step(s) pending): <cause>. The service starts anyway and retries in <s> s`, when it first fails and at most one more per 60 s (the next one ends in `(N similar suppressed)`), without a stack trace; when the last step has succeeded after a retry it logs one INFO, `catalog_entries initialised after <n> attempts`.
+- **Permanent** (MongoDB answered and refused the step, for example an index whose definition conflicts with an existing index of the same name): retrying cannot help, so the step is dropped with one ERROR, `Skipping '<step>' on catalog_entries: it was refused, and retrying cannot help (<message>)`, with the stack trace, and the other steps still run. Text search fails until the index is fixed by hand; nothing else does.
+
+Shutdown stops the retry thread.
 
 Index creation is explicit instead of `spring.data.mongodb.auto-index-creation` (set to `false`) so the index set is visible in one place, named, and created once the application is up rather than as a side effect of mapping-context bootstrap.
 
@@ -269,10 +288,13 @@ Index creation is explicit instead of `spring.data.mongodb.auto-index-creation` 
 
 `config/MongoConfig.kt` registers a static `BeanPostProcessor` that gives Boot's `MappingMongoConverter` a `DefaultMongoTypeMapper(null)`, which stops Spring Data from writing the `_class` type hint. The hint only matters when one collection holds several entity types; `catalog_entries` holds one, so it was noise and leaked a Java class name into the data. A post-processor is used instead of a replacement converter bean so that Boot's converter, with its Decimal128 representation and codec registry, stays untouched; it is `@JvmStatic` because bean post-processors must exist before the beans they process.
 
+`MongoConfig` also defines `mongoClientTimeouts`, a `MongoClientSettingsBuilderCustomizer` that replaces the driver's defaults: a 30 s server-selection timeout (every request would hang for half a minute through an outage and pin a request thread), no connect or read timeout on an established connection, and a 2 minute wait for a pooled connection. A request now waits at most 3 s for a server (`catalog.mongo.server-selection-timeout`), 2 s to open a connection (`connect-timeout`), 5 s for the answer to a command (`socket-timeout`) and 2 s for a pooled connection (`pool-wait-timeout`), then fails with a MongoDB timeout, which the exception handler answers with 503. It is a customizer rather than a set of URI options so that `SPRING_MONGODB_URI`, which replaces host, port and credentials, does not lose them.
+
 ## Security and identity
 
 - **Gateway.** `GET` under `/api/v1/catalog` is public. `POST /api/v1/catalog/sync/{productId}` and `PATCH /api/v1/catalog/product/{productId}` need a JWT whose role is exactly `ADMIN` (403 at the edge otherwise).
-- **Service.** No Spring Security. `security/Authorization.requireAdmin` runs before the service layer on both writes: 401 `Authentication required` without `X-Username`, 403 `Access denied` unless `X-User-Role` is exactly `ADMIN`. The `PATCH` body is validated: `price` > 0 with at most 15 integer digits and 2 decimals; `imageUrl` an absolute `http(s)` URL of at most 2048 characters, or empty to clear. Page size is 1 to 100. `SecurityHeadersFilter` adds `nosniff` and `no-store`; `ActuatorRegistryFilter` limits `/actuator/serviceregistry` to loopback.
+- **Service.** No Spring Security. `security/Authorization.requireAdmin` runs before the service layer on both writes: 401 `Authentication required` when both `X-Username` and `X-User-Role` are missing or blank, otherwise 403 `Access denied` unless `X-User-Role` is exactly `ADMIN`. The `PATCH` body is validated: `price` > 0 with at most 15 integer digits and 2 decimals; `imageUrl` an absolute `http(s)` URL of at most 2048 characters, or empty to clear. Page size is 1 to 100. `SecurityHeadersFilter` adds `nosniff` and `no-store`; `ActuatorRegistryFilter` limits `/actuator/serviceregistry` to loopback.
+- **Request size.** `filter/RequestSizeLimitFilter` caps a request body at 1 MB (`http.max-request-body-bytes`, default 1048576), because a body is read into memory before any validation runs and a service reachable without the gateway's own size limit (a published port, another pod) would otherwise be exposed to a few large requests. A request that declares a `Content-Length` above the limit is answered 413 `{"status":413,"error":"Payload Too Large","message":"Request body too large"}` without reading anything. A body that declares no length (chunked) is cut off with an I/O error once it passes the limit, which the malformed-body handler answers as 400 `Malformed request body`.
 - **Bypassing the gateway.** docker-compose publishes port 8083 on the host, so both write endpoints can be called at `http://localhost:8083` with forged identity headers.
 - **Database account.** The service authenticates as the MongoDB root user created by the container (`MONGO_INITDB_ROOT_USERNAME=cataloguser`, `authentication-database: admin`), which has full rights on the whole server; compose also publishes MongoDB on host port 27017.
 
@@ -293,14 +315,18 @@ From `src/main/resources/application.yaml`, plus what docker-compose and Kuberne
 | `spring.mongodb.uri` | `SPRING_MONGODB_URI` | unset | When set, Boot ignores host, port and credentials. |
 | `spring.data.mongodb.representation.big-decimal` | — | `decimal128` | Exact numeric storage for `price`. |
 | `spring.data.mongodb.auto-index-creation` | — | `false` | Indexes come from `CatalogCollectionInitializer`. |
+| `catalog.mongo.server-selection-timeout` / `connect-timeout` / `socket-timeout` / `pool-wait-timeout` | — | `3s` / `2s` / `5s` / `2s` | MongoDB client timeouts (`MongoConfig.mongoClientTimeouts`). The driver's own defaults are a 30 s server selection, no socket timeouts and a 2 minute pool wait. |
 | `spring.cloud.openfeign.client.config.default.connect-timeout` / `read-timeout` | — | `2000` / `10000` ms | Feign timeouts. |
+| `spring.cloud.openfeign.circuitbreaker.enabled` | — | `true` | Wraps the Feign client in the circuit breaker and enables the fallback factory. |
+| `spring.cloud.circuitbreaker.resilience4j.disable-thread-pool` / `disable-time-limiter` | — | `true` / `true` | The call runs on the request thread, with no 1 s time limiter; Feign's timeouts govern. |
+| `spring.cloud.circuitbreaker.bulkhead.resilience4j.enabled` | — | `false` | No bulkhead (the default would allow one concurrent call per CPU and queue the rest). |
 | `spring.cloud.loadbalancer.cache.ttl` | — | `5s` | Matches the Eureka fetch interval. |
 | `spring.cloud.loadbalancer.eager-load.clients` | — | `product-service` | Build the instance list at startup. |
 | `eureka.client.service-url.defaultZone` | `EUREKA_CLIENT_SERVICEURL_DEFAULTZONE` | `http://localhost:8761/eureka/` | compose and k8s: `http://service-discovery:8761/eureka/`. |
 | `eureka.client.registry-fetch-interval-seconds` | — | `5` | |
 | `eureka.instance.prefer-ip-address` | `EUREKA_INSTANCE_PREFER_IP_ADDRESS` (k8s) | `true` | |
 | `eureka.instance.lease-renewal-interval-in-seconds` / `lease-expiration-duration-in-seconds` | — | `5` / `15` | |
-| `resilience4j.circuitbreaker.instances.product-service.*` | — | window 10, minimum 5 calls, 50 %, 10 s open | Applies to no call (see Outbound calls). |
+| `resilience4j.circuitbreaker.instances.product-service.*` | — | `slidingWindowSize` 10, `minimumNumberOfCalls` 5, `failureRateThreshold` 50, `waitDurationInOpenState` 10s, `permittedNumberOfCallsInHalfOpenState` 3, `slowCallDurationThreshold` 5s, `slowCallRateThreshold` 80, `automaticTransitionFromOpenToHalfOpenEnabled` true, 4xx in `ignoreExceptions` | The breaker named `product-service` (see Outbound calls). |
 | `management.endpoints.web.exposure.include` | — | `health,info,metrics,prometheus,circuitbreakers,serviceregistry` | |
 | `management.endpoint.health.show-details` | — | `never` | |
 | `management.endpoint.health.probes.enabled` | `MANAGEMENT_ENDPOINT_HEALTH_PROBES_ENABLED` (k8s) | unset | k8s sets `true`. |
@@ -309,7 +335,10 @@ From `src/main/resources/application.yaml`, plus what docker-compose and Kuberne
 | `management.opentelemetry.tracing.export.otlp.endpoint` | `OTEL_EXPORTER_OTLP_ENDPOINT` (base) | `http://tempo:4318` + `/v1/traces` | |
 | `management.otlp.metrics.export.enabled` | — | `false` | |
 | `springdoc.api-docs.path` / `swagger-ui.path` | — | `/api-docs` / `/swagger-ui.html` | |
-| `logging.pattern.console` | — | `%d{yyyy-MM-dd HH:mm:ss} [%X{correlationId}] [%thread] %-5level %logger{36} - %msg%n` | |
+| `logging.pattern.console` | — | `%d{yyyy-MM-dd HH:mm:ss} [%thread] [%X{correlationId:-}] [%X{traceId:-}] %-5level %logger{36} - %msg%n` | The same pattern in every Java service. |
+| `logging.level.com.ecommerce` | `LOGGING_LEVEL_COM_ECOMMERCE` | `INFO` | Set to `DEBUG` for a diagnosis. |
+| `logging.level.org.mongodb.driver` | — | `WARN` | While MongoDB is unreachable the driver logs an INFO line of 600+ characters (the whole topology) for every operation that waits for a server, and a stack trace for every failed heartbeat. |
+| `http.max-request-body-bytes` | — | `1048576` | Largest request body; the default is in `RequestSizeLimitFilter`, not in `application.yaml`. |
 | `spring.data.web.pageable.serialization-mode` | — | not set (`direct`) | Page JSON shape, see the API reference. |
 | `spring.jackson.*` | — | not set | Jackson 3 defaults. |
 | `JAVA_OPTS` | `JAVA_OPTS` | `-XX:MaxRAMPercentage=55 -XX:ActiveProcessorCount=2 -XX:+ExitOnOutOfMemoryError` (compose and k8s) | |
@@ -320,10 +349,10 @@ Runtime: compose `mem_limit: 768m`, waits for a healthy `catalogdb` (an authenti
 
 ## Observability
 
-- **Actuator.** `/actuator/health` (details always; includes MongoDB), liveness and readiness groups in Kubernetes, `/actuator/info`, `/actuator/metrics`, `/actuator/prometheus` (unrestricted), `/actuator/serviceregistry` (used by the `preStop` hook). `circuitbreakers` is in the exposure list, but no call goes through a breaker.
-- **Metrics.** Boot's auto-configured meters only; no custom meters. `http.server.requests` has a percentile histogram and SLO buckets at 50 ms to 2 s; meters carry `application=catalog-service` and `environment`. Prometheus job `catalog-service` scrapes `catalog-service:8083/actuator/prometheus`; MongoDB is scraped by `mongodb-exporter-catalogdb` (`:9216`) with the alerts `MongoDown` and `MongoTooManyConnections`.
-- **Logs.** `Synced catalog entry for product <id>` (INFO); `Concurrent write on sync of product <id> (attempt <n>/5), retrying` (INFO); `Not found: <message>` (WARN, every 404); `Concurrent modification on <uri>: <message>` (WARN, every 409); `Unhandled exception` (ERROR, every 500, including Feign failures and malformed requests); `Ensured index <name> on catalog_entries` at startup.
-- **Correlation id.** `filter/CorrelationIdFilter.kt` uses `X-Correlation-Id` when the header is present (an empty value is used as is; only a missing header gets a new UUID), puts it in the MDC and echoes it. It is not forwarded on the Feign calls.
+- **Actuator.** `/actuator/health` (status only, `show-details: never`; includes MongoDB, so it answers 503 while MongoDB is unreachable, and the compose healthcheck calls it), liveness and readiness groups in Kubernetes (`/actuator/health/liveness` stays 200 during a MongoDB outage, because a restart cannot bring MongoDB back), `/actuator/info`, `/actuator/metrics`, `/actuator/prometheus` (unrestricted), `/actuator/serviceregistry` (used by the `preStop` hook). `circuitbreakers` is in the exposure list; both Feign calls go through the breaker `product-service` (see [Outbound calls](#outbound-calls)).
+- **Metrics.** Boot's auto-configured meters and the circuit breaker's `resilience4j_circuitbreaker_*` meters (`name="product-service"`, watched by the `CircuitBreakerOpen` alert); no custom meters. `http.server.requests` has a percentile histogram and SLO buckets at 50 ms to 2 s; meters carry `application=catalog-service` and `environment`. Prometheus job `catalog-service` scrapes `catalog-service:8083/actuator/prometheus`; MongoDB is scraped by `mongodb-exporter-catalogdb` (`:9216`) with the alerts `MongoDown` and `MongoTooManyConnections`.
+- **Logs.** The console pattern carries the thread, the correlation id and the trace id, and `com.ecommerce` logs at INFO (the MongoDB driver at WARN). Lines: `Synced catalog entry for product <id>` (INFO); `Concurrent write on sync of product <id> (attempt <n>/5), retrying` (INFO); `Not found: <message>` (WARN, 404), `Concurrent modification on <uri>` (WARN, 409) and `Upstream not found on <uri>` (WARN, product-service 404), each at most once per 10 s with `(N similar suppressed)` on the next, and with the logged URI or message stripped of control characters and cut at 256 characters; `Dependency unavailable on <method> <uri> (correlationId=<id>): <cause>; root cause: <root cause>` (WARN, 503, per cause class per 10 s, no stack trace); `product-service answered with status <n> on <method> <uri> (correlationId=<id>)` (WARN, 502, per status per 10 s); `Unhandled exception on <method> <uri> (correlationId=<id>)` (ERROR with the stack trace, a real bug, at most once per failure site per 10 s); `Circuit breaker 'product-service' is now OPEN (...)` (WARN) and `... is closed again (...)` (INFO), on transitions only; `Ensured index <name> on catalog_entries` and the initializer's WARN, INFO and ERROR lines (see Persistence). A flood of failing requests costs a handful of lines, not one or more per request.
+- **Correlation id.** `filter/CorrelationIdFilter.kt` uses `X-Correlation-Id` when it matches `^[A-Za-z0-9._-]{1,64}$` (a missing, empty or malformed value gets a new UUID), puts it in the MDC and echoes it. It is not forwarded on the Feign calls.
 - **Tracing.** Micrometer tracing with OTLP export to Tempo, sampling 1.0. Inbound requests are traced; the Feign calls to product-service are not instrumented.
 
 ## Testing
@@ -332,22 +361,31 @@ Paths are relative to `src/test/kotlin/com/ecommerce/`.
 
 | Class | Kind | What it covers |
 |---|---|---|
-| `catalogservice/service/CatalogServiceTest` | Mockito unit test | Featured, by id (found, not found, `id == productId`), by category, search (text hit, substring fallback, blank query skips the text index), PATCH (featured and price, not found, a lost race is not retried), sync (insert keyed by product id with `LOW_STOCK`, cents rounding, update in place keeps `featured` and `imageUrl`, retry after a lost first insert fetches the product only once, gives up after five lost races). |
+| `catalogservice/service/CatalogServiceTest` | Mockito unit test | Featured, by id (found, not found, `id == productId`), by category, search (text hit, substring fallback, blank query skips the text index), PATCH (featured and price, not found, a lost race is not retried), sync (insert keyed by product id with `LOW_STOCK`, cents rounding, update in place keeps `featured` and `imageUrl`, retry after a lost first insert fetches the product only once, gives up after five lost races; a failed categories lookup keeps the stored name, clears it when the category changed, and a product without a category skips the call; unusable product data is refused with 502 and nothing is written, an absurd price exponent before anything rounds it); category and featured ask the repository for one page only. |
+| `catalogservice/repository/CatalogEntryRepositoryImplTest` | Mockito unit test | the text search, its count and the substring scan all carry `maxTimeMS` 4000 |
 | `catalogservice/repository/CatalogEntryRepositoryTest` | `@DataMongoTest` against `mongo:8.0` via Testcontainers; skipped, not failed, without Docker | Field round trip with Decimal128 price, no `productId` field, no `_class`, version 0; insert collision on an existing id; derived queries; regex metacharacters in the substring search; paging; startup indexes by name; timestamps across load-modify-save; text ranking and OR semantics and whole-word matching; stable text-search totals; the service's text-then-substring choice; a stale save rejected by the version check; two racing first syncs converge; backfill of legacy documents. |
 | `catalogservice/repository/MongoSliceTestConfiguration` | test configuration | Stands in for the application class in the slice, because the real one's `@EnableFeignClients` needs Feign auto-configuration the slice leaves out. |
 | `catalogservice/config/ConnectionFailureRetryerTest` | unit test | Connection refused and connect timeouts are retried then propagated; read timeouts are not retried; `clone()` resets the counter. |
 | `catalogservice/config/FeignHttpMessageConvertersRaceTest` | concurrency test | 200 rounds of 48 threads hitting a cold converter instance never observe an empty list. |
 | `catalogservice/contract/ProductServiceConsumerPactTest` | Pact consumer | Runs the real Feign client, the production `FeignConfig` and Boot's Jackson against a Pact mock server on fixed port 18083, driven through `CatalogService.syncFromProductService()`; writes `target/pacts/catalog-service-product-service.json`. |
-| `catalogservice/exception/GlobalExceptionHandlerTest`, `catalogservice/filter/CorrelationIdFilterTest` | unit | exception mappings, including the client-error mappings and the catch-all; the correlation ID |
-| `catalogservice/client/ProductServiceClientFallbackTest`, `catalogservice/config/CatalogCollectionInitializerTest` | unit | the inactive fallback; the startup backfill and index creation logic |
+| `catalogservice/exception/GlobalExceptionHandlerTest`, `catalogservice/filter/CorrelationIdFilterTest` | unit | exception mappings, including the client-error mappings, the 503 for a MongoDB or product-service that does not answer, the 502 for an unusable answer, 409 for a write conflict and the catch-all; the throttled log lines (a dead database or peer under load, a bug on a hot path, unknown ids, a storm of lost races); the correlation ID |
+| `catalogservice/exception/DependencyFailuresTest` | unit | which driver and Spring Data exceptions count as "MongoDB did not answer" (the cause chain is walked, command codes for a busy or failing-over server) and which stay errors or 409s |
+| `catalogservice/filter/RequestSizeLimitFilterTest`, `catalogservice/logging/LogThrottleTest` | unit | 413 for a declared length above the limit, a body without a declared length cut off at the limit; one logged occurrence per key and window with the suppressed count |
+| `catalogservice/client/ProductServiceClientFallbackTest`, `catalogservice/client/ProductServiceClientFallbackFactoryTest` | unit | the fallback fails instead of inventing a product or an empty category list; the factory passes a 404 through, turns "no answer" into the 503 exception and an unusable answer into the 502 exception (carrying only the status), unwraps wrappers from another thread and rethrows anything else |
+| `catalogservice/config/CatalogCollectionInitializerTest` | unit | backfill and index creation by collection name and in order; a database that does not answer does not fail startup and a retry is scheduled; back-off from 1 s to 30 s; on recovery the remaining steps run in order and none of the finished ones twice; a long outage logs at most one warning a minute and no stack trace; a refused step is skipped with one error while the others run; shutdown stops the retries |
+| `catalogservice/config/CircuitBreakerTransitionLoggerTest` | unit | opening is one WARN and closing one INFO, calls rejected while open log nothing, a forced-open breaker is a WARN, breakers that already exist are covered |
+| `catalogservice/config/MongoClientTimeoutsTest`, `catalogservice/config/ProductionConfigTest` | unit | the MongoDB timeouts (3 s, 2 s, 5 s, 2 s) are the defaults, none is the driver's, and they can be tuned; the packaged `application.yaml` as production reads it: breaker without worker thread, time limiter or bulkhead, Feign timeouts, breaker thresholds, INFO logging in one pattern with the driver at WARN |
 | `catalogservice/integration/CatalogApiIT` | full app, `mongo:8.0`, WireMock for product-service | sync stores the projection and a second sync updates in place, keeping the catalog-owned fields; get by id and the 404 envelope with the caller's correlation ID; browse paging; by category; featured; PATCH; search ranking and the substring fallback |
-| `catalogservice/integration/ProductServiceFailureIT` | full app, `mongo:8.0`, WireMock | product-service answering 500, being down (after the connection retries) or returning an undecodable body fails the sync and writes nothing; the sync works again on recovery; a failing categories call only costs the category name |
-| `catalogservice/integration/CatalogCollectionInitializerIT` | full app, `mongo:8.0` | startup creates every index; on a fresh database it creates the collection and a second run changes nothing; a legacy document is backfilled and then updatable |
+| `catalogservice/integration/ProductServiceFailureIT` | full app, `mongo:8.0`, WireMock | product-service answering 500 is a 502 and the stored entry is untouched; being down is a 503 after the connection retries and nothing is written; an undecodable body is a 502, not a half-written entry; an unknown product is a 404; the sync works again on recovery; a failing categories call does not fail the sync |
+| `catalogservice/integration/ProductServiceResilienceIT` | full app, `mongo:8.0`, WireMock | the breaker adds no worker thread, time limiter or bulkhead and is the one named `product-service` with the configured window; 24 concurrent syncs overlap at the peer; a 2.5 s answer is waited for, not cut at 1 s; slow answers open the breaker and later calls fail fast; a read timeout is a 503 after the timeout and the peer is asked once; a connection reset and a 503 are each a 503 sent once, not repeated; a 500 is a 502 with a fixed message; an unknown product is a 404; a failing categories call keeps the stored category name; an unusable price is refused with 502, an absurd exponent quickly; repeated outages open the breaker, which rejects without calling the peer and closes again on recovery; 4xx answers never open it |
+| `catalogservice/integration/MongoUnavailableIT` | full app, no MongoDB at all | the service starts; the read endpoints (by id, browse, search, featured, category) answer 503 within the server-selection timeout; liveness stays 200 while `/actuator/health` is 503; 40 failing requests cost at most four WARN/ERROR lines from startup on and none with a stack trace; the driver writes no per-operation lines |
+| `catalogservice/integration/CatalogListBoundsIT` | full app, `mongo:8.0` | category and featured answer with one page of at most 100 in product id order; browse and search pages are stable and do not overlap; oversized and nonsense page parameters are 400; a search text over 200 characters is 400; a request body over 1 MB is 413 and nothing is stored |
+| `catalogservice/integration/CatalogCollectionInitializerIT` | full app, `mongo:8.0` | startup creates every index; on a fresh database it creates the collection and a second run changes nothing; a legacy document is backfilled and then updatable; an index that conflicts with an existing one is skipped with an error and startup and the other indexes are not affected |
 | `catalog/controller/CatalogControllerTest.kt`, `catalog/service/CatalogServiceTest.kt` | placeholders | Only a package line and the comment "Replaced"; no tests. The web layer is covered by `CatalogApiIT` |
 
-69 unit, slice and pact tests and 20 integration tests. The repository test skips without Docker; the ITs fail.
+200 unit, slice and pact tests and 117 integration tests. The repository test skips without Docker; the ITs fail.
 
-No tests are disabled for bugs any more.
+No tests are disabled for bugs any more. The counts include the `@Tag("security")` classes (`CatalogAuthorizationSecurityTest`, `CatalogDataIntegritySecurityIT`, `CatalogInjectionSecurityIT`).
 
 Pinned by the consumer pact (verified by `ProductServiceProviderPactTest` in product-service after `ecommerce-platform/sync-pacts.sh` copies it there):
 
@@ -368,11 +406,13 @@ Paths are relative to `src/main/kotlin/com/ecommerce/catalogservice/` unless sta
 | Path | Role |
 |---|---|
 | `CatalogServiceApplication.kt` | Boot entry point, `@EnableFeignClients`. |
-| `client/ProductServiceClient.kt` | Feign client for product-service. |
-| `client/ProductServiceClientFallback.kt` | Fallback implementation; not wired (no Feign circuit breaker). |
-| `config/FeignConfig.kt` | `ThreadSafeFeignHttpMessageConverters`, `ConnectionFailureRetryer`. |
-| `config/MongoConfig.kt` | Removes the `_class` type hint. |
-| `config/CatalogCollectionInitializer.kt` | Startup backfill and index creation. |
+| `client/ProductServiceClient.kt` | Feign client for product-service (`fallbackFactory`). |
+| `client/ProductServiceClientFallbackFactory.kt` | Typed fallback factory: 404 passed through, no answer becomes 503, an unusable answer 502. |
+| `client/ProductServiceClientFallback.kt` | The fallback for "no answer": throws `ProductServiceUnavailableException`. |
+| `config/FeignConfig.kt` | `ThreadSafeFeignHttpMessageConverters`, `ConnectionFailureRetryer`, the HttpClient 5 customizer that switches its automatic retries off, and the `CircuitBreakerNameResolver` that names the breaker `product-service`. |
+| `config/MongoConfig.kt` | Removes the `_class` type hint; sets the MongoDB client timeouts. |
+| `config/CatalogCollectionInitializer.kt` | Startup backfill and index creation, retried in the background while MongoDB does not answer. |
+| `config/CircuitBreakerTransitionLogger.kt` | One log line per breaker state change (WARN on open, INFO on close). |
 | `config/OpenApiConfig.kt` | OpenAPI title and a global `bearerAuth` scheme (documentation only). |
 | `controller/CatalogController.kt` | `/api/v1/catalog` endpoints. |
 | `service/CatalogService.kt` | Search, reads, sync, PATCH, retry on concurrent writes, price rounding, DTO mapping. |
@@ -380,8 +420,10 @@ Paths are relative to `src/main/kotlin/com/ecommerce/catalogservice/` unless sta
 | `repository/CatalogEntryRepositoryCustom.kt` | `searchByText` and its `Impl` (MongoTemplate `$text` query). |
 | `model/CatalogEntry.kt`, `model/StockStatus.kt` | Document class and stock band enum. |
 | `dto/` | `CatalogEntryDTO`, `UpdateCatalogEntryRequest`, and the inbound `ProductDTO` and `CategoryDTO`. |
-| `exception/` | `CatalogEntryNotFoundException`, `ErrorResponse` and `FieldError`, `GlobalExceptionHandler`. |
+| `exception/` | `CatalogEntryNotFoundException`, `ErrorResponse` and `FieldError`, `GlobalExceptionHandler`, `DependencyFailures` (which MongoDB failures mean "did not answer"), `ProductServiceUnavailableException` (503) and `ProductServiceErrorException` (502). |
 | `filter/CorrelationIdFilter.kt` | `X-Correlation-Id` to MDC and response header. |
+| `filter/RequestSizeLimitFilter.kt` | 413 for a request body above 1 MB. |
+| `logging/LogThrottle.kt` | Bounds how often one kind of log line is written (the Kotlin copy of the class every Java service carries). |
 | `docker/Dockerfile` | Runtime image: `eclipse-temurin:25-jre-alpine`, copies the jar built on the host, runs as a non-root user. |
 
 ## Known issues and limitations
@@ -392,13 +434,14 @@ Paths are relative to `src/main/kotlin/com/ecommerce/catalogservice/` unless sta
 | A price set through `PATCH` is overwritten by the next sync, although the README calls the price overridable. | `CatalogService.syncFromProductService()` (existing-entry branch) | Merchandising price changes are silently lost. | Medium |
 | The product `status` is ignored and entries are never removed. | `CatalogService.syncFromProductService()`; no delete endpoint | Soft-deleted products stay in the catalog and are shown with a stock band computed from their quantity. | Medium |
 | ~~Write endpoints need only any JWT~~ (fixed: admin-only, validated); port 8083 still skips the gateway in compose. | `controller/CatalogController.kt` | Any user can sync any product and change `featured`, `imageUrl` and the catalog price. The storefront does not read the catalog today, which limits the effect. | Medium |
-| ~~Feign failures are not mapped~~ | fixed for an unknown product (404); other upstream failures are still 500. | | — |
-| The configured circuit breaker and the fallback are dead: `spring.cloud.openfeign.circuitbreaker.enabled` is never set. | `client/ProductServiceClient.kt`, `client/ProductServiceClientFallback.kt`, `application.yaml` (`resilience4j`) | No protection when product-service is slow: each sync can hold a request thread for up to 10 s per call. The configuration suggests otherwise. | Low |
-| A failed categories call writes `categoryName = null` over a previously stored name. | `CatalogService.syncFromProductService()` | A transient failure blanks category names. | Low |
+| ~~Feign failures are not mapped~~ | fixed | An unknown product is 404, a product-service that gives no answer is 503 and any other upstream failure is 502, each with a fixed message. | — |
+| ~~The configured circuit breaker and the fallback are dead~~ | fixed | `spring.cloud.openfeign.circuitbreaker.enabled` is `true`, the breaker is named `product-service`, and the fallback factory maps failures to 404, 503 and 502 (see Outbound calls). | — |
+| ~~A failed categories call writes `categoryName = null` over a previously stored name~~ | fixed | A failed lookup means "unknown": the stored name is kept while the category is unchanged (rule 4). | — |
 | ~~No client-error handlers~~ | fixed | Malformed requests are 400/404/405/406/415. | — |
 | ~~The PATCH body is not validated~~ | fixed | `price` and `imageUrl` are validated (see Security and identity). | — |
 | The 409 only covers the service's own read-to-write window; the version is not exposed and the PATCH takes no expected version. | `CatalogService.updateCatalogEntry()`, `dto/CatalogEntryDTO.kt` | A client editing from an older read overwrites newer changes without a conflict. | Low |
-| Browse and the substring fallback are unsorted; `size` is capped at 100. | `CatalogService.getAllEntries()`, `findByProductNameContainingIgnoreCase()`, `CatalogController` | Page boundaries are not guaranteed stable; a client can request any page size. | Low |
-| Every sync downloads the full category list instead of `GET /api/v1/categories/{id}`. | `CatalogService.syncFromProductService()` | Cost grows with the number of categories. | Low |
-| Changing an index definition under an existing name, or the text index fields, makes `createIndex` fail and stops startup until the old index is dropped by hand. | `config/CatalogCollectionInitializer.kt` | Operational step on index changes. | Low |
-| Dead code and configuration: `findByStockStatus` and its index (no endpoint), `ProductServiceClientFallback`, the `resilience4j` instance, the unused `spring-boot-starter-validation`, and two placeholder test files under `com/ecommerce/catalog`. | `repository/CatalogEntryRepository.kt`, `pom.xml`, `src/test/kotlin/com/ecommerce/catalog/` | Noise; one index maintained for nothing. | Low |
+| ~~Browse and the substring fallback are unsorted~~ | fixed | Every list is ordered by `productId` (search by text score first), `size` is 1 to 100, and category and featured are paged too (rule 10). | — |
+| Every sync downloads the category list instead of `GET /api/v1/categories/{id}` (it is skipped for a product without a category). | `CatalogService.syncFromProductService()` | Cost grows with the number of categories. product-service returns at most the first 1000 by id, so a category beyond that is not found and its name stays unresolved. | Low |
+| ~~Changing an index definition under an existing name, or the text index fields, stops startup~~ | fixed | The initializer skips the refused step with one ERROR and the service starts; text search fails until the old index is dropped by hand (see Persistence). | — |
+| A document that cannot be mapped to `CatalogEntry` (for example one without `productSku`) fails every read of a page that contains it. | `CatalogEntry` (non-null Kotlin properties), `CatalogService.syncFromProductService()` | The request ends in a 500 (its ERROR line is throttled), and a sync of that product cannot repair the document because it loads it first. It has to be fixed or deleted in MongoDB by hand. | Low |
+| Dead code and configuration: `findByStockStatus` and its index (no endpoint), and two placeholder test files under `com/ecommerce/catalog`. | `repository/CatalogEntryRepository.kt`, `src/test/kotlin/com/ecommerce/catalog/` | Noise; one index maintained for nothing. | Low |

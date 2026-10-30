@@ -301,8 +301,9 @@ spec:
               value: kafka:29092
             - name: DYNAMIC_CONFIG_ENABLED
               value: "true"
+            # Same exit-on-OOM contract as java-env: a half-dead UI is worse than a restart.
             - name: JAVA_OPTS
-              value: -XX:MaxRAMPercentage=60 -XX:ActiveProcessorCount=2
+              value: -XX:MaxRAMPercentage=60 -XX:ActiveProcessorCount=2 -XX:+ExitOnOutOfMemoryError
           resources:
             requests:
               cpu: 100m

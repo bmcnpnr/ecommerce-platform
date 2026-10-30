@@ -27,7 +27,26 @@
         "tags": [
           "Shipments"
         ],
+        "summary": "Create a shipment (admin)",
         "operationId": "createShipment",
+        "parameters": [
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -57,8 +76,25 @@
         "tags": [
           "Shipments"
         ],
+        "summary": "Update shipment status (admin)",
         "operationId": "updateStatus",
         "parameters": [
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "id",
             "in": "path",
@@ -118,8 +154,25 @@
         "tags": [
           "Shipments"
         ],
+        "summary": "Shipment history (owner or admin)",
         "operationId": "getHistory",
         "parameters": [
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "id",
             "in": "path",
@@ -170,7 +223,7 @@
             "content": {
               "*/*": {
                 "schema": {
-                  "$ref": "#/components/schemas/ShipmentDTO"
+                  "$ref": "#/components/schemas/PublicTrackingDTO"
                 }
               }
             }
@@ -183,8 +236,25 @@
         "tags": [
           "Shipments"
         ],
+        "summary": "Shipment of an order (owner or admin)",
         "operationId": "getByOrderId",
         "parameters": [
+          {
+            "name": "X-Username",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
           {
             "name": "orderId",
             "in": "path",
@@ -216,23 +286,38 @@
         "type": "object",
         "properties": {
           "carrier": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 50,
+            "minLength": 0,
+            "pattern": "[^\\u0000]*"
           },
           "customerId": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 0,
+            "pattern": "[^\\u0000]*"
           },
           "destinationAddress": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 1000,
+            "minLength": 0,
+            "pattern": "[^\\u0000]*"
           },
           "estimatedDelivery": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 0,
+            "pattern": "[^\\u0000]*"
           },
           "orderId": {
             "type": "integer",
             "format": "int64"
           },
           "originAddress": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 1000,
+            "minLength": 0,
+            "pattern": "[^\\u0000]*"
           }
         },
         "required": [
@@ -289,13 +374,22 @@
         "type": "object",
         "properties": {
           "description": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 0,
+            "pattern": "[^\\u0000]*"
           },
           "location": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 255,
+            "minLength": 0,
+            "pattern": "[^\\u0000]*"
           },
           "status": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 30,
+            "minLength": 0,
+            "pattern": "[^\\u0000]*"
           }
         },
         "required": [
@@ -325,6 +419,48 @@
           "shipmentId": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "PublicTrackingDTO": {
+        "type": "object",
+        "properties": {
+          "carrier": {
+            "type": "string"
+          },
+          "estimatedDelivery": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "events": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PublicTrackingEventDTO"
+            }
+          },
+          "status": {
+            "type": "string"
+          },
+          "trackingNumber": {
+            "type": "string"
+          }
+        }
+      },
+      "PublicTrackingEventDTO": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "location": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "timestamp": {
+            "type": "string",
+            "format": "date-time"
           }
         }
       }

@@ -1,8 +1,11 @@
 # React SPA served by nginx, with /api proxied to the gateway.
 #
 # The image is reused unchanged from compose, but its baked-in nginx.conf is
-# overridden by the ConfigMap below. Two things in the compose version do not
-# survive the move:
+# overridden by the ConfigMap below. The ConfigMap is ecommerce-frontend/nginx.conf
+# (security headers, server_tokens off, no /actuator/ proxy, 5 s connect and 35 s
+# read timeouts, the JSON 503 fallback, request-size and client timeouts, the
+# asset access-log filter) with one difference, the upstream. Two things in the
+# compose version do not survive the move:
 #
 #   resolver 127.0.0.11   — Docker's embedded DNS. That address does not exist
 #                           in a pod; nginx would fail every proxied request.
@@ -11,6 +14,11 @@
 #                           life of the Service, so resolving once at startup
 #                           is correct again and the variable indirection (and
 #                           the $request_uri it forces) can go.
+#
+# Keep the two in step: check-frontend-nginx-parity.sh compares them, and the
+# checksum/nginx-config annotation on the pod template below has to change with
+# the ConfigMap, because a subPath mount never sees a ConfigMap update and the
+# pod would keep serving the old config.
 #
 # Two Services: `frontend` on :80 is what nginx-exporter and blackbox scrape
 # (both address it by that name and port), `frontend-lb` publishes it on host
@@ -23,21 +31,56 @@ metadata:
   namespace: ecommerce
 data:
   default.conf: |
+    # Static asset hits are most of the access log and say nothing: only failed ones (4xx/5xx) are
+    # logged for the asset location below. API requests and everything else stay fully logged.
+    map $status $log_asset_failures {
+        ~^[23]  0;
+        default 1;
+    }
+
     server {
         listen 80;
+        # Also accept IPv6: container tooling resolves 'localhost' to ::1 first.
         listen [::]:80;
         server_name _;
 
         root /usr/share/nginx/html;
         index index.html;
 
-        gzip on;
-        gzip_types text/plain text/css application/json application/javascript
-                   text/xml application/xml application/xml+rss text/javascript;
+        # Don't advertise the nginx version in headers and error pages (S-7).
+        server_tokens off;
 
-        # nginx metrics for nginx-prometheus-exporter. Without this the
-        # exporter's scrape falls through to the SPA fallback below, receives
-        # HTML, and every nginx_* metric goes missing.
+        # ─── Slow or oversized clients ──────────────────────────────────────────
+        # The API takes small JSON bodies (the gateway refuses anything over 1 MB as well) and the SPA
+        # uploads nothing, so a client that dribbles headers or a body is not served for a minute.
+        client_header_timeout 15s;
+        client_body_timeout   15s;
+        send_timeout          30s;
+        client_max_body_size  1m;
+
+        # ─── Browser security headers (S-7) ─────────────────────────────────────
+        # The token sits in localStorage, so a script injection would be enough to
+        # steal it: the CSP allows scripts from this origin only. MUI/emotion inject
+        # <style> elements at runtime, hence 'unsafe-inline' for styles (not
+        # scripts). add_header is inherited only by locations that define none of
+        # their own, so every location that adds a header repeats these.
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+        add_header X-Frame-Options "DENY" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+
+        # ─── Gzip compression ──────────────────────────────────────────────────
+        gzip on;
+        gzip_vary on;
+        gzip_min_length 1024;
+        gzip_types text/plain text/css application/json application/javascript
+                   text/xml application/xml application/xml+rss text/javascript image/svg+xml;
+
+        # ─── nginx metrics for nginx-prometheus-exporter ────────────────────────
+        # Without this, the exporter's scrape of /stub_status falls through to the
+        # SPA fallback and receives HTML, so every nginx_* metric goes missing.
+        # Restricted to RFC1918 so it is not reachable from outside the network.
         location = /stub_status {
             stub_status;
             access_log off;
@@ -48,9 +91,23 @@ data:
             deny all;
         }
 
-        # '^~' so this wins over the static-asset regex below: without it a
-        # request such as /api/v1/products/logo.png would match the regex
-        # location and 404 instead of being proxied.
+        # ─── API proxy → api-gateway ────────────────────────────────────────────
+        # All /api requests are forwarded to the API Gateway inside the cluster. The
+        # browser never needs to know the gateway's address.
+        # '^~' so this wins over the static-asset regex below: without it, a request
+        # such as /api/v1/products/logo.png would be matched by the regex location
+        # and 404 instead of being proxied.
+        # A literal hostname in proxy_pass is resolved once, when nginx starts, and that
+        # is right here: api-gateway is a Service, and a Service's ClusterIP is stable for
+        # the life of the Service (rolling the gateway pods does not change it). So the
+        # Docker-only workarounds of the compose config are dropped: no resolver (a pod
+        # has no 127.0.0.11) and no proxy_pass through a variable, hence no $request_uri.
+        #
+        # Timeouts: the gateway answers its own 504 (JSON) once a service is too slow, and the SPA gives
+        # up after 30 s, so nginx waits a little longer than both (35 s, not the 60 s default of the
+        # old config) and a dead gateway costs a request 5 s to connect, not 60. A timed-out request
+        # is never replayed against the gateway (proxy_next_upstream off): the retry decision is the
+        # SPA's, which retries a failed read once and never a write.
         location ^~ /api/ {
             proxy_pass         http://api-gateway:8080;
             proxy_http_version 1.1;
@@ -58,23 +115,76 @@ data:
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
             proxy_set_header   X-Forwarded-Proto $scheme;
-            proxy_read_timeout 60s;
+            proxy_connect_timeout 5s;
+            proxy_send_timeout    35s;
+            proxy_read_timeout    35s;
+            proxy_next_upstream   off;
+            # The services send nosniff themselves and the server-level add_header adds it again, which
+            # made "nosniff, nosniff": keep only nginx's, which is also present on its own error pages.
+            proxy_hide_header     X-Content-Type-Options;
+            # Only nginx's own failures (gateway down: 502, no answer: 504) get this; a status the
+            # gateway itself sends, with its own JSON body, passes through untouched.
+            error_page 502 503 504 = @api_unavailable;
         }
 
+        # What the SPA gets when it cannot reach the gateway: the same 503 + fixed message the services
+        # use for an unavailable dependency, as JSON it can show, instead of an HTML error page.
+        location @api_unavailable {
+            default_type application/json;
+            add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+            add_header X-Frame-Options "DENY" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+            add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+            add_header Cache-Control "no-store" always;
+            add_header Retry-After "5" always;
+            return 503 '{"status":503,"error":"Service Unavailable","message":"Service temporarily unavailable"}';
+        }
+
+        # No /actuator/ proxy: the gateway's management endpoints (serviceregistry can
+        # take it out of load balancing) are not for the public origin (S-6). The paths answer
+        # 404 instead of the SPA page, so a scanner or a probe sees that nothing is there.
         location ^~ /actuator/ {
-            proxy_pass         http://api-gateway:8080;
-            proxy_http_version 1.1;
-            proxy_set_header   Host      $host;
-            proxy_set_header   X-Real-IP $remote_addr;
+            return 404;
         }
 
-        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?|ttf|eot)$ {
-            expires 1y;
-            add_header Cache-Control "public, immutable";
+        # ─── Favicon – not content-hashed, so it must be allowed to change ──────
+        location = /favicon.svg {
+            add_header Cache-Control "public, max-age=86400" always;
+            add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+            add_header X-Frame-Options "DENY" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+            add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
             try_files $uri =404;
         }
 
+        # ─── Static assets – long-lived cache ───────────────────────────────────
+        # Vite names every bundle after its content (assets/index-1a2b3c.js), so a file under this
+        # name never changes and may be cached for good. After a deploy the old names are gone: a tab
+        # that still asks for one gets a 404 and the SPA reloads itself once (lazyWithReload).
+        location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?|ttf|eot)$ {
+            add_header Cache-Control "public, max-age=31536000, immutable" always;
+            add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+            add_header X-Frame-Options "DENY" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+            add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
+            access_log /var/log/nginx/access.log main if=$log_asset_failures;
+            try_files $uri =404;
+        }
+
+        # ─── SPA fallback – all other routes → index.html ───────────────────────
+        # index.html names the current bundles, so it must be revalidated on every load (no-cache keeps
+        # the ETag round trip and drops the stale copy): a browser that kept an old one would ask for
+        # chunks that a deploy has deleted and show a white page.
         location / {
+            add_header Cache-Control "no-cache" always;
+            add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'" always;
+            add_header X-Frame-Options "DENY" always;
+            add_header X-Content-Type-Options "nosniff" always;
+            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+            add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()" always;
             try_files $uri $uri/ /index.html;
         }
     }
@@ -131,8 +241,11 @@ spec:
         group: frontend
       annotations:
         # Roll the pods when the proxy config changes; without this a ConfigMap
-        # edit only reaches nginx on the next unrelated restart.
-        checksum/nginx-config: "v1"
+        # edit only reaches nginx on the next unrelated restart. Change the value
+        # with every edit of default.conf above (v1 = the original proxy-only config,
+        # v2 = ecommerce-frontend/nginx.conf: headers, timeouts, JSON 503, no actuator;
+        # v3 = /actuator/ answers 404, one X-Content-Type-Options on API responses).
+        checksum/nginx-config: "v3"
     spec:
       containers:
         - name: nginx

@@ -50,3 +50,8 @@ HDR
 } > "$OUT"
 
 echo "wrote $OUT ($(wc -l < "$OUT") lines) from $MON_DIR"
+
+# Promtail's Kubernetes config is the one monitoring config kept inline in
+# 60-monitoring.yaml. Say so when its pipeline has drifted from the compose one
+# (a warning only: a drift must not block a deploy, but it must not go unseen).
+bash "$K8S_DIR/check-promtail-parity.sh" || echo "WARNING: promtail pipelines differ between compose and Kubernetes (see above)" >&2

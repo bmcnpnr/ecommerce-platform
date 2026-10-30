@@ -38,12 +38,12 @@ one to the other, which replaces the cluster with an empty one:
 | runtime | cri-dockerd | containerd |
 | `type: LoadBalancer` | binds on localhost | binds on localhost |
 | locally built images | shared | pulled from Docker on demand; a rebuilt tag needs `crictl pull` on the node (build-images does it) |
-| promtail stage | `docker: {}` | `cri: {}` |
+| promtail stage | `docker: {}` (chosen by the line's shape) | `cri: {}` (chosen by the line's shape) |
 | kubelet log rotation | no | yes (10 MB × 5) |
 
-`docker desktop kubernetes status` prints the active mode. Only the promtail
-pipeline stage in `60-monitoring.yaml` has to match — everything else is
-portable between the two.
+`docker desktop kubernetes status` prints the active mode. Nothing has to be
+edited to switch between the two: the Promtail pipeline in `60-monitoring.yaml`
+picks `docker` or `cri` per line (see below), so everything is portable.
 
 ```powershell
 ..\build-all.ps1 -SkipTests    # Maven; the Dockerfiles copy a pre-built jar
@@ -124,7 +124,13 @@ steady-state usage is around 7 GB, so the overcommit is deliberate.
 hardcodes Docker's embedded DNS at `127.0.0.11`, which does not exist in a pod.
 It also routes `proxy_pass` through a variable to force re-resolution, a
 workaround for container IPs changing on restart — a ClusterIP is stable for the
-life of the Service, so that indirection is dropped.
+life of the Service, so that indirection is dropped. Apart from those two things
+the ConfigMap is `ecommerce-frontend/nginx.conf` verbatim: the security headers
+(S-7), `server_tokens off`, no `/actuator/` proxy (S-6), 5 s connect and 35 s read
+timeouts, the JSON 503 when the gateway is unreachable, the 1 MB body limit and the
+asset access-log filter. `check-frontend-nginx-parity.sh` compares the two, and
+the `checksum/nginx-config` annotation on the pod template has to change with
+the ConfigMap, because a subPath mount never sees a ConfigMap update.
 
 **Promtail reads the Kubernetes API, not the Docker socket.** It discovers pods
 instead of containers; RBAC for it is in `60-monitoring.yaml`. Three details
@@ -132,16 +138,31 @@ have to be right together or it silently ships nothing:
 
 - a `__host__` relabel plus `HOSTNAME` from `spec.nodeName`. Promtail tails only
   pods on its own node and decides that by comparing the two. Without it every
-  target is discarded — `promtail_targets_active_total 0`, and no error.
-- a pipeline stage matching the runtime — `cri: {}` for containerd/CRI-O,
+  target is discarded — `promtail_targets_active_total 0`, and no error (the
+  alert `PromtailNoActiveTargets` now fires after 10 minutes).
+- an envelope stage matching the runtime — `cri: {}` for containerd/CRI-O,
   `docker: {}` for cri-dockerd. Get it wrong and lines still ship, but nothing
-  parses: no `level` label and no structured metadata. Check with
+  parses: no `level` label and no structured metadata. This used to be a manual
+  edit that a Docker Desktop upgrade silently invalidated. The pipeline now has
+  both, each in a `match` stage whose selector tests the shape of the line
+  (`{"log":` is Docker's JSON, anything else is CRI), so the right one runs
+  whatever the runtime is. (`docker` keeps the trailing newline of each line, so
+  it is followed by a `replace` that strips it.) Check the runtime with
   `kubectl get node -o jsonpath='{.items[0].status.nodeInfo.containerRuntimeVersion}'`.
 - on cri-dockerd only, `/var/lib/docker/containers` mounted as well as
   `/var/log/pods`, because there the log files are symlinks into that tree.
   Without it the globs resolve and then every file fails with
-  `stat failed ... no such file or directory`. Not needed on containerd, where
-  the files are real.
+  `stat failed ... no such file or directory`. The DaemonSet now always mounts
+  it (a `DirectoryOrCreate` hostPath, an empty directory under containerd).
+
+Everything after the envelope — multiline grouping of stack traces, the `level`
+label, `correlationId`/`traceId`/`thread` as structured metadata, the per-container
+counters, the DEBUG drop and the 300 entries/s limit — is the compose pipeline
+(`ecommerce-monitoring/promtail/promtail-config.yml`) verbatim.
+`check-promtail-parity.sh` compares the two and `sync-monitoring-config.sh`
+runs it, because the two parsers drifting apart is how finding O-3 happened.
+Promtail also gets a `promtail` Service (`:9080`) so Prometheus can scrape the
+log-volume counters like any other target.
 
 **Gateway routing is unaffected by Kubernetes Services.** `lb://user-service`
 resolves through Eureka, so `kubectl scale` works but the k8s Service is not in
@@ -186,7 +207,16 @@ after re-applying a changed config those pods need a restart
 (`kubectl -n ecommerce rollout restart deployment/prometheus`); the
 `--web.enable-lifecycle` reload endpoint cannot help because the file inside the
 pod has not changed. Rules and dashboards are directory mounts and refresh on
-their own within about a minute.
+their own within about a minute. The same goes for Promtail's config, which is
+a directory mount and which Promtail watches. The unit tests for the rules
+(`ecommerce-monitoring/prometheus/tests/`) are deliberately not part of the
+ConfigMap; they run in the monitoring repository's CI.
+
+The disk bounds are part of the generated configuration: the Loki and Tempo
+limits and Prometheus' `sample_limit` live in the shared files, so they need the
+restart above. Prometheus' `--storage.tsdb.retention.size=5GB` and Kafka's
+`KAFKA_LOG_RETENTION_BYTES` / `KAFKA_LOG_SEGMENT_BYTES` are in `60-monitoring.yaml`
+and `20-kafka.yaml`, mirroring `docker-compose.yml`.
 
 `prometheus.yml` needed no changes at all: it addresses everything by service
 name and port, and those names are preserved here.
@@ -252,7 +282,10 @@ scenario failed 13 of ~430 requests before):
   `OUT_OF_SERVICE` to its own `/actuator/serviceregistry`, then sleeps 15s while
   still serving. Every peer has dropped it by then, so Boot's graceful shutdown
   (default in Boot 4) only has in-flight requests to finish.
-  `terminationGracePeriodSeconds: 60` covers 15s drain + 30s graceful phase.
+  `terminationGracePeriodSeconds: 90` covers 15s drain + 30s graceful phase +
+  20s for the scheduler to let an outbox relay batch finish (order, payment,
+  shipping), with headroom. Compose gives the same JVMs `stop_grace_period: 60s`
+  (no drain there); Docker's default of 10s would cut both phases.
 - **Retry on connection failure only**: the gateway (`Retry` default filter,
   `connect-timeout: 3000`) and the Feign clients (`FeignConfig.ConnectionFailureRetryer`,
   `connect-timeout: 2000`) retry a request whose TCP connect failed — it never
@@ -308,4 +341,15 @@ that mode, bound it in `C:\Users\<you>\.docker\daemon.json`:
 Note that Docker Desktop rewrites `daemon.json` from its own settings store on
 restart, so make that change through Settings → Docker Engine rather than by
 editing the file. `docker-compose.yml` bounds the compose side independently
-with its `x-default-logging` anchor (50 MB × 3).
+with its `x-default-logging` anchor (50 MB × 3, non-blocking).
+
+That node-side file is the one thing the manifests cannot bound, and under
+kubeadm it remains a residual risk. (A pod `ephemeral-storage` limit does not
+fix it: the kubelet evicts the pod, but the evicted pod's dead container, and
+its log, stay on the node until the pod object is deleted, and the Deployment
+starts a replacement that floods again.) What the manifests do bound is what
+reaches the stores: Promtail drops more than 300 entries/s per container,
+Loki refuses a stream above 128 KB/s, and the alerts in
+`ecommerce-monitoring/prometheus/rules/logging-alerts.yml`
+(`ContainerLogVolumeHigh`, `ServiceLogRateCritical`, `HostDiskWillFillWithin4h`)
+fire within minutes of a runaway.

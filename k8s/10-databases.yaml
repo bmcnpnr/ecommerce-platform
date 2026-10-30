@@ -287,8 +287,11 @@ spec:
           image: mongo:8.0
           imagePullPolicy: IfNotPresent
           # WiredTiger sizes its cache from the cgroup limit and would otherwise
-          # claim all of it; 0.25 GB is the minimum. Matches docker-compose.yml.
-          args: ["mongod", "--wiredTigerCacheSizeGB", "0.25"]
+          # claim all of it; 0.25 GB is the minimum. Matches docker-compose.yml,
+          # including --quiet (no "Connection accepted/ended" and client-metadata
+          # lines, two thirds of mongod's per-connection log output) and --slowms
+          # 1000 (log only operations slower than a second, not 100 ms).
+          args: ["mongod", "--wiredTigerCacheSizeGB", "0.25", "--quiet", "--slowms", "1000"]
           ports:
             - name: mongodb
               containerPort: 27017

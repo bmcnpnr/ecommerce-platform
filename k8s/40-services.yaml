@@ -12,6 +12,13 @@
 # Probes use the split liveness/readiness groups enabled in 02-config.yaml.
 # Liveness must never depend on a downstream: pointing it at the aggregate
 # /actuator/health would let a 30-second database blip kill every JVM at once.
+#
+# Every probe waits 5 s for an answer (compose's healthcheck timeout), not the
+# 1 s default. A JVM on a saturated node (a log flood, a disk under pressure, ten
+# JVMs starting at once with ActiveProcessorCount=2) can stall for a second or two
+# in GC or scheduling; with the default each stall counted as a failure, and five
+# in a row restarted a healthy pod, which starts all over on the same saturated
+# node: a restart storm that hammers Postgres, Kafka and Eureka.
 ---
 apiVersion: v1
 kind: Service
@@ -49,7 +56,7 @@ spec:
         group: application
     spec:
       # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -131,18 +138,21 @@ spec:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: http
             periodSeconds: 20
+            timeoutSeconds: 5
             failureThreshold: 5
 ---
 apiVersion: v1
@@ -181,7 +191,7 @@ spec:
         group: application
     spec:
       # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -252,18 +262,21 @@ spec:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: http
             periodSeconds: 20
+            timeoutSeconds: 5
             failureThreshold: 5
 ---
 apiVersion: v1
@@ -302,7 +315,7 @@ spec:
         group: application
     spec:
       # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -376,18 +389,21 @@ spec:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: http
             periodSeconds: 20
+            timeoutSeconds: 5
             failureThreshold: 5
 ---
 apiVersion: v1
@@ -426,7 +442,7 @@ spec:
         group: application
     spec:
       # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -504,18 +520,21 @@ spec:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: http
             periodSeconds: 20
+            timeoutSeconds: 5
             failureThreshold: 5
 ---
 apiVersion: v1
@@ -554,7 +573,7 @@ spec:
         group: application
     spec:
       # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -632,18 +651,21 @@ spec:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: http
             periodSeconds: 20
+            timeoutSeconds: 5
             failureThreshold: 5
 ---
 apiVersion: v1
@@ -682,7 +704,7 @@ spec:
         group: application
     spec:
       # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -760,18 +782,21 @@ spec:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: http
             periodSeconds: 20
+            timeoutSeconds: 5
             failureThreshold: 5
 ---
 apiVersion: v1
@@ -810,7 +835,7 @@ spec:
         group: application
     spec:
       # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -881,18 +906,21 @@ spec:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: http
             periodSeconds: 20
+            timeoutSeconds: 5
             failureThreshold: 5
 ---
 apiVersion: v1
@@ -904,6 +932,10 @@ metadata:
     app: notification-service
     group: application
 spec:
+  # Only Prometheus and the health probes use this Service (the service has no API). Its readiness
+  # includes the Kafka listeners, so a broker outage makes the pod NotReady; keep it in the endpoints
+  # anyway, or the scrape that should show the outage would lose the target.
+  publishNotReadyAddresses: true
   selector:
     app: notification-service
   ports:
@@ -931,7 +963,7 @@ spec:
         group: application
     spec:
       # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -984,23 +1016,28 @@ spec:
               memory: 320Mi
             limits:
               memory: 640Mi
+          # Liveness, not readiness: readiness includes the Kafka listeners, and a broker that stays
+          # unreachable for the 5 minutes of this probe would otherwise restart the pod in a loop.
           startupProbe:
             httpGet:
-              path: /actuator/health/readiness
+              path: /actuator/health/liveness
               port: http
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: http
             periodSeconds: 20
+            timeoutSeconds: 5
             failureThreshold: 5
 ---
 apiVersion: v1
@@ -1055,7 +1092,7 @@ spec:
         group: application
     spec:
       # preStop drain (15s) + Boot's graceful shutdown phase (30s) must fit.
-      terminationGracePeriodSeconds: 60
+      terminationGracePeriodSeconds: 90
       initContainers:
         - name: wait-for-service-discovery
           image: busybox:1.36
@@ -1101,6 +1138,14 @@ spec:
                 secretKeyRef:
                   name: platform-secrets
                   key: JWT_SECRET
+            # Same as docker-compose.yml: the gateway buffers request bodies (up to 1 MB
+            # per in-flight POST) in Netty direct memory, whose default cap is the maximum
+            # heap (55 % of 768 Mi = 424 Mi as the JVM rounds it). Heap + direct could pass
+            # the 768 Mi limit and OOM-kill the pod; 128m fails the one request instead (a
+            # catchable OutOfMemoryError that -XX:+ExitOnOutOfMemoryError does not act on).
+            # Measured: 424 + 128 + ~145 non-heap = ~700 Mi of 768 Mi.
+            - name: JAVA_TOOL_OPTIONS
+              value: -XX:MaxDirectMemorySize=128m
           resources:
             requests:
               cpu: 100m
@@ -1112,16 +1157,19 @@ spec:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 5
+            timeoutSeconds: 5
             failureThreshold: 60
           readinessProbe:
             httpGet:
               path: /actuator/health/readiness
               port: http
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
               path: /actuator/health/liveness
               port: http
             periodSeconds: 20
+            timeoutSeconds: 5
             failureThreshold: 5

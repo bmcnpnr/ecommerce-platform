@@ -28,7 +28,7 @@
         "tags": [
           "Users"
         ],
-        "summary": "Get user by ID",
+        "summary": "Get user by ID (owner or admin)",
         "operationId": "getUserById",
         "parameters": [
           {
@@ -38,6 +38,22 @@
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "X-User-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -73,6 +89,22 @@
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "X-User-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -118,6 +150,22 @@
             "schema": {
               "type": "integer",
               "format": "int64"
+            }
+          },
+          {
+            "name": "X-User-Id",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-User-Role",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -206,7 +254,7 @@
           {
             "name": "X-Username",
             "in": "header",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -230,37 +278,6 @@
           }
         ]
       }
-    },
-    "/api/v1/users/internal/{username}": {
-      "get": {
-        "tags": [
-          "Users"
-        ],
-        "summary": "Internal endpoint - get user by username (service-to-service)",
-        "operationId": "getUserByUsername",
-        "parameters": [
-          {
-            "name": "username",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "OK",
-            "content": {
-              "*/*": {
-                "schema": {
-                  "$ref": "#/components/schemas/UserDTO"
-                }
-              }
-            }
-          }
-        }
-      }
     }
   },
   "components": {
@@ -269,25 +286,34 @@
         "type": "object",
         "properties": {
           "defaultBillingAddress": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 0,
+            "pattern": "^[^\\u0000]*$"
           },
           "defaultShippingAddress": {
-            "type": "string"
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 0,
+            "pattern": "^[^\\u0000]*$"
           },
           "firstName": {
             "type": "string",
             "maxLength": 50,
-            "minLength": 0
+            "minLength": 0,
+            "pattern": "^[^\\u0000]*$"
           },
           "lastName": {
             "type": "string",
             "maxLength": 50,
-            "minLength": 0
+            "minLength": 0,
+            "pattern": "^[^\\u0000]*$"
           },
           "phoneNumber": {
             "type": "string",
             "maxLength": 20,
-            "minLength": 0
+            "minLength": 0,
+            "pattern": "^[^\\u0000]*$"
           }
         }
       },
@@ -342,22 +368,23 @@
           "firstName": {
             "type": "string",
             "maxLength": 50,
-            "minLength": 0
+            "minLength": 0,
+            "pattern": "^[^\\u0000]*$"
           },
           "lastName": {
             "type": "string",
             "maxLength": 50,
-            "minLength": 0
+            "minLength": 0,
+            "pattern": "^[^\\u0000]*$"
           },
           "password": {
-            "type": "string",
-            "maxLength": 2147483647,
-            "minLength": 8
+            "type": "string"
           },
           "phoneNumber": {
             "type": "string",
             "maxLength": 20,
-            "minLength": 0
+            "minLength": 0,
+            "pattern": "^[^\\u0000]*$"
           },
           "username": {
             "type": "string",

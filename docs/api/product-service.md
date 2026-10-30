@@ -60,29 +60,31 @@ TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/users/login \
 | `HttpMessageNotReadableException` (missing or malformed body, wrong JSON type, unknown enum value, fractional integer) | 400 | `Bad Request` | `Malformed request body` |
 | `MissingServletRequestParameterException`, `ServletRequestBindingException` | 400 | `Bad Request` | `Missing required parameter '<name>'` |
 | `MethodArgumentTypeMismatchException` (e.g. a non-numeric id) | 400 | `Bad Request` | `Invalid value for parameter '<name>'` |
-| invalid request (page size over 100, NUL byte, unknown sort property) | 400 | `Bad Request` | e.g. `Page size must be between 1 and 100`, `Invalid sort property` |
+| invalid request (page size over 100, unknown sort property, search text over 200 characters or with a NUL byte, unknown product status, stock quantity out of range) | 400 | `Bad Request` | e.g. `Page size must be between 1 and 100`, `Invalid sort property`, `Invalid value for parameter 'q'`, `Unknown product status: <value>`, `Stock quantity out of range` |
 | missing identity on an admin endpoint | 401 | `Unauthorized` | `Authentication required` |
 | not `ADMIN` | 403 | `Forbidden` | `Access denied` |
 | unmapped path | 404 | `Not Found` | `Resource not found` |
 | `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | `Method not allowed` |
 | unacceptable `Accept` | 406 | `Not Acceptable` | `Not acceptable` |
 | unique-constraint race | 409 | `Conflict` | `Resource already exists` |
+| request body above 1 MB | 413 | `Payload Too Large` | `Request body too large` |
 | unsupported `Content-Type` | 415 | `Unsupported Media Type` | `Unsupported media type` |
-| anything else | 500 | `Internal Server Error` | `An unexpected error occurred` (logged at ERROR with the stack trace) |
+| anything else | 500 | `Internal Server Error` | `An unexpected error occurred` (logged at ERROR with the stack trace, at most once per failure site and 10 s) |
+| the database did not answer (connection pool timeout, lock or query timeout, dead or frozen connection, a rollback or commit that failed because the connection died) | 503 | `Service Unavailable` | `Service temporarily unavailable` (logged as one WARN line without a stack trace, at most once per cause and 10 s) |
 
-"Anything else" is any unexpected failure, e.g. a non-unique database constraint violation.
+"Anything else" is any unexpected failure, e.g. a non-unique database constraint violation. The `413` is written by `filter/RequestSizeLimitFilter` before the request reaches a controller, for a request that declares a `Content-Length` above 1 MB (`http.max-request-body-bytes`); its body has only `status`, `error` and `message`: `{"status":413,"error":"Payload Too Large","message":"Request body too large"}`. A body that declares no length (chunked) is cut off at 1 MB and answered `400` `Malformed request body`.
 
 Every response carries `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
 
-**Pagination.** `GET /api/v1/products` and `GET /api/v1/products/search` take Spring Data's pageable parameters:
+**Pagination.** `GET /api/v1/products`, `GET /api/v1/products/search` and `GET /api/v1/products/category/{categoryId}` take Spring Data's pageable parameters:
 
 | Parameter | Default | Notes |
 |---|---|---|
 | `page` | `0` | Zero-based. Negative or non-numeric values fall back to 0. |
-| `size` | `20` (`@PageableDefault`) | Values below 1 fall back to 20; values above 100 are `400` `Page size must be between 1 and 100`. |
-| `sort` | unsorted | `property` or `property,asc` / `property,desc`; repeat the parameter for several keys. Properties are the entity's: `id`, `sku`, `name`, `description`, `price`, `stockQuantity`, `brand`, `categoryId`, `status`, `createdAt`, `updatedAt`. An unknown property returns 400. |
+| `size` | `20` (`@PageableDefault`); `100` on the category endpoint | Values below 1 fall back to the default; values above 100 are `400` `Page size must be between 1 and 100`. |
+| `sort` | `id` | `property` or `property,asc` / `property,desc`; repeat the parameter for several keys. Properties are the entity's: `id`, `sku`, `name`, `description`, `price`, `stockQuantity`, `brand`, `categoryId`, `status`, `createdAt`, `updatedAt`. An unknown property returns 400. Without a `sort` the result is ordered by `id`, so page boundaries are stable. |
 
-The response is a Spring Data `Page` serialized directly (`spring.data.web.pageable.serialization-mode` is left at `direct`):
+The list and search endpoints answer with a Spring Data `Page` serialized directly (`spring.data.web.pageable.serialization-mode` is left at `direct`); the category endpoint answers with a plain JSON array of the page's products:
 
 ```json
 {
@@ -97,11 +99,11 @@ The response is a Spring Data `Page` serialized directly (`spring.data.web.pagea
     "pageNumber": 0,
     "pageSize": 20,
     "paged": true,
-    "sort": { "empty": true, "sorted": false, "unsorted": true },
+    "sort": { "empty": false, "sorted": true, "unsorted": false },
     "unpaged": false
   },
   "size": 20,
-  "sort": { "empty": true, "sorted": false, "unsorted": true },
+  "sort": { "empty": false, "sorted": true, "unsorted": false },
   "totalElements": 1,
   "totalPages": 1
 }
@@ -111,7 +113,7 @@ The frontend reads `content`, `totalElements`, `totalPages`, `size`, `number`, `
 
 **Dates.** `LocalDateTime` values are ISO-8601 strings without an offset, in the server JVM's local time, e.g. `2026-10-29T18:07:12.345678` (Jackson 3 default; no `spring.jackson.*` settings).
 
-**Numbers.** `price` is a JSON number. Values read from the database carry four decimals because the column is `NUMERIC(19,4)` (`49.9900`); the `201` response of `POST /api/v1/products` echoes the scale the client sent (`49.99`). PostgreSQL rounds a price with more than four decimals when storing it, so later reads can differ from the `201` body. A fractional number sent for an integer field (`stockQuantity`, `delta`) is truncated toward zero (Jackson's `ACCEPT_FLOAT_AS_INT` is on), e.g. `-1.9` becomes `-1`.
+**Numbers.** `price` is a JSON number. Values read from the database carry four decimals because the column is `NUMERIC(19,4)` (`49.9900`); the `201` response of `POST /api/v1/products` echoes the scale the client sent (`49.99`), so a later read shows the same value with two more zeros. A fractional number sent for an integer field (`stockQuantity`, `delta`) is a `400` `Malformed request body`, not a silent truncation (`spring.jackson.deserialization.accept-float-as-int` is `false`).
 
 **Other JSON rules.** Unknown request properties are ignored (Jackson 3 default). `null` fields are written as `null`, not omitted. Key order in the examples follows the DTO declarations; clients must not depend on it.
 
@@ -123,16 +125,16 @@ The frontend reads `content`, `totalElements`, `totalPages`, `size`, `number`, `
 |---|---|---|---|---|
 | POST | `/api/v1/products` | `ADMIN` | `ADMIN` | Create a product |
 | GET | `/api/v1/products` | Public | none | Page of `ACTIVE` products |
-| GET | `/api/v1/products/{id}` | Public | none | Product by id, any status |
-| GET | `/api/v1/products/sku/{sku}` | Public | none | Product by SKU, any status |
+| GET | `/api/v1/products/{id}` | Public | `INACTIVE` products: `ADMIN` only (404 otherwise) | Product by id |
+| GET | `/api/v1/products/sku/{sku}` | Public | `INACTIVE` products: `ADMIN` only (404 otherwise) | Product by SKU |
 | GET | `/api/v1/products/search` | Public | none | Page of `ACTIVE` products whose name contains `q` |
-| GET | `/api/v1/products/category/{categoryId}` | Public | none | `ACTIVE` products of one category |
+| GET | `/api/v1/products/category/{categoryId}` | Public | none | One page of the `ACTIVE` products of one category |
 | PUT | `/api/v1/products/{id}` | `ADMIN` | `ADMIN` | Partial update |
 | PATCH | `/api/v1/products/{id}/stock` | `ADMIN` | `ADMIN` | Add or remove stock |
 | PATCH | `/internal/v1/products/{id}/stock` | not routed | none | Same, for order-service |
 | DELETE | `/api/v1/products/{id}` | `ADMIN` | `ADMIN` | Soft delete |
 | POST | `/api/v1/categories` | `ADMIN` | `ADMIN` | Create a category |
-| GET | `/api/v1/categories` | Public | none | All categories |
+| GET | `/api/v1/categories` | Public | none | Categories, at most 1000 |
 | GET | `/api/v1/categories/{id}` | Public | none | Category by id |
 
 ## POST /api/v1/products
@@ -147,7 +149,7 @@ Creates a product with status `ACTIVE`.
 |---|---|---|---|---|
 | `sku` | string | yes | `@NotBlank` "SKU is required"; `@Size(max = 100)` "size must be between 0 and 100" | Must not exist yet (409). Case-sensitive. Cannot be changed later. |
 | `name` | string | yes | `@NotBlank` "Name is required"; `@Size(max = 200)` "size must be between 0 and 200" | |
-| `description` | string | no | — | Unlimited (`TEXT`). |
+| `description` | string | no | `@Size(max = 5000)` "size must be between 0 and 5000" | At most 5000 characters (the column is `TEXT`, but every list response carries it). |
 | `price` | number | yes | `@NotNull` "Price is required"; `@DecimalMin("0", exclusive)` "Price must be greater than 0"; `@Digits(15, 2)` "Price must have at most 15 integer digits and 2 decimals" | More digits are `400`, not rounded. |
 | `stockQuantity` | integer | yes | `@NotNull` "Stock quantity is required"; `@Min(0)` "Stock quantity cannot be negative" | The product is `ACTIVE` even when this is 0. |
 | `brand` | string | no | `@Size(max = 100)` "size must be between 0 and 100" | |
@@ -189,6 +191,8 @@ Creates a product with status `ACTIVE`.
 - `409` `Product with SKU already exists: <sku>`.
 - `401` / `403` not an admin.
 - `409` `Resource already exists` when two requests create the same SKU at the same time.
+- `413` `Request body too large` above 1 MB.
+- `503` `Service temporarily unavailable` when the database does not answer.
 
 **Side effects:** one `INSERT` into `products`; log line `Product created: SKU=<sku>`. No events.
 
@@ -212,7 +216,7 @@ Returns a page of products whose status is `ACTIVE`. `OUT_OF_STOCK` and `INACTIV
 |---|---|---|---|---|---|
 | `page` | query | integer | no | `0` | See [Pagination](#conventions). |
 | `size` | query | integer | no | `20` | 1 to 100. |
-| `sort` | query | string | no | unsorted | `property`, `property,asc` or `property,desc`; repeatable. |
+| `sort` | query | string | no | `id` | `property`, `property,asc` or `property,desc`; repeatable. |
 
 **Responses**
 
@@ -229,7 +233,7 @@ curl -s 'http://localhost:8080/api/v1/products?page=0&size=20&sort=price,desc'
 
 ## GET /api/v1/products/{id}
 
-Returns one product, whatever its status (soft-deleted `INACTIVE` and `OUT_OF_STOCK` products are returned too). order-, catalog- and review-service call this endpoint over Feign.
+Returns one product, whatever its status: `ACTIVE` and `OUT_OF_STOCK` products to everyone, a soft-deleted `INACTIVE` product only to an `ADMIN` (everyone else gets `404`). order-, catalog- and review-service call this endpoint over Feign, without identity headers.
 
 **Auth:** Public.
 
@@ -271,7 +275,7 @@ curl -s http://localhost:8080/api/v1/products/1
 
 ## GET /api/v1/products/sku/{sku}
 
-Returns the product with this exact SKU (case-sensitive), whatever its status.
+Returns the product with this exact SKU (case-sensitive), whatever its status; as for the lookup by id, a soft-deleted `INACTIVE` product is returned only to an `ADMIN`.
 
 **Auth:** Public.
 
@@ -304,15 +308,15 @@ Returns a page of `ACTIVE` products whose `name` contains `q`, ignoring case. On
 
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
-| `q` | query | string | yes | — | Missing: 400. |
+| `q` | query | string | yes | — | Missing: 400. At most 200 characters (a name is at most 200, so a longer text can never match) and no NUL byte, otherwise 400 `Invalid value for parameter 'q'`. |
 | `page` | query | integer | no | `0` | |
 | `size` | query | integer | no | `20` | 1 to 100. |
-| `sort` | query | string | no | unsorted | `property`, `property,asc` or `property,desc`; repeatable. |
+| `sort` | query | string | no | `id` | `property`, `property,asc` or `property,desc`; repeatable. |
 
 **Responses**
 
 - `200 OK` with a [`Page`](#page) of [`ProductDTO`](#productdto).
-- `400` `q` missing.
+- `400` `q` missing, longer than 200 characters or containing a NUL byte.
 - `400` for an unknown `sort` property or a `size` over 100.
 
 **Side effects:** none.
@@ -325,19 +329,23 @@ curl -s 'http://localhost:8080/api/v1/products/search?q=mouse&size=10'
 
 ## GET /api/v1/products/category/{categoryId}
 
-Returns the `ACTIVE` products whose `categoryId` equals the given id, as a plain list (not paged, no defined order). Products in child categories are not included.
+Returns one page of the `ACTIVE` products whose `categoryId` equals the given id, as a plain JSON array (not a `Page`). The status filter runs in the database. Without `page` and `size` that is the first 100 products, ordered by `id`; a category with more products needs `page=1`, `page=2` and so on. Products in child categories are not included.
 
 **Auth:** Public.
 
-**Path parameters**
+**Path / query parameters**
 
 | Name | In | Type | Required | Default | Constraints |
 |---|---|---|---|---|---|
 | `categoryId` | path | integer (int64) | yes | — | The category must exist. |
+| `page` | query | integer | no | `0` | See [Pagination](#conventions). |
+| `size` | query | integer | no | `100` | 1 to 100. |
+| `sort` | query | string | no | `id` | `property`, `property,asc` or `property,desc`; repeatable. |
 
 **Responses**
 
-- `200 OK` with an array of [`ProductDTO`](#productdto) (possibly empty).
+- `200 OK` with an array of at most `size` [`ProductDTO`](#productdto) (possibly empty).
+- `400` for an unknown `sort` property or a `size` over 100.
 - `404` `Category not found: <categoryId>`.
 
 **Side effects:** none.
@@ -346,6 +354,7 @@ Returns the `ACTIVE` products whose `categoryId` equals the given id, as a plain
 
 ```bash
 curl -s http://localhost:8080/api/v1/products/category/10
+curl -s 'http://localhost:8080/api/v1/products/category/10?page=1&size=100'
 ```
 
 ## PUT /api/v1/products/{id}
@@ -365,7 +374,7 @@ Partially updates a product: every non-null field in the body replaces the store
 | Field | Type | Required | Validation | Notes |
 |---|---|---|---|---|
 | `name` | string | no | `@Size(max = 200)` | An empty string is accepted. |
-| `description` | string | no | — | |
+| `description` | string | no | `@Size(max = 5000)` "size must be between 0 and 5000" | |
 | `price` | number | no | `@DecimalMin("0.01")` "Price must be greater than 0" | |
 | `brand` | string | no | `@Size(max = 100)` | |
 | `categoryId` | integer | no | Checked by the service; an unknown id is `404`. | |
@@ -386,8 +395,9 @@ Partially updates a product: every non-null field in the body replaces the store
 - `404` `Product not found with id: <id>`.
 - `400` unknown `status` value.
 - `404` `Category not found: <categoryId>`.
+- `413` `Request body too large` above 1 MB.
 
-**Side effects:** one `UPDATE products` that writes every column (no optimistic lock, see the service document); no events. The new price is what order-service copies into order items from then on.
+**Side effects:** one `UPDATE products` that writes every column (no optimistic lock and no row lock, see the service document); no events. The new price is what order-service copies into order items from then on.
 
 **Example**
 
@@ -421,12 +431,12 @@ Adds `delta` to the product's stock. A positive delta adds stock (restock, order
 
 **Behaviour** (`ProductService.updateStock()`):
 
-1. Load the product (404 if it does not exist). The status is not checked, so `INACTIVE` products can be adjusted too.
-2. `new = stockQuantity + delta`. If `new < 0`, answer 400 and write nothing.
-3. If `new == 0`, set status `OUT_OF_STOCK` (from any status, including `INACTIVE`). If `new > 0` and the status was `OUT_OF_STOCK`, set `ACTIVE`. Otherwise keep the status.
+1. Load the product under a row lock (`SELECT ... FOR NO KEY UPDATE`, waiting at most 5 s; 404 if it does not exist). The status is not checked, so `INACTIVE` products can be adjusted too.
+2. `new = stockQuantity + delta`, computed in `long`. If `new < 0`, answer 400 and write nothing. If `new` is above 2147483647, answer 400 `Stock quantity out of range` and write nothing.
+3. If `new == 0` and the status is `ACTIVE`, set status `OUT_OF_STOCK`. If `new > 0` and the status is `OUT_OF_STOCK`, set `ACTIVE`. Otherwise keep the status; an `INACTIVE` product stays `INACTIVE`.
 4. Set `stockQuantity = new` and `updatedAt = now`, save, return the product.
 
-**Concurrency:** none. The product is read without a lock and written back whole at commit, there is no version column and no atomic `stock_quantity = stock_quantity + delta` update, so two concurrent requests for the same product can both succeed and the later commit overwrites the earlier one (lost update). The stored stock never goes negative, but reservations can oversell and restorations can be lost. The request is not idempotent: repeating it applies the delta again.
+**Concurrency:** requests for the same product run one after the other. Each waits for the row lock the previous one holds and reads the quantity that one committed, so reservations cannot oversell and restorations are not lost. If the lock is not free within 5 s (a stuck holder, such as an open admin session), the request fails with `503` `Service temporarily unavailable` and the stock is untouched. The request is not idempotent: repeating it applies the delta again, and a `503` after a failed commit or a lost response does not say whether the delta was applied.
 
 **Responses**
 
@@ -460,11 +470,14 @@ Adds `delta` to the product's stock. A positive delta adds stock (restock, order
     "fieldErrors": null
   }
   ```
-- `400` `delta` missing or `null` (`Validation failed`, `fieldErrors: [{"field": "delta", "message": "Delta is required"}]`), malformed JSON or a non-numeric `delta`, or a non-numeric `id`.
+- `400` `delta` missing or `null` (`Validation failed`, `fieldErrors: [{"field": "delta", "message": "Delta is required"}]`), malformed JSON, a non-numeric or fractional `delta`, or a non-numeric `id`.
+- `400` `Stock quantity out of range` when the new quantity would exceed 2147483647.
 - `404` `Product not found with id: <id>`.
 - `405` for any method other than `PATCH` on this path.
+- `413` `Request body too large` above 1 MB.
+- `503` `Service temporarily unavailable` when the row lock is not free within 5 s (the stock is untouched) or the database does not answer.
 
-**Side effects:** one `UPDATE products` (every column); log line `Stock updated for product <sku>: <old> -> <new>`. No events, so catalog-service's `stockStatus` is not updated.
+**Side effects:** one `UPDATE products` (every column) under a row lock that is held until the commit; log line `Stock updated for product <sku>: <old> -> <new>`. No events, so catalog-service's `stockStatus` is not updated.
 
 **Example**
 
@@ -510,7 +523,7 @@ Creates a category, optionally under a parent.
 | Field | Type | Required | Validation | Notes |
 |---|---|---|---|---|
 | `name` | string | yes | `@NotBlank` "Category name is required"; `@Size(max = 100)` "size must be between 0 and 100" | Unique (409), case-sensitive. |
-| `description` | string | no | — | |
+| `description` | string | no | `@Size(max = 5000)` "size must be between 0 and 5000" | |
 | `parentCategoryId` | integer | no | An unknown id is `404`. | |
 
 ```json
@@ -533,6 +546,7 @@ Creates a category, optionally under a parent.
 - `400` validation failure or malformed JSON.
 - `409` `Category already exists: <name>` (also for a concurrent create with the same name).
 - `404` `Category not found: <parentCategoryId>`.
+- `413` `Request body too large` above 1 MB.
 
 **Side effects:** one `INSERT` into `categories`. No events.
 
@@ -546,7 +560,7 @@ curl -s -X POST http://localhost:8080/api/v1/categories \
 
 ## GET /api/v1/categories
 
-Returns every category as a flat list (not paged, no defined order). Hierarchy is expressed only by `parentCategoryId`. catalog-service calls this on every sync to resolve a category name.
+Returns the categories as a flat list ordered by `id`, at most the first 1000 (there are no `page` or `size` parameters: catalog-service reads the whole list, so it is bounded by design). Hierarchy is expressed only by `parentCategoryId`. catalog-service calls this on every sync of a product that has a category, to resolve the category name.
 
 **Auth:** Public.
 

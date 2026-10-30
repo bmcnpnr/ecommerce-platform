@@ -19,7 +19,7 @@ Service overview: [payment-service](../services/payment-service.md).
 - **Enums** are sent as their names:
   - `status`: `PENDING`, `PROCESSING`, `COMPLETED`, `FAILED`, `REFUNDED`.
   - `method`: `CREDIT_CARD`, `DEBIT_CARD`, `BANK_TRANSFER`, `DIGITAL_WALLET`.
-- **Pagination:** none. The list endpoint returns a plain JSON array.
+- **Pagination:** only the customer's payment list is paged: optional `page` (from 0, default 0) and `size` (1 to 100, default 100), newest first (by id, descending). It still returns a plain JSON array, so a client that sends no parameter gets the newest 100 payments. A `page` below 0 or a `size` outside 1 to 100 is 400, not clamped.
 
 ### Error body
 
@@ -59,22 +59,26 @@ A validation failure sets `message` to `Validation failed` and fills `fieldError
 | Exception | Status | `error` | `message` |
 |---|---|---|---|
 | `PaymentNotFoundException` | 404 | `Not Found` | `Payment not found: {id}` or `Payment not found for order: {orderId}` |
-| `PaymentAlreadyProcessedException` | 409 | `Conflict` | `Payment already completed for order: {orderId}`, `Payment already in status: {status}`, `A payment already exists for order: {orderId}` (another customer), `Payment for order {orderId} is in status {status} and cannot be initiated again`, or a concurrent-create / concurrent-process message |
+| `PaymentAlreadyProcessedException` | 409 | `Conflict` | `Payment already completed for order: {orderId}`, `Payment already in status: {status}`, `A payment already exists for order: {orderId}` (another customer), `The payment for this order was declined and the order is cancelled. Place a new order to try again.` (the order's payment is `FAILED`), `Payment for order {orderId} is in status {status} and cannot be initiated again`, or a concurrent-create / concurrent-process message |
 | `InvalidPaymentStateException` | 400 | `Bad Request` | `Can only refund COMPLETED payments. Current: {status}` or `Amount does not match the order total` |
-| `InvalidPaymentMethodException` | 400 | `Bad Request` | `Unsupported payment method: {method}` |
+| `BadRequestException` (`page`, `size`) | 400 | `Bad Request` | `page must be at least 0 and size between 1 and 100` |
+| `InvalidPaymentMethodException` | 400 | `Bad Request` | `Unsupported payment method` |
 | missing identity | 401 | `Unauthorized` | `Authentication required` |
 | `ForbiddenException` | 403 | `Forbidden` | `Access denied` |
 | `OrderNotFoundException` (order-service has no such order) | 404 | `Not Found` | `Order not found: {orderId}` |
 | `OrderNotPayableException` | 409 | `Conflict` | `Order {orderId} is not awaiting payment` |
 | `ObjectOptimisticLockingFailureException` | 409 | `Conflict` | `The payment was modified by another request` |
-| `DependencyUnavailableException` (order-service unreachable) | 503 | `Service Unavailable` | `Order service unavailable. Please try again later.` |
+| `DependencyUnavailableException` (order-service gave no usable answer: connect failure, timeout, no instance, 5xx, an undecodable body, or an open circuit breaker) | 503 | `Service Unavailable` | `Order service unavailable. Please try again later.` |
+| A dependency of this service does not answer: the database (connection wait over 5 s, lock timeout, a connection lost during commit or rollback), a Kafka timeout | 503 | `Service Unavailable` | `Service temporarily unavailable` |
 | `MethodArgumentNotValidException` (`@Valid` body) | 400 | `Bad Request` | `Validation failed`, with `fieldErrors` |
 | `HttpMessageNotReadableException` (missing or malformed body) | 400 | `Bad Request` | `Malformed request body` |
 | `MethodArgumentTypeMismatchException` (for example a non-numeric `{id}`) | 400 | `Bad Request` | `Invalid value for parameter '{name}'` |
 | other binding errors | 400 | `Bad Request` | `Invalid request` |
 | `HttpRequestMethodNotSupportedException` | 405 | `Method Not Allowed` | `Request method not supported` |
 | not acceptable / unmapped path | 406 / 404 | | `Requested media type not acceptable` / `Resource not found` |
-| Anything else, including database errors | 500 | `Internal Server Error` | `An unexpected error occurred`, logged at ERROR with the stack trace |
+| Anything else | 500 | `Internal Server Error` | `An unexpected error occurred`, logged at ERROR with the stack trace, once per failure site per 10 s |
+
+A 503 of either kind writes one WARN per exception class per 10 s, without a stack trace.
 
 ## Endpoints
 
@@ -83,7 +87,7 @@ A validation failure sets `message` to `Validation failed` and fills `fieldError
 | POST | `/api/v1/payments` | Bearer JWT | `customerId` is the caller (or `ADMIN`); order verified with order-service | Create a `PENDING` payment |
 | GET | `/api/v1/payments/{id}` | Bearer JWT | owner or `ADMIN` | Get a payment by id |
 | GET | `/api/v1/payments/order/{orderId}` | Bearer JWT | owner or `ADMIN` | Get the payment of an order |
-| GET | `/api/v1/payments/customer/{customerId}` | Bearer JWT | that customer or `ADMIN` | List a customer's payments |
+| GET | `/api/v1/payments/customer/{customerId}` | Bearer JWT | that customer or `ADMIN`; `page` at least 0, `size` 1 to 100 | List a customer's payments, newest first |
 | POST | `/api/v1/payments/{id}/process` | Bearer JWT | owner or `ADMIN` | Settle with the simulated gateway (80 % success) |
 | POST | `/api/v1/payments/{id}/refund` | `ADMIN` | `ADMIN` | Refund a `COMPLETED` payment in full |
 
@@ -91,9 +95,9 @@ The examples below assume `GW=http://localhost:8080` and `AUTH="Authorization: B
 
 ## POST /api/v1/payments
 
-Creates a payment in `PENDING` for an order. Before storing anything the service asks order-service (`GET /internal/v1/orders/{orderId}`, `OrderVerifier`): the order must exist (404), be `CONFIRMED` (409), belong to the payer (403) and its total must equal `amount` exactly (400). If order-service cannot answer, the result is 503: a payment is never accepted blind. The frontend checkout sends the order's `totalAmount` and the username as `customerId`. Creating a payment does not settle it; call [process](#post-apiv1paymentsidprocess) next.
+Creates a payment in `PENDING` for an order. Before storing anything the service asks order-service (`GET /internal/v1/orders/{orderId}`, `OrderVerifier`): the order must exist (404), be `CONFIRMED` (409), belong to the payer (403) and its total must equal `amount` exactly (400). If order-service cannot answer (no connection, a timeout, no instance, a server error, or its circuit breaker is open), the result is 503: a payment is never accepted blind. The frontend checkout sends the order's `totalAmount` and the username as `customerId`. Creating a payment does not settle it; call [process](#post-apiv1paymentsidprocess) next.
 
-**Auth:** Bearer JWT. `customerId` must equal `X-Username` unless the caller is `ADMIN` (403 otherwise). A repeat for an order with an existing payment is allowed only for the same customer and only while it is `PENDING` or `FAILED`.
+**Auth:** Bearer JWT. `customerId` must equal `X-Username` unless the caller is `ADMIN` (403 otherwise). A repeat for an order with an existing payment is allowed only for the same customer and only while it is `PENDING`, which is reused. A declined payment (`FAILED`) is final for its order.
 
 **Request body** `InitiatePaymentRequest`
 
@@ -144,10 +148,18 @@ The default validation messages are `must not be null`, `must not be blank`, `mu
 - `400` also for `Amount does not match the order total` and an unknown `method`.
 - `401` / `403` no identity, another customer's `customerId`, or an order owned by someone else.
 - `404` `Order not found: {orderId}`.
-- `409` with `Payment already completed for order: {orderId}` when the order's payment is `COMPLETED`; `Order {orderId} is not awaiting payment` when the order is not `CONFIRMED`; and when the existing payment is `REFUNDED` or `PROCESSING`, or belongs to another customer. A `PENDING` or `FAILED` payment of the same customer is reused.
-- `503` order-service could not be reached.
+- `409`, in the order the service checks:
+  - `Order {orderId} is not awaiting payment` when order-service says the order is not `CONFIRMED`. This comes first, so once order-service has cancelled the order after a decline, every retry gets this message;
+  - `Payment already completed for order: {orderId}` when the order's payment is `COMPLETED`;
+  - `A payment already exists for order: {orderId}` when the existing payment belongs to another customer (checked before the status below, so only the owner learns what became of it);
+  - `The payment for this order was declined and the order is cancelled. Place a new order to try again.` when the existing payment is `FAILED`. This is the answer in the short window before order-service has consumed `payment.failed` and the order still reads `CONFIRMED`. Nothing is charged and nothing is published; the row stays `FAILED`;
+  - `Payment for order {orderId} is in status {status} and cannot be initiated again` when the existing payment is `REFUNDED` or `PROCESSING`;
+  - `A payment is already being created for order: {orderId}` when a concurrent request created or reset the row first.
 
-**Side effects:** inserts one `payments` row (or resets a `PENDING`/`FAILED` one). One Feign call to order-service. No event is published.
+  A `PENDING` payment of the same customer is reused.
+- `503` with `Order service unavailable. Please try again later.` when order-service could not be asked. `503` with `Service temporarily unavailable` when the database does not answer.
+
+**Side effects:** inserts one `payments` row (or resets a `PENDING` one). One Feign call to order-service. No event is published.
 
 **Example**
 
@@ -200,7 +212,7 @@ Returns the payment of an order. The frontend's `OrderDetailPage` uses this endp
 
 - `200 OK` with a [`PaymentDTO`](#paymentdto).
 - `404` with `Payment not found for order: {orderId}`.
-- `403` the payment belongs to someone else. An order has one payment row (`order_id` is unique): a retry after a decline reuses it.
+- `403` the payment belongs to someone else. An order has one payment row (`order_id` is unique), and a declined payment stays `FAILED`: a new attempt for that order is refused (409), so this endpoint keeps returning the declined payment.
 
 **Side effects:** none.
 
@@ -212,26 +224,29 @@ curl -s -H "$AUTH" "$GW/api/v1/payments/order/7"
 
 ## GET /api/v1/payments/customer/{customerId}
 
-Lists every payment whose `customerId` equals the path value exactly. The frontend's `useCustomerPayments()` hook would pass the username, but no page uses it.
+Lists the payments whose `customerId` equals the path value exactly, newest first, one page at a time. The frontend's `useCustomerPayments()` hook would pass the username, but no page uses it.
 
-**Auth:** Bearer JWT; `{customerId}` must equal `X-Username`, or the caller is `ADMIN` (403 otherwise).
+**Auth:** Bearer JWT; `{customerId}` must equal `X-Username`, or the caller is `ADMIN` (403 otherwise). The check comes before the `page` and `size` validation.
 
-**Path parameters**
+**Path and query parameters**
 
-| Name | In | Type | Required | Constraints |
-|---|---|---|---|---|
-| `customerId` | path | string | yes | Exact match |
+| Name | In | Type | Required | Default | Constraints |
+|---|---|---|---|---|---|
+| `customerId` | path | string | yes | | Exact match |
+| `page` | query | integer (`int`) | no | `0` | At least 0, else 400 |
+| `size` | query | integer (`int`) | no | `100` | 1 to 100, else 400 (a larger value is rejected, not clamped) |
 
 **Responses**
 
-- `200 OK` with a JSON array of [`PaymentDTO`](#paymentdto). The array is empty when nothing matches; this endpoint never returns 404. The order is unspecified because the query has no `ORDER BY`.
+- `200 OK` with a JSON array of [`PaymentDTO`](#paymentdto), at most `size` long and ordered by `id` descending (newest first). The array is empty when nothing matches or the page is past the end; this endpoint never returns 404. It is still a plain array: ask for `page=1`, `page=2` and so on to read further back.
+- `400` with `page must be at least 0 and size between 1 and 100`, or `Invalid value for parameter '{name}'` when `page` or `size` is not a number.
 
 **Side effects:** none.
 
 **Example**
 
 ```bash
-curl -s -H "$AUTH" "$GW/api/v1/payments/customer/alice"
+curl -s -H "$AUTH" "$GW/api/v1/payments/customer/alice?page=0&size=20"
 ```
 
 ## POST /api/v1/payments/{id}/process
@@ -240,7 +255,7 @@ Settles a `PENDING` payment with the simulated gateway: `ThreadLocalRandom.curre
 
 | Outcome | `status` | `transactionId` | `failureReason` | Event |
 |---|---|---|---|---|
-| Success (draw 0 to 7) | `COMPLETED` | `TXN-` followed by 8 upper-case hex digits | `null` | `payment.completed` |
+| Success (draw 0 to 7) | `COMPLETED` | `TXN-` followed by 16 upper-case hex digits | `null` | `payment.completed` |
 | Decline (draw 8 or 9) | `FAILED` | `null` | `Payment declined by gateway` | `payment.failed` |
 
 **Auth:** Bearer JWT; owner of the payment, or `ADMIN`.
@@ -266,7 +281,7 @@ Settles a `PENDING` payment with the simulated gateway: `ThreadLocalRandom.curre
     "currency": "USD",
     "status": "COMPLETED",
     "method": "CREDIT_CARD",
-    "transactionId": "TXN-1A2B3C4D",
+    "transactionId": "TXN-1A2B3C4D5E6F7A8B",
     "failureReason": null,
     "cardLastFour": "4242",
     "createdAt": "2026-10-29T14:30:15.123456",
@@ -275,18 +290,19 @@ Settles a `PENDING` payment with the simulated gateway: `ThreadLocalRandom.curre
   ```
 
 - `404` with `Payment not found: {id}`.
-- `409` with `Payment already in status: {status}` when the payment is not `PENDING`.
+- `409` with `Payment already in status: {status}` when the payment is not `PENDING`, or `Payment is being processed by another request` when a concurrent call claimed it first.
+- `503` with `Service temporarily unavailable` when the database does not answer. A Kafka outage does not reach this endpoint: the event waits in the outbox.
 
 **Side effects:**
 
-- Updates the `payments` row. The intermediate `PROCESSING` status is never committed.
-- Publishes `payment.completed` or `payment.failed` with key `orderId`. The send happens inside the transaction, before commit, and is fire-and-forget.
+- Updates the `payments` row. The intermediate `PROCESSING` status is flushed inside the transaction and never committed.
+- Inserts an `outbox_event` row for `payment.completed` or `payment.failed` (key `orderId`) in the same transaction. The relay publishes it to Kafka about half a second after the commit, at least once. If the transaction rolls back, nothing is published.
 - Downstream:
-  - order-service sets the order to `PAID` or `CANCELLED`.
+  - order-service sets the order to `PAID`; on `payment.failed` it cancels the order, returns its stock and publishes no `order.cancelled`. After a decline, a new payment for the order is refused (409, see [POST /api/v1/payments](#post-apiv1payments)).
   - shipping-service creates a shipment on `payment.completed`.
   - notification-service logs a notification.
 
-The payment row carries a `version` column (optimistic locking, migration `V3`), so two concurrent calls settle it once and publish once; the loser gets 409.
+The payment row carries a `version` column (optimistic locking, migration `V3`), so two concurrent calls settle it once and write one event; the loser gets 409.
 
 **Example**
 
@@ -319,7 +335,7 @@ No service and no frontend page calls this endpoint. The `useRefundPayment()` ho
 **Side effects:**
 
 - Updates the `payments` row.
-- Publishes `payment.refunded` with the full `amount` and key `orderId`, before commit.
+- Inserts an `outbox_event` row for `payment.refunded` (full `amount`, key `orderId`) in the same transaction; the relay publishes it after the commit.
 - Only notification-service consumes that topic. The order status and the shipment do not change.
 
 **Example**
